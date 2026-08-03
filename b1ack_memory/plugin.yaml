@@ -1,0 +1,7 @@
+name: b1ack-memory
+version: "0.1.0"
+description: Local-first personal memory with transparent Dream consolidation and WebUI
+requires_env: []
+hooks:
+  - on_session_end
+  - on_pre_compress

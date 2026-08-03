@@ -1,0 +1,13 @@
+{
+  "name": "b1ack-memory",
+  "label": "B1ack Memory",
+  "version": "0.1.0",
+  "description": "个人记忆白盒面板",
+  "icon": "Brain",
+  "tab": {
+    "path": "/b1ack-memory",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

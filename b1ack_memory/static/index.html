@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>B1ack Memory</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <aside>
+    <div class="brand"><i></i><span>B1ack Memory<small>个人记忆控制台</small></span></div>
+    <nav>
+      <button class="active" data-page="overview">概览</button>
+      <button data-page="memories">长期记忆</button>
+      <button data-page="candidates">候选记忆</button>
+      <button data-page="dream">Dream 日志</button>
+      <button data-page="traces">召回轨迹</button>
+      <button data-page="settings">模型与设置</button>
+      <button data-page="maintenance">备份与维护</button>
+    </nav>
+    <div class="local">仅本机访问 · SQLite</div>
+  </aside>
+  <main>
+    <header><div><h1 id="title">概览</h1><p id="subtitle">记忆健康、处理队列和近期活动</p></div><button class="ghost" id="refresh">刷新</button></header>
+    <div id="notice" role="status"></div>
+
+    <section id="overview" class="page active">
+      <div id="metrics" class="metrics"></div>
+      <div class="grid two">
+        <article><h2>系统状态</h2><div id="health"></div></article>
+        <article><h2>记忆流</h2><div class="flow"><span>会话</span><b>→</b><span>Light</span><b>→</b><span>REM</span><b>→</b><span>Deep</span></div><p class="muted">只有经过多日证据和多次召回的候选才会自动固化。</p></article>
+      </div>
+    </section>
+
+    <section id="memories" class="page">
+      <div class="toolbar"><input id="memory-search" placeholder="在当前列表中筛选"><select id="memory-status"><option value="active">有效</option><option value="trashed">回收站</option></select><button id="add-memory">新增记忆</button></div>
+      <div id="memory-list" class="cards"></div>
+    </section>
+
+    <section id="candidates" class="page">
+      <div class="callout">候选是尚未固化的短期记忆。你可以查看证据评分后手动晋升或拒绝。</div>
+      <div id="candidate-list" class="cards"></div>
+    </section>
+
+    <section id="dream" class="page">
+      <div class="toolbar"><button id="run-dream">立即运行 Dream</button><button class="ghost" id="dry-dream" title="会调用模型，但不会修改记忆数据库">试运行（不写入）</button></div>
+      <div id="dream-list" class="cards"></div>
+      <h2 class="section-title">模型调用明细</h2><div id="call-list" class="cards"></div>
+    </section>
+
+    <section id="traces" class="page"><div id="trace-list" class="table-wrap"></div></section>
+
+    <section id="settings" class="page">
+      <div class="grid two">
+        <form id="llm-form"><h2>Dream 模型</h2><label>OpenAI 兼容地址<input name="base_url" required></label><label>模型名<input name="model" required></label><label>超时（秒）<input name="timeout_seconds" type="number" min="1"></label><label>最大输出 Token<input name="max_output_tokens" type="number" min="64"></label><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="llm">测试连接</button></div><small id="llm-key"></small></form>
+        <form id="embedding-form"><h2>向量检索（可选）</h2><label class="check"><input name="enabled" type="checkbox">启用 embeddings</label><label>兼容地址<input name="base_url"></label><label>模型名<input name="model"></label><label>超时（秒）<input name="timeout_seconds" type="number" min="1" value="60"></label><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="embedding">测试连接</button></div><small id="embedding-key"></small></form>
+        <form id="dream-form"><h2>Dream 调度</h2><label class="check"><input name="enabled" type="checkbox">启用每日 Dream</label><label>本地时间<input name="daily_at" type="time"></label><label>Light 单批最大字符<input name="batch_chars" type="number" min="1000"></label><label>Light 最大批数<input name="max_light_batches" type="number" min="1"></label><label>单次最大自动晋升数<input name="max_auto_promotions" type="number" min="0"></label><button type="submit">保存</button></form>
+        <form id="recall-form"><h2>召回</h2><label>返回条数<input name="limit" type="number" min="1" max="20"></label><label>最大注入字符<input name="max_context_chars" type="number" min="500"></label><button type="submit">保存</button></form>
+      </div>
+    </section>
+
+    <section id="maintenance" class="page">
+      <div class="grid two">
+        <article><h2>维护操作</h2><div class="stack"><button id="create-backup">创建备份</button><button id="rebuild">重建全文索引与镜像</button><button id="rebuild-vector" class="ghost">重建全文与向量索引</button><button id="vacuum" class="ghost">清理过期数据并压缩数据库</button><a id="export" class="button ghost" href="#">导出 JSONL</a></div></article>
+        <form id="retention-form"><h2>保留策略</h2><label>原始会话（天）<input name="raw_turn_days" type="number" min="1"></label><label>模型调用日志（天）<input name="model_call_days" type="number" min="1"></label><label>保留备份数<input name="backup_count" type="number" min="1"></label><button type="submit">保存</button></form>
+      </div>
+      <h2>数据库备份</h2><div id="backup-list" class="cards"></div>
+    </section>
+  </main>
+  <dialog id="editor"><form method="dialog"><h2 id="editor-title">记忆</h2><label>类型<select id="edit-kind"><option>fact</option><option>preference</option><option>decision</option><option>project</option><option>procedure</option><option>relationship</option><option>correction</option><option>episode</option></select></label><label>内容<textarea id="edit-content" rows="7"></textarea></label><div class="row end"><button value="cancel" class="ghost">取消</button><button value="save" id="editor-save">保存</button></div></form></dialog>
+  <script src="app.js"></script>
+</body>
+</html>

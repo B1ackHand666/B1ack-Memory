@@ -1,0 +1,5 @@
+include plugin.yaml
+include cli.py
+recursive-include dashboard *.json *.py *.js
+recursive-include b1ack_memory/static *.html *.css *.js
+recursive-include b1ack_memory/dashboard *.json *.py *.js
