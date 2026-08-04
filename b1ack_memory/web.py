@@ -30,9 +30,14 @@ async def _friendly_errors():
         raise HTTPException(status_code=400, detail=str(error)) from error
 
 
-def create_router(service: MemoryService | None = None) -> APIRouter:
+def create_router(
+    service: MemoryService | None = None, *, local_only: bool = True
+) -> APIRouter:
     memory = service or get_service(start_background=True)
-    router = APIRouter(dependencies=[Depends(_local_only), Depends(_friendly_errors)])
+    dependencies = [Depends(_friendly_errors)]
+    if local_only:
+        dependencies.insert(0, Depends(_local_only))
+    router = APIRouter(dependencies=dependencies)
 
     def mutation_token(x_b1ack_memory_token: str = Header(default="")) -> None:
         if not hmac.compare_digest(x_b1ack_memory_token, memory.mutation_token):
@@ -52,6 +57,15 @@ def create_router(service: MemoryService | None = None) -> APIRouter:
     @router.get("/ui/style.css")
     def stylesheet() -> FileResponse:
         return FileResponse(STATIC / "style.css", media_type="text/css")
+
+    @router.get("/ui-bundle")
+    def ui_bundle() -> dict[str, str]:
+        """Return standalone UI assets for an authenticated Dashboard embed."""
+        return {
+            "html": (STATIC / "index.html").read_text(encoding="utf-8"),
+            "css": (STATIC / "style.css").read_text(encoding="utf-8"),
+            "js": (STATIC / "app.js").read_text(encoding="utf-8"),
+        }
 
     @router.get("/bootstrap")
     def bootstrap() -> dict[str, Any]:

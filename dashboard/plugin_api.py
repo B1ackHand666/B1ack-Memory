@@ -7,4 +7,4 @@ if str(_PLUGIN_ROOT) not in sys.path:
 
 from b1ack_memory.web import create_router
 
-router = create_router()
+router = create_router(local_only=False)

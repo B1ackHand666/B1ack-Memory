@@ -1,4 +1,6 @@
 const base = location.pathname.replace(/\/ui\/?$/, "");
+const dashboardBridge =
+  window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
 let token = "";
 let settings = {};
 let editing = null;
@@ -38,6 +40,9 @@ async function api(path, options = {}) {
   const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
   if (options.method && options.method !== "GET") {
     headers["X-B1ack-Memory-Token"] = token;
+  }
+  if (dashboardBridge) {
+    return dashboardBridge.request(path, { ...options, headers });
   }
   const response = await fetch(base + path, { ...options, headers });
   if (!response.ok) {
@@ -350,8 +355,25 @@ for (const section of ["llm", "embedding", "dream", "recall", "retention"]) {
 
 $("#memory-search").addEventListener("input", loadMemories);
 $("#memory-status").addEventListener("change", loadMemories);
-$("#export").addEventListener("click", (event) => {
-  event.currentTarget.href = `${base}/export`;
+$("#export").addEventListener("click", async (event) => {
+  if (!dashboardBridge) {
+    event.currentTarget.href = `${base}/export`;
+    return;
+  }
+  event.preventDefault();
+  try {
+    const content = await dashboardBridge.exportText();
+    const url = URL.createObjectURL(
+      new Blob([content], { type: "application/x-ndjson;charset=utf-8" }),
+    );
+    const download = document.createElement("a");
+    download.href = url;
+    download.download = "b1ack-memory.jsonl";
+    download.click();
+    URL.revokeObjectURL(url);
+  } catch (error) {
+    showNotice(error.message, true);
+  }
 });
 
 loadAll();

@@ -23,6 +23,10 @@ class WebTests(unittest.TestCase):
 
     def test_ui_and_mutation_token(self) -> None:
         self.assertEqual(self.client.get("/api/ui/").status_code, 200)
+        bundle = self.client.get("/api/ui-bundle")
+        self.assertEqual(bundle.status_code, 200)
+        self.assertIn("B1ack Memory", bundle.json()["html"])
+        self.assertIn("dashboardBridge.request", bundle.json()["js"])
         self.assertEqual(self.client.post("/api/memories", json={"content": "测试"}).status_code, 403)
         token = self.client.get("/api/bootstrap").json()["token"]
         response = self.client.post(

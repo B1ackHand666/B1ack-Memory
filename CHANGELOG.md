@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+## [0.1.3] - 2026-08-04
+
+### 修复
+
+- Dashboard 面板改用 Hermes Plugin SDK 的认证请求桥接，不再让 iframe 直接导航到受保护的插件 API。
+- 修复启用 Hermes Dashboard 会话认证时，B1ack Memory 面板显示 `Unauthorized` 的问题。
+- 保持独立 WebUI 的本机访问限制；嵌入 Dashboard 时改由 Hermes 的会话认证保护。
+
 ## [0.1.2] - 2026-08-04
 
 ### 修复
@@ -51,7 +59,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.2...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.3
 [0.1.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.2
 [0.1.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.1
 [0.1.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.0
