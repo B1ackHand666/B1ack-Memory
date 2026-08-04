@@ -2,6 +2,8 @@
 
 B1ack Memory 是一个面向个人、local-first 的 Hermes Memory Provider。它把 SQLite 作为唯一事实源，以全文检索为默认召回方式，并用 Light → REM → Deep 三阶段 Dream 流程保守地整理长期记忆。项目刻意不引入 ORM、外部向量库、Node 构建链或常驻数据库服务，方便一个人阅读、修改和维护。
 
+[更新日志](CHANGELOG.md) · [最新版本](https://github.com/B1ackHand666/B1ack-Memory/releases/latest)
+
 ## 能做什么
 
 - 在 Hermes 对话前召回相关的长期记忆和明确标记为“未验证”的候选记忆。
