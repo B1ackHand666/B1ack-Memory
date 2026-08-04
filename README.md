@@ -28,7 +28,7 @@ hermes memory status
 hermes b1ack-memory status
 ```
 
-在 `hermes memory setup` 中选择 `b1ack-memory`。如果 Hermes Gateway 正在运行，安装后执行 `hermes gateway restart`。升级时重新运行安装命令；数据保存在插件目录之外，不会随插件升级被覆盖。
+在 `hermes memory setup` 中选择 `b1ack-memory`。如果 Hermes Gateway 正在运行，安装后执行 `hermes gateway restart`。以后升级已安装插件时运行 `hermes plugins update b1ack-memory`；如果该目录不是由 Git 安装的，可改用安装命令并添加 `--force`。数据保存在插件目录之外，不会随插件升级被覆盖。
 
 Hermes Dashboard 已启用时，运行 `hermes dashboard --no-open`，面板中会出现 B1ack Memory 标签。也可启动更轻量的独立 WebUI：
 
