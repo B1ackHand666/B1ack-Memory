@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import b1ack_memory
 from b1ack_memory.dream import DreamEngine
 from b1ack_memory.llm import LlmResult, OpenAICompatibleClient
 from b1ack_memory.security import SecretStore, contains_secret, is_sensitive, redact_secrets
@@ -200,6 +202,22 @@ class SecurityTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_http_client_sends_cloudflare_compatible_identity(self) -> None:
+        client = OpenAICompatibleClient(
+            base_url="https://opencode.ai/zen/go/v1",
+            model="deepseek-v4-flash",
+            api_key="test",
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+        with mock.patch("b1ack_memory.llm.urllib.request.urlopen", return_value=response) as open_url:
+            self.assertTrue(client._post("/chat/completions", {"model": client.model})["ok"])
+
+        request = open_url.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), f"B1ack-Memory/{b1ack_memory.__version__}")
+        self.assertEqual(request.get_header("Accept"), "application/json")
+        self.assertEqual(request.get_header("Authorization"), "Bearer test")
+
     def test_deepseek_uses_low_cost_non_thinking_mode(self) -> None:
         client = OpenAICompatibleClient(
             base_url="https://api.deepseek.com", model="deepseek-v4-flash", api_key="test"

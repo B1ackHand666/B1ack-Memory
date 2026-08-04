@@ -1,6 +1,6 @@
 """B1ack Memory public package."""
 
 from .service import MemoryService
+from .version import __version__
 
-__version__ = "0.1.3"
 __all__ = ["MemoryService", "__version__"]

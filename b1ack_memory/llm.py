@@ -6,6 +6,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from .version import __version__
+
 
 class LlmError(RuntimeError):
     pass
@@ -101,7 +103,9 @@ class OpenAICompatibleClient:
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
             method="POST",
             headers={
+                "Accept": "application/json",
                 "Content-Type": "application/json",
+                "User-Agent": f"B1ack-Memory/{__version__}",
                 **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
             },
         )

@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.1.4] - 2026-08-04
+
+### 修复
+
+- 为所有 OpenAI-compatible 请求添加明确的 `User-Agent` 和 `Accept` 请求头。
+- 修复 OpenCode Go/Zen 经 Cloudflare 访问时，Python 默认客户端特征触发 `HTTP 403 / error code 1010` 的问题。
+
 ## [0.1.3] - 2026-08-04
 
 ### 修复
@@ -59,7 +66,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.3...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.4
 [0.1.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.3
 [0.1.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.2
 [0.1.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.1
