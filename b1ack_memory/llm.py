@@ -69,7 +69,8 @@ class OpenAICompatibleClient:
         }
         # DeepSeek V4 defaults to thinking mode. Dream extraction is structured,
         # repetitive work, so non-thinking mode is the lower-cost default.
-        if "api.deepseek.com" in self.base_url and self.model.startswith("deepseek-v4"):
+        model_id = self.model.lower().rsplit("/", 1)[-1]
+        if model_id.startswith("deepseek-v4"):
             body["thinking"] = {"type": "disabled"}
         try:
             response = self._post("/chat/completions", body)
@@ -80,10 +81,20 @@ class OpenAICompatibleClient:
             body["messages"][0]["content"] += " Output one valid JSON object and no markdown."
             response = self._post("/chat/completions", body)
         try:
-            content = response["choices"][0]["message"]["content"]
+            message = response["choices"][0]["message"]
+            content = message["content"]
             if isinstance(content, list):
                 content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+            if not str(content or "").strip():
+                if message.get("reasoning_content"):
+                    raise LlmError(
+                        "Model returned reasoning_content but no final content; "
+                        "use non-thinking mode for structured Dream extraction"
+                    )
+                raise LlmError("Model returned an empty completion")
             parsed = self._parse_json(str(content))
+        except LlmError:
+            raise
         except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
             raise LlmError(f"Invalid JSON completion: {error}") from error
         usage = response.get("usage") or {}

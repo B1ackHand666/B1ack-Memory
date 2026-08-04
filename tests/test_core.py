@@ -7,7 +7,7 @@ from unittest import mock
 
 import b1ack_memory
 from b1ack_memory.dream import DreamEngine
-from b1ack_memory.llm import LlmResult, OpenAICompatibleClient
+from b1ack_memory.llm import LlmError, LlmResult, OpenAICompatibleClient
 from b1ack_memory.security import SecretStore, contains_secret, is_sensitive, redact_secrets
 from b1ack_memory.service import MemoryService
 
@@ -233,7 +233,9 @@ class ClientTests(unittest.TestCase):
 
     def test_deepseek_uses_low_cost_non_thinking_mode(self) -> None:
         client = OpenAICompatibleClient(
-            base_url="https://api.deepseek.com", model="deepseek-v4-flash", api_key="test"
+            base_url="https://opencode.ai/zen/go/v1",
+            model="deepseek-v4-flash",
+            api_key="test",
         )
         captured = {}
 
@@ -244,6 +246,20 @@ class ClientTests(unittest.TestCase):
         client._post = fake_post  # type: ignore[method-assign]
         self.assertTrue(client.chat_json(system="JSON only", user="test").parsed["ok"])
         self.assertEqual(captured["thinking"], {"type": "disabled"})
+
+    def test_empty_reasoning_only_completion_has_actionable_error(self) -> None:
+        client = OpenAICompatibleClient(
+            base_url="https://opencode.ai/zen/go/v1",
+            model="deepseek-v4-flash",
+            api_key="test",
+        )
+        client._post = lambda _path, _body: {  # type: ignore[method-assign]
+            "choices": [
+                {"message": {"content": "", "reasoning_content": "internal reasoning"}}
+            ]
+        }
+        with self.assertRaisesRegex(LlmError, "reasoning_content"):
+            client.chat_json(system="JSON only", user="test")
 
 
 if __name__ == "__main__":

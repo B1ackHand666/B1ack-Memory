@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+## [0.1.6] - 2026-08-04
+
+### 修复
+
+- DeepSeek V4 的非思考模式判断改为基于模型 ID，不再限定 DeepSeek 官方 API 域名。
+- 修复通过 OpenCode Go 等兼容网关使用 `deepseek-v4-flash` 时，响应只含 `reasoning_content`、普通 `content` 为空并导致 JSON 解析失败的问题。
+- 对空 completion 和仅思考内容的响应提供明确错误信息。
+
 ## [0.1.5] - 2026-08-04
 
 ### 修复
@@ -73,7 +81,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.5...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.6...HEAD
+[0.1.6]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.6
 [0.1.5]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.5
 [0.1.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.4
 [0.1.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.3
