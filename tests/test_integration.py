@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import inspect
 import json
+import os
+import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -66,6 +71,82 @@ class ProviderTests(unittest.TestCase):
 
 
 class DistributionTests(unittest.TestCase):
+    def test_directory_plugin_is_discoverable_and_loadable(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        entrypoint = (root / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("register_memory_provider", entrypoint)
+        self.assertIn("MemoryProvider", entrypoint)
+
+        package_name = "_hermes_user_memory.b1ack-memory"
+        parent_name = package_name.rpartition(".")[0]
+        parent = types.ModuleType(parent_name)
+        parent.__path__ = []
+        sys.modules[parent_name] = parent
+        previous_home = os.environ.get("B1ACK_MEMORY_HOME")
+        try:
+            with tempfile.TemporaryDirectory() as memory_home:
+                os.environ["B1ACK_MEMORY_HOME"] = memory_home
+                spec = importlib.util.spec_from_file_location(
+                    package_name,
+                    root / "__init__.py",
+                    submodule_search_locations=[str(root)],
+                )
+                self.assertIsNotNone(spec)
+                self.assertIsNotNone(spec.loader)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[package_name] = module
+                spec.loader.exec_module(module)
+
+                class Collector:
+                    provider = None
+
+                    def register_memory_provider(self, provider) -> None:
+                        self.provider = provider
+
+                collector = Collector()
+                module.register(collector)
+                self.assertIsNotNone(collector.provider)
+                self.assertEqual(collector.provider.name, "b1ack-memory")
+                collector.provider.service.shutdown(timeout=1)
+        finally:
+            if previous_home is None:
+                os.environ.pop("B1ACK_MEMORY_HOME", None)
+            else:
+                os.environ["B1ACK_MEMORY_HOME"] = previous_home
+            for name in list(sys.modules):
+                if name == parent_name or name.startswith(f"{package_name}.") or name == package_name:
+                    sys.modules.pop(name, None)
+
+    def test_directory_manifest_matches_release(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        manifest = (root / "plugin.yaml").read_text(encoding="utf-8")
+        self.assertIn("manifest_version: 1", manifest)
+        self.assertIn("kind: exclusive", manifest)
+        self.assertIn(f'version: "{b1ack_memory.__version__}"', manifest)
+
+    def test_dashboard_api_can_be_loaded_as_a_standalone_module(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        script = (
+            "import importlib.util; "
+            f"p={str(root / 'dashboard' / 'plugin_api.py')!r}; "
+            "s=importlib.util.spec_from_file_location('hermes_dashboard_plugin_b1ack_memory', p); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+            "assert m.router.prefix == ''"
+        )
+        with tempfile.TemporaryDirectory() as memory_home:
+            environment = os.environ.copy()
+            environment["B1ACK_MEMORY_HOME"] = memory_home
+            environment.pop("PYTHONPATH", None)
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                cwd=memory_home,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_packaged_dashboard_and_manifest_assets_exist(self) -> None:
         package = Path(b1ack_memory.__file__).parent
         required = [

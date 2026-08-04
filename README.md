@@ -1,4 +1,4 @@
-# B1ack Memory v0.1.0
+# B1ack Memory v0.1.1
 
 B1ack Memory 是一个面向个人、local-first 的 Hermes Memory Provider。它把 SQLite 作为唯一事实源，以全文检索为默认召回方式，并用 Light → REM → Deep 三阶段 Dream 流程保守地整理长期记忆。项目刻意不引入 ORM、外部向量库、Node 构建链或常驻数据库服务，方便一个人阅读、修改和维护。
 
@@ -19,21 +19,30 @@ B1ack Memory 是一个面向个人、local-first 的 Hermes Memory Provider。�
 
 ## 安装到 Hermes
 
-要求 Hermes Agent 0.18.2+、Python 3.11+。个人安装推荐将本目录复制或链接为 `~/.hermes/plugins/b1ack-memory`，然后在 Hermes 配置中把 memory provider 设为 `b1ack-memory`。也可以通过 wheel/pip entry point 安装；发布包同时携带 provider、CLI、静态页面与 Dashboard 资产。
-
-开发时也可以在本目录运行：
+要求 Hermes Agent 0.20.0+、Python 3.11+。推荐使用 Hermes 自带的插件安装器：
 
 ```bash
-python -m pip install -e .
-b1ack-memory status
-b1ack-memory ui
+hermes plugins install B1ackHand666/B1ack-Memory --enable
+hermes memory setup
+hermes memory status
+hermes b1ack-memory status
 ```
 
-若 Hermes 尚未安装 Web Dashboard 依赖，使用 `python -m pip install -e ".[web]"`。独立 WebUI 默认只监听 `http://127.0.0.1:7788/api/ui/`。Dashboard 安装器若检测到 `dashboard/manifest.json`，会复用同一套页面和 API。
+在 `hermes memory setup` 中选择 `b1ack-memory`。如果 Hermes Gateway 正在运行，安装后执行 `hermes gateway restart`。升级时重新运行安装命令；数据保存在插件目录之外，不会随插件升级被覆盖。
+
+Hermes Dashboard 已启用时，运行 `hermes dashboard --no-open`，面板中会出现 B1ack Memory 标签。也可启动更轻量的独立 WebUI：
+
+```bash
+hermes b1ack-memory ui --host 127.0.0.1 --port 7788 --no-open
+```
+
+服务器上建议保持 loopback 监听，再通过 SSH 端口转发访问；不要把 WebUI 直接暴露到公网。独立页面地址是 `http://127.0.0.1:7788/api/ui/`。
+
+开发时可在项目目录运行 `python -m pip install -e ".[web]"`，然后使用独立命令 `b1ack-memory`。仅用 pip 安装 wheel 不会让 Hermes 0.20.x 自动发现 Memory Provider，生产安装请使用上面的 `hermes plugins install`。
 
 ## 首次设置
 
-1. 运行 `b1ack-memory ui`，打开“模型与设置”。
+1. 运行 `hermes b1ack-memory ui`，打开“模型与设置”。
 2. 填写 OpenAI-compatible Base URL、模型名和 API Key，点击“测试连接”。
 3. 根据需要调整每日 Dream 时间。向量检索默认关闭，不影响中文和英文全文检索。
 4. 在“备份与维护”创建第一次备份。
