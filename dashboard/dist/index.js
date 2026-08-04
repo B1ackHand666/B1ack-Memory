@@ -2,10 +2,11 @@
   "use strict";
   const SDK = window.__HERMES_PLUGIN_SDK__;
   const React = SDK.React;
+  const dashboardBasePath = (window.__HERMES_BASE_PATH__ || "").replace(/\/$/, "");
 
   function B1ackMemoryPage() {
     return React.createElement("iframe", {
-      src: "/api/plugins/b1ack-memory/ui/",
+      src: dashboardBasePath + "/api/plugins/b1ack-memory/ui/",
       title: "B1ack Memory",
       style: {
         border: 0,

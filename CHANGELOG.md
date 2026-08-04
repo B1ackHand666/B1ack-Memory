@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.1.2] - 2026-08-04
+
+### 修复
+
+- Dashboard iframe 现在读取 Hermes 注入的 `window.__HERMES_BASE_PATH__`。
+- 修复 Hermes Dashboard 经反向代理子路径访问时，B1ack Memory 面板请求根路径并显示 `Not Found` 的问题。
+
 ## [0.1.1] - 2026-08-04
 
 ### 修复
@@ -44,6 +51,7 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.1...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.2...HEAD
+[0.1.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.2
 [0.1.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.1
 [0.1.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.0

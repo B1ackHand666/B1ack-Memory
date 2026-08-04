@@ -124,6 +124,16 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("kind: exclusive", manifest)
         self.assertIn(f'version: "{b1ack_memory.__version__}"', manifest)
 
+    def test_dashboard_iframe_respects_reverse_proxy_base_path(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for script in (
+            root / "dashboard" / "dist" / "index.js",
+            root / "b1ack_memory" / "dashboard" / "dist" / "index.js",
+        ):
+            source = script.read_text(encoding="utf-8")
+            self.assertIn("window.__HERMES_BASE_PATH__", source)
+            self.assertIn('dashboardBasePath + "/api/plugins/b1ack-memory/ui/"', source)
+
     def test_dashboard_api_can_be_loaded_as_a_standalone_module(self) -> None:
         root = Path(__file__).resolve().parents[1]
         script = (
