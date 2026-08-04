@@ -8,6 +8,11 @@ from typing import Any
 
 from .version import __version__
 
+try:
+    import httpx
+except ImportError:  # pragma: no cover - exercised by minimal plugin installs
+    httpx = None  # type: ignore[assignment]
+
 
 class LlmError(RuntimeError):
     pass
@@ -98,16 +103,38 @@ class OpenAICompatibleClient:
         return vectors
 
     def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        url = f"{self.base_url}{path}"
+        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"B1ack-Memory/{__version__}",
+            **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
+        }
+        if httpx is not None:
+            try:
+                response = httpx.post(
+                    url,
+                    content=payload,
+                    headers=headers,
+                    timeout=self.timeout,
+                    follow_redirects=True,
+                )
+            except httpx.HTTPError as error:
+                raise LlmError(str(error)) from error
+            raw = response.text
+            if response.status_code >= 400:
+                raise LlmError(f"HTTP {response.status_code}: {raw[:500]}")
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as error:
+                raise LlmError(str(error)) from error
+
         request = urllib.request.Request(
-            f"{self.base_url}{path}",
-            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            url,
+            data=payload,
             method="POST",
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "User-Agent": f"B1ack-Memory/{__version__}",
-                **({"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}),
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:

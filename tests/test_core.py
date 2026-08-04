@@ -208,15 +208,28 @@ class ClientTests(unittest.TestCase):
             model="deepseek-v4-flash",
             api_key="test",
         )
-        response = mock.MagicMock()
-        response.__enter__.return_value.read.return_value = b'{"ok":true}'
-        with mock.patch("b1ack_memory.llm.urllib.request.urlopen", return_value=response) as open_url:
+        response = mock.MagicMock(status_code=200, text='{"ok":true}')
+        with mock.patch("b1ack_memory.llm.httpx.post", return_value=response) as post:
             self.assertTrue(client._post("/chat/completions", {"model": client.model})["ok"])
 
-        request = open_url.call_args.args[0]
-        self.assertEqual(request.get_header("User-agent"), f"B1ack-Memory/{b1ack_memory.__version__}")
-        self.assertEqual(request.get_header("Accept"), "application/json")
-        self.assertEqual(request.get_header("Authorization"), "Bearer test")
+        headers = post.call_args.kwargs["headers"]
+        self.assertEqual(headers["User-Agent"], f"B1ack-Memory/{b1ack_memory.__version__}")
+        self.assertEqual(headers["Accept"], "application/json")
+        self.assertEqual(headers["Authorization"], "Bearer test")
+        self.assertTrue(post.call_args.kwargs["follow_redirects"])
+
+    def test_http_client_keeps_urllib_fallback(self) -> None:
+        client = OpenAICompatibleClient(
+            base_url="http://localhost:1234/v1", model="local-model"
+        )
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true}'
+        with (
+            mock.patch("b1ack_memory.llm.httpx", None),
+            mock.patch("b1ack_memory.llm.urllib.request.urlopen", return_value=response) as open_url,
+        ):
+            self.assertTrue(client._post("/chat/completions", {})["ok"])
+        self.assertEqual(open_url.call_args.args[0].get_header("Accept"), "application/json")
 
     def test_deepseek_uses_low_cost_non_thinking_mode(self) -> None:
         client = OpenAICompatibleClient(

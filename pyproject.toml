@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "b1ack-memory"
-version = "0.1.4"
+version = "0.1.5"
 description = "A small, transparent personal memory provider for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["httpx>=0.27"]
 
 [project.scripts]
 b1ack-memory = "b1ack_memory.cli:main"

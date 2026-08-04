@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.1.5] - 2026-08-04
+
+### 修复
+
+- OpenAI-compatible 请求优先改用 Hermes 环境已有的 `httpx` 传输，同时保留标准库 `urllib` 回退。
+- 修复部分 VPS 出口下 Cloudflare 根据 Python `urllib` 的 HTTP/TLS 客户端指纹持续返回 `403 / 1010` 的问题。
+
 ## [0.1.4] - 2026-08-04
 
 ### 修复
@@ -66,7 +73,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.4...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.5...HEAD
+[0.1.5]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.5
 [0.1.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.4
 [0.1.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.3
 [0.1.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.2
