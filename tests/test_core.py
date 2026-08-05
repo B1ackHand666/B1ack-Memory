@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import sqlite3
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -59,6 +61,106 @@ class ConflictClient(FakeClient):
             ],
         }
         return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+
+
+class ApprovingClient(FakeClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        import json
+
+        if "review personal-memory" in system:
+            payload = json.loads(user)
+            parsed = {
+                "summary": "耐久信息已通过复核",
+                "themes": [],
+                "durable_candidate_ids": [item["id"] for item in payload["candidates"]],
+                "noise": [],
+                "duplicates": [],
+                "conflicts": [],
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        if "compact qualified" in system:
+            payload = json.loads(user)
+            parsed = {
+                "memories": [
+                    {"candidate_id": item["id"], "content": item["content"]}
+                    for item in payload["candidates"]
+                ]
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
+class ExistingApprovingClient(ApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        if "extract durable" in system:
+            parsed = {"candidates": []}
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
+class ManyCandidateClient(ExistingApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        import json
+
+        if "extract durable" in system:
+            turn_id = json.loads(user)["turns"][0]["id"]
+            parsed = {
+                "candidates": [
+                    {
+                        "content": f"用户的稳定偏好编号 {index}",
+                        "kind": "preference",
+                        "confidence": 0.9,
+                        "sensitive": False,
+                        "source_turn_id": turn_id,
+                    }
+                    for index in range(12)
+                ]
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
+class DuplicateReviewClient(ExistingApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        import json
+
+        if "review personal-memory" in system:
+            payload = json.loads(user)
+            candidates = payload["candidates"]
+            parsed = {
+                "summary": "合并同义候选",
+                "themes": [],
+                "durable_candidate_ids": [candidates[0]["id"]],
+                "noise": [],
+                "duplicates": [
+                    {
+                        "candidate_id": candidates[1]["id"],
+                        "canonical_candidate_id": candidates[0]["id"],
+                        "explanation": "表达不同但含义相同",
+                    }
+                ],
+                "conflicts": [],
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
+class NoiseReviewClient(ExistingApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        import json
+
+        if "review personal-memory" in system:
+            candidate_id = json.loads(user)["candidates"][0]["id"]
+            parsed = {
+                "summary": "发现一次性噪声",
+                "themes": [],
+                "durable_candidate_ids": [],
+                "noise": [{"candidate_id": candidate_id, "explanation": "一次性任务进度"}],
+                "duplicates": [],
+                "conflicts": [],
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
 
 
 class CoreTests(unittest.TestCase):
@@ -127,6 +229,7 @@ class CoreTests(unittest.TestCase):
         candidate_id = self.service.list_candidates()[0]["id"]
         memory_id = self.service.promote_candidate(candidate_id)["id"]
         old_backup = self.service.create_backup().name
+        self.service.trash_memory(memory_id)
         result = self.service.purge_memory(memory_id)
         self.assertEqual(result["removed"]["memories"], 1)
         self.assertEqual(self.service.list_memories(), [])
@@ -185,6 +288,202 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(candidate.evidence_days, 2)
 
+    def test_dream_caps_new_candidates_at_eight(self) -> None:
+        self.service.capture_turn("s1", "这里包含很多长期偏好", "好的")
+        outcome = DreamEngine(self.service.db, ManyCandidateClient()).run()
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.candidate_count, 8)
+        self.assertEqual(outcome.filtered_count, 4)
+        self.assertEqual(len(self.service.list_candidates()), 8)
+
+    def test_repeat_evidence_lane_auto_promotes(self) -> None:
+        raw_id = self.service.db.add_raw_turn("old", "旧证据", "好的", redacted=False)
+        self.service.db.upsert_candidate(
+            "用户偏好简洁的中文回答",
+            kind="preference",
+            confidence=0.94,
+            sensitive=False,
+            raw_turn_id=raw_id,
+            excerpt="用户偏好简洁的中文回答",
+            observed_at=(datetime.now(UTC) - timedelta(days=1)).isoformat(),
+        )
+        self.service.db.mark_turns_ingested([raw_id])
+        self.service.capture_turn("today", "请记住我偏好简洁中文", "好的")
+        outcome = DreamEngine(self.service.db, ApprovingClient()).run()
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.promoted_count, 1)
+        self.assertEqual(len(self.service.list_memories()), 1)
+
+    def test_utility_lane_auto_promotes_after_two_distinct_injections(self) -> None:
+        candidate = self.service.db.upsert_candidate(
+            "用户偏好黑咖啡",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="用户偏好黑咖啡",
+        )
+        self.service.rebuild_derived()
+        self.service.search("黑咖啡偏好", injected=True)
+        self.service.search("用户喝什么咖啡", injected=True)
+        self.service.capture_turn("trigger", "今天继续工作", "好的")
+        outcome = DreamEngine(self.service.db, ExistingApprovingClient()).run()
+        self.assertEqual(outcome.promoted_count, 1)
+        self.assertEqual(self.service.list_memories()[0]["content"], candidate.content)
+
+    def test_rem_merges_semantic_duplicates_and_expires_noise(self) -> None:
+        first = self.service.db.upsert_candidate(
+            "用户喜欢简洁的中文回答",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="用户喜欢简洁的中文回答",
+        )
+        self.service.db.upsert_candidate(
+            "回答用户时应使用精炼中文",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="回答用户时应使用精炼中文",
+        )
+        self.service.capture_turn("merge", "继续", "好的")
+        outcome = DreamEngine(self.service.db, DuplicateReviewClient()).run()
+        self.assertEqual(outcome.merged_count, 1)
+        pending = self.service.list_candidates()
+        self.assertEqual(len(pending), 1)
+        canonical_id = pending[0]["id"]
+
+        with self.service.db.transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE candidates SET rem_status='unreviewed',rem_reviewed_at=NULL WHERE id=?",
+                (canonical_id,),
+            )
+        self.service.capture_turn("noise", "继续", "好的")
+        noisy = DreamEngine(self.service.db, NoiseReviewClient()).run()
+        self.assertEqual(noisy.expired_count, 1)
+        self.assertEqual(self.service.db.get_candidate(canonical_id).status, "expired")
+
+    def test_auto_promotion_is_capped_per_local_day(self) -> None:
+        for index in range(4):
+            content = f"跨日稳定偏好 {index}"
+            for day in (2, 1):
+                raw_id = self.service.db.add_raw_turn(
+                    f"seed-{index}-{day}", content, "好的", redacted=False
+                )
+                self.service.db.upsert_candidate(
+                    content,
+                    kind="preference",
+                    confidence=0.9,
+                    sensitive=False,
+                    raw_turn_id=raw_id,
+                    excerpt=content,
+                    observed_at=(datetime.now(UTC) - timedelta(days=day)).isoformat(),
+                )
+                self.service.db.mark_turns_ingested([raw_id])
+        self.service.capture_turn("first", "继续", "好的")
+        first = DreamEngine(self.service.db, ExistingApprovingClient()).run()
+        self.assertEqual(first.promoted_count, 3)
+        self.service.capture_turn("second", "继续", "好的")
+        second = DreamEngine(self.service.db, ExistingApprovingClient()).run()
+        self.assertEqual(second.promoted_count, 0)
+        self.assertEqual(len(self.service.list_memories()), 3)
+
+    def test_candidate_expiration_rejection_and_cleanup(self) -> None:
+        candidate = self.service.db.upsert_candidate(
+            "长期候选",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="长期候选",
+        )
+        now = datetime(2026, 8, 5, tzinfo=UTC)
+        with self.service.db.transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE candidates SET last_activity_at=? WHERE id=?",
+                ((now - timedelta(days=15)).isoformat(), candidate.id),
+            )
+        first = self.service.db.retention_cleanup(365, 365, 14, 30, 30, now=now)
+        self.assertEqual(first["expired_candidates"], 1)
+        self.assertEqual(self.service.db.get_candidate(candidate.id).status, "expired")
+        with self.service.db.transaction(immediate=True) as conn:
+            conn.execute(
+                "UPDATE candidates SET expired_at=? WHERE id=?",
+                ((now - timedelta(days=31)).isoformat(), candidate.id),
+            )
+        second = self.service.db.retention_cleanup(365, 365, 14, 30, 30, now=now)
+        self.assertEqual(second["purged_candidates"], 1)
+        self.assertIsNone(self.service.db.get_candidate(candidate.id))
+
+        rejected = self.service.db.upsert_candidate(
+            "不要重复建议晨跑",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="不要重复建议晨跑",
+        )
+        self.service.reject_candidate(rejected.id)
+        suppressed = self.service.db.upsert_candidate(
+            "不要重复建议晨跑",
+            kind="preference",
+            confidence=0.99,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="不要重复建议晨跑",
+        )
+        self.assertEqual(suppressed.status, "rejected")
+        self.assertEqual(self.service.list_candidates(), [])
+
+    def test_candidate_privacy_purge_removes_old_backups(self) -> None:
+        self.service.capture_turn("s1", "候选隐私删除标记", "好的")
+        DreamEngine(self.service.db, FakeClient()).run()
+        candidate_id = self.service.list_candidates()[0]["id"]
+        old_backup = self.service.create_backup().name
+        result = self.service.purge_candidate(candidate_id)
+        self.assertEqual(result["removed"]["candidates"], 1)
+        self.assertIsNone(self.service.db.get_candidate(candidate_id))
+        self.assertNotIn(old_backup, {item["name"] for item in self.service.list_backups()})
+        self.assertTrue(result["clean_backup"].endswith("-post-purge.db"))
+
+    def test_active_long_term_memory_cannot_be_hard_deleted(self) -> None:
+        memory_id = self.service.remember("需要先回收的长期记忆")["memory"]["id"]
+        with self.assertRaisesRegex(ValueError, "trash"):
+            self.service.purge_memory(memory_id)
+
+    def test_schema_v2_candidate_migrates_without_immediate_deletion(self) -> None:
+        from b1ack_memory.db import MemoryDatabase
+
+        path = self.root / "legacy.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta(version INTEGER NOT NULL);
+            INSERT INTO schema_meta VALUES(2);
+            CREATE TABLE candidates (
+                id TEXT PRIMARY KEY, content TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending', model_confidence REAL NOT NULL DEFAULT 0,
+                sensitive INTEGER NOT NULL DEFAULT 0, score REAL NOT NULL DEFAULT 0,
+                score_components TEXT NOT NULL DEFAULT '{}', recall_count INTEGER NOT NULL DEFAULT 0,
+                unique_query_count INTEGER NOT NULL DEFAULT 0, evidence_days INTEGER NOT NULL DEFAULT 1,
+                conflict_memory_id TEXT, conflict_reason TEXT, content_hash TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL
+            );
+            INSERT INTO candidates VALUES(
+                'legacy','旧候选','fact','pending',0.9,0,0,'{}',0,0,1,NULL,NULL,
+                'hash','2026-01-01T00:00:00+00:00','2026-01-02T00:00:00+00:00'
+            );
+            """
+        )
+        conn.close()
+        legacy = MemoryDatabase(path)
+        migrated = legacy.get_candidate("legacy")
+        self.assertIsNotNone(migrated)
+        self.assertEqual(migrated.status, "pending")
+        self.assertEqual(migrated.last_activity_at, migrated.last_seen_at)
+
 
 class SecurityTests(unittest.TestCase):
     def test_secret_detection_and_redaction(self) -> None:
@@ -204,9 +503,10 @@ class SecurityTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def test_dream_prompts_bound_structured_output(self) -> None:
-        self.assertIn("at most 20 candidates", LIGHT_SYSTEM)
+        self.assertIn("at most 8 candidates", LIGHT_SYSTEM)
         self.assertIn("under 240 characters", LIGHT_SYSTEM)
-        self.assertIn("at most 10 themes and 20 conflicts", REM_SYSTEM)
+        self.assertIn("durable_candidate_ids", REM_SYSTEM)
+        self.assertIn("duplicates", REM_SYSTEM)
 
     def test_http_client_sends_cloudflare_compatible_identity(self) -> None:
         client = OpenAICompatibleClient(

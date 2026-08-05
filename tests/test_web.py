@@ -76,6 +76,47 @@ class WebTests(unittest.TestCase):
         self.assertIn("backup", restore.json()["detail"].lower())
         self.assertEqual(self.client.get("/api/memories").json()[0]["id"], created["id"])
 
+    def test_candidate_status_restore_and_privacy_delete_api(self) -> None:
+        token = self.client.get("/api/bootstrap").json()["token"]
+        headers = {"X-B1ack-Memory-Token": token}
+        candidate = self.service.db.upsert_candidate(
+            "候选 API 测试",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="候选 API 测试",
+        )
+        rejected = self.client.post(
+            f"/api/candidates/{candidate.id}/reject", headers=headers
+        )
+        self.assertEqual(rejected.status_code, 200)
+        rows = self.client.get("/api/candidates?status=rejected").json()
+        self.assertEqual(rows[0]["id"], candidate.id)
+        self.assertIsNotNone(rows[0]["lifecycle"]["purge_at"])
+
+        restored = self.client.post(
+            f"/api/candidates/{candidate.id}/restore", headers=headers
+        )
+        self.assertEqual(restored.status_code, 200)
+        deleted = self.client.delete(f"/api/candidates/{candidate.id}", headers=headers)
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(self.client.get("/api/candidates").json(), [])
+
+    def test_candidate_retention_settings_are_exposed(self) -> None:
+        token = self.client.get("/api/bootstrap").json()["token"]
+        headers = {"X-B1ack-Memory-Token": token}
+        settings = self.client.get("/api/settings").json()
+        self.assertEqual(settings["dream"]["max_new_candidates"], 8)
+        self.assertEqual(settings["retention"]["candidate_inactive_days"], 14)
+        response = self.client.post(
+            "/api/settings/retention",
+            json={"candidate_inactive_days": 21},
+            headers=headers,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["candidate_inactive_days"], 21)
+
 
 if __name__ == "__main__":
     unittest.main()

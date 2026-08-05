@@ -225,7 +225,7 @@ class RetrievalEngine:
                         (hit.id,),
                     ).fetchone()[0]
                     conn.execute(
-                        "UPDATE candidates SET recall_count=?,unique_query_count=? WHERE id=?",
-                        (count, unique, hit.id),
+                        "UPDATE candidates SET recall_count=?,unique_query_count=?,"
+                        "last_recalled_at=?,last_activity_at=? WHERE id=? AND status='pending'",
+                        (count, unique, now, now, hit.id),
                     )
-

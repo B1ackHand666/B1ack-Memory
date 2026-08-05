@@ -163,6 +163,18 @@ def create_router(
         memory.reject_candidate(candidate_id)
         return {"ok": True}
 
+    @router.post("/candidates/{candidate_id}/restore", dependencies=mutate())
+    def restore_candidate(candidate_id: str) -> dict[str, Any]:
+        return memory.restore_candidate(candidate_id)
+
+    @router.delete("/candidates/{candidate_id}", dependencies=mutate())
+    def purge_candidate(candidate_id: str) -> dict[str, Any]:
+        return memory.purge_candidate(candidate_id)
+
+    @router.post("/candidates/purge", dependencies=mutate())
+    def purge_candidates(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.purge_candidates(str(body.get("status", "")))
+
     @router.post("/backup", dependencies=mutate())
     def backup() -> dict[str, str]:
         return {"name": memory.create_backup().name}

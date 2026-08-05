@@ -4,6 +4,35 @@
 
 ## [未发布]
 
+## [0.2.0] - 2026-08-05
+
+### 新增
+
+- 候选记忆增加待审核、已过期、已拒绝生命周期，以及恢复、单条隐私删除和按状态批量清理。
+- 默认 14 天无活动后过期；已过期与人工拒绝候选再保留 30 天后自动清理。
+- WebUI 显示候选最后活动、清理时间、REM 判断和两条自动晋升通道进度。
+- Dream 日志新增候选新增、合并、过滤和过期计数。
+- 新增根目录 `AGENTS.md`，固定架构边界、跨会话接手流程和发布完成标准。
+
+### 变更
+
+- Light 只提取适合长期保留的稳定信息，置信度下限为 0.75，每次 Dream 最多新增 8 条候选。
+- REM 在原有调用中识别同义项、已有长期记忆、近期人工拒绝内容和临时噪声，无需新增模型或 embeddings。
+- 自动晋升改为“跨日重复”或“实际作用”双通道；综合评分只用于排序，每天最多自动晋升 3 条。
+- 长期记忆必须先进入回收站才能永久删除。
+- 设置面板增加候选数量上限和三项候选保留策略。
+
+### 安全与维护
+
+- 手动永久删除候选会清理关联会话、Dream/model 日志、召回、索引和旧托管备份，并生成干净备份。
+- 自动到期清理仅删除在线候选和派生数据，旧备份继续按照现有数量自然轮换。
+- 数据库升级到 schema v3；v0.1.x 旧候选保留并初始化最后活动时间，不会在升级时立即删除。
+
+### 测试
+
+- 覆盖双通道晋升、每日上限、严格提取上限、REM 同义合并和噪声过滤。
+- 覆盖候选过期、拒绝抑制、恢复、自动清理、隐私删除、Web API 和 schema v2 升级。
+
 ## [0.1.7] - 2026-08-05
 
 ### 修复
@@ -89,7 +118,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.7...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.2.0
 [0.1.7]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.7
 [0.1.6]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.6
 [0.1.5]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.5
