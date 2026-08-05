@@ -5,6 +5,7 @@ let token = "";
 let settings = {};
 let editing = null;
 let memoriesById = new Map();
+let candidateStatus = "pending";
 
 const pageDescriptions = {
   overview: "记忆健康、处理队列和近期活动",
@@ -92,12 +93,17 @@ function renderStatus(status) {
   const metrics = [
     ["长期记忆", counts.active_memories],
     ["待审核候选", counts.pending_candidates],
+    ["已过期候选", counts.expired_candidates],
+    ["已拒绝候选", counts.rejected_candidates],
     ["待处理会话", counts.pending_turns],
     ["回收站", counts.trashed_memories],
   ];
   $("#metrics").innerHTML = metrics
     .map(([label, value]) => `<div class="metric"><span>${label}</span><b>${value}</b></div>`)
     .join("");
+  $("#candidate-pending-count").textContent = counts.pending_candidates;
+  $("#candidate-expired-count").textContent = counts.expired_candidates;
+  $("#candidate-rejected-count").textContent = counts.rejected_candidates;
   $("#health").innerHTML = `
     <p>数据库：<b>${escapeHtml(status.database.integrity)}</b> · ${(status.database.bytes / 1024).toFixed(1)} KB</p>
     <p>模型：${escapeHtml(status.llm.model)} · Key ${status.llm.configured ? "已配置" : "未配置"}</p>
@@ -149,30 +155,55 @@ async function loadMemories() {
 }
 
 async function loadCandidates() {
-  const rows = await api("/candidates");
+  const rows = await api(`/candidates?status=${encodeURIComponent(candidateStatus)}`);
+  document.querySelectorAll("[data-candidate-status]").forEach((button) => {
+    button.classList.toggle("active", button.dataset.candidateStatus === candidateStatus);
+  });
+  const bulk = $("#purge-candidate-status");
+  bulk.hidden = candidateStatus === "pending" || rows.length === 0;
   $("#candidate-list").innerHTML =
     rows
       .map((item) => {
         const conflict = item.conflict_reason
           ? `<div class="conflict">冲突：${escapeHtml(item.conflict_reason)}</div>`
           : "";
+        const reason = item.rem_reason
+          ? `<div class="candidate-reason">REM：${escapeHtml(item.rem_reason)}</div>`
+          : "";
+        const progress = item.promotion_progress;
+        const lifecycle = candidateStatus === "pending"
+          ? `无活动过期：${localTime(item.lifecycle.expires_at)}`
+          : `自动清理：${localTime(item.lifecycle.purge_at)}`;
+        const progressHtml = candidateStatus === "pending"
+          ? `<div class="promotion-progress">
+              <span class="${progress.confidence_met ? "met" : ""}">置信度 ${Number(item.model_confidence).toFixed(2)}</span>
+              <span class="${progress.rem_approved ? "met" : ""}">REM ${escapeHtml(item.rem_status)}</span>
+              <span class="${progress.repeat_evidence.met ? "met" : ""}">跨日 ${progress.repeat_evidence.current}/2</span>
+              <span class="${progress.utility.met ? "met" : ""}">作用 ${progress.utility.recalls}/2 次 · ${progress.utility.queries}/2 类</span>
+            </div>`
+          : "";
+        const actions = candidateStatus === "pending"
+          ? `<button data-action="promote-candidate" data-id="${item.id}">晋升</button>
+             <button class="danger" data-action="reject-candidate" data-id="${item.id}">拒绝</button>
+             <button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`
+          : `<button data-action="restore-candidate" data-id="${item.id}">恢复</button>
+             <button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`;
         const details = escapeHtml(
           JSON.stringify({ score: item.score_components, evidence: item.evidence }, null, 2),
         );
         return `<div class="card">
           <div>
             <p>${escapeHtml(item.content)}</p>
-            <div class="meta"><span class="badge">${escapeHtml(item.kind)}</span> · 评分 ${Number(item.score).toFixed(2)} · 证据天数 ${item.evidence_days} · 召回 ${item.recall_count} 次 / ${item.unique_query_count} 种查询</div>
+            <div class="meta"><span class="badge">${escapeHtml(item.kind)}</span> · 评分 ${Number(item.score).toFixed(2)} · 最后活动 ${localTime(item.last_activity_at)} · ${lifecycle}</div>
+            ${progressHtml}
             ${conflict}
+            ${reason}
             <details><summary>评分与证据（${item.evidence.length}）</summary><pre>${details}</pre></details>
           </div>
-          <div class="actions">
-            <button data-action="promote-candidate" data-id="${item.id}">晋升</button>
-            <button class="danger" data-action="reject-candidate" data-id="${item.id}">拒绝</button>
-          </div>
+          <div class="actions">${actions}</div>
         </div>`;
       })
-      .join("") || "<div class='callout'>没有待审核候选</div>";
+      .join("") || `<div class='callout'>当前没有${candidateStatus === "pending" ? "待审核" : candidateStatus === "expired" ? "已过期" : "已拒绝"}候选</div>`;
 }
 
 async function loadDreams() {
@@ -183,7 +214,7 @@ async function loadDreams() {
         (item) => `<div class="card">
           <div>
             <p><b>${escapeHtml(item.status)}</b> · ${localTime(item.started_at)}</p>
-            <div class="meta">输入 ${item.input_count} · 候选 ${item.candidate_count} · 晋升 ${item.promoted_count} · Token ${item.input_tokens}/${item.output_tokens}</div>
+            <div class="meta">输入 ${item.input_count} · 新增 ${item.candidate_count} · 合并 ${item.merged_count} · 过滤 ${item.filtered_count} · 过期 ${item.expired_count} · 晋升 ${item.promoted_count} · Token ${item.input_tokens}/${item.output_tokens}</div>
             ${item.error ? `<pre>${escapeHtml(item.error)}</pre>` : ""}
           </div>
           <span class="badge">${escapeHtml(item.id.slice(0, 8))}</span>
@@ -275,6 +306,12 @@ async function handleAction(button) {
     await mutate(`/candidates/${id}/promote`);
   } else if (action === "reject-candidate") {
     await mutate(`/candidates/${id}/reject`);
+  } else if (action === "restore-candidate") {
+    await mutate(`/candidates/${id}/restore`);
+  } else if (action === "purge-candidate") {
+    if (confirm("永久删除会清除关联会话、Dream 日志、索引和全部旧备份，无法撤销。继续？")) {
+      await mutate(`/candidates/${id}`, {}, "DELETE");
+    }
   } else if (action === "restore-backup") {
     if (confirm("将先保存当前状态，再恢复所选备份。继续？")) {
       await mutate(`/backups/${encodeURIComponent(button.dataset.name)}/restore`);
@@ -292,6 +329,9 @@ document.addEventListener("click", async (event) => {
       $(`#${button.dataset.page}`).classList.add("active");
       $("#title").textContent = button.textContent;
       $("#subtitle").textContent = pageDescriptions[button.dataset.page];
+    } else if (button.dataset.candidateStatus) {
+      candidateStatus = button.dataset.candidateStatus;
+      await loadCandidates();
     } else if (button.dataset.action) await handleAction(button);
     else if (button.id === "refresh") await loadAll();
     else if (button.id === "run-dream") await mutate("/dream/run");
@@ -306,6 +346,12 @@ document.addEventListener("click", async (event) => {
     } else if (button.dataset.test) {
       await mutate("/model/test", { kind: button.dataset.test });
     } else if (button.id === "add-memory") openEditor();
+    else if (button.id === "purge-candidate-status") {
+      const label = candidateStatus === "expired" ? "已过期" : "已拒绝";
+      if (confirm(`将永久删除全部${label}候选、关联内容和旧备份，无法撤销。继续？`)) {
+        await mutate("/candidates/purge", { status: candidateStatus });
+      }
+    }
   } catch (error) {
     showNotice(error.message, true);
   }

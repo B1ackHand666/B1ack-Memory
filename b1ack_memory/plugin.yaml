@@ -1,6 +1,6 @@
 manifest_version: 1
 name: b1ack-memory
-version: "0.1.7"
+version: "0.2.0"
 kind: exclusive
 description: Local-first personal memory with transparent Dream consolidation and WebUI
 requires_env: []

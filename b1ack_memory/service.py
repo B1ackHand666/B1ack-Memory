@@ -297,6 +297,9 @@ class MemoryService:
                     "",
                     f"- Input turns: {run['input_count']}",
                     f"- Candidates: {run['candidate_count']}",
+                    f"- Merged: {run['merged_count']}",
+                    f"- Filtered: {run['filtered_count']}",
+                    f"- Expired: {run['expired_count']}",
                     f"- Promoted: {run['promoted_count']}",
                     f"- Tokens: {run['input_tokens']} in / {run['output_tokens']} out",
                 ]
@@ -321,6 +324,12 @@ class MemoryService:
                 ).fetchone()[0],
                 "pending_candidates": conn.execute(
                     "SELECT COUNT(*) FROM candidates WHERE status='pending'"
+                ).fetchone()[0],
+                "expired_candidates": conn.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE status='expired'"
+                ).fetchone()[0],
+                "rejected_candidates": conn.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE status='rejected'"
                 ).fetchone()[0],
                 "pending_turns": conn.execute(
                     "SELECT COUNT(*) FROM raw_turns WHERE ingested_at IS NULL"
@@ -361,7 +370,10 @@ class MemoryService:
         return [item.to_dict() for item in self.db.list_memories(status=status, limit=limit)]
 
     def list_candidates(self, *, status: str = "pending", limit: int = 500) -> list[dict[str, Any]]:
+        if status not in {"pending", "expired", "rejected", "promoted"}:
+            raise ValueError("Unsupported candidate status")
         items = [item.to_dict() for item in self.db.list_candidates(status=status, limit=limit)]
+        retention = self.db.get_settings()["retention"]
         with self.db.connect() as conn:
             for item in items:
                 rows = conn.execute(
@@ -370,6 +382,54 @@ class MemoryService:
                     (item["id"],),
                 ).fetchall()
                 item["evidence"] = [dict(row) for row in rows]
+                activity = datetime.fromisoformat(item["last_activity_at"])
+                expires_at = activity + timedelta(
+                    days=int(retention["candidate_inactive_days"])
+                )
+                purge_at: datetime | None = None
+                if item["status"] == "expired" and item["expired_at"]:
+                    purge_at = datetime.fromisoformat(item["expired_at"]) + timedelta(
+                        days=int(retention["candidate_expired_days"])
+                    )
+                elif item["status"] == "rejected" and item["rejected_at"]:
+                    purge_at = datetime.fromisoformat(item["rejected_at"]) + timedelta(
+                        days=int(retention["rejected_candidate_days"])
+                    )
+                repeat_met = int(item["evidence_days"]) >= 2
+                utility_met = (
+                    int(item["recall_count"]) >= 2
+                    and int(item["unique_query_count"]) >= 2
+                )
+                common_met = (
+                    float(item["model_confidence"]) >= 0.80
+                    and item["rem_status"] == "approved"
+                    and item["rem_reviewed_at"] is not None
+                    and item["rem_reviewed_at"] >= item["last_activity_at"]
+                    and not item["sensitive"]
+                    and not item["conflict_reason"]
+                    and not item["conflict_memory_id"]
+                )
+                item["lifecycle"] = {
+                    "expires_at": expires_at.isoformat(),
+                    "purge_at": purge_at.isoformat() if purge_at else None,
+                }
+                item["promotion_progress"] = {
+                    "confidence_met": float(item["model_confidence"]) >= 0.80,
+                    "rem_approved": item["rem_status"] == "approved",
+                    "repeat_evidence": {
+                        "current": int(item["evidence_days"]),
+                        "required": 2,
+                        "met": repeat_met,
+                    },
+                    "utility": {
+                        "recalls": int(item["recall_count"]),
+                        "required_recalls": 2,
+                        "queries": int(item["unique_query_count"]),
+                        "required_queries": 2,
+                        "met": utility_met,
+                    },
+                    "eligible": common_met and (repeat_met or utility_met),
+                }
         return items
 
     def promote_candidate(self, candidate_id: str, content: str | None = None) -> dict[str, Any]:
@@ -384,6 +444,52 @@ class MemoryService:
         with self._maintenance_lock:
             self.db.reject_candidate(candidate_id)
             self.rebuild_derived()
+
+    def restore_candidate(self, candidate_id: str) -> dict[str, Any]:
+        with self._maintenance_lock:
+            candidate = self.db.restore_candidate(candidate_id)
+            self.rebuild_derived()
+            return candidate.to_dict()
+
+    def purge_candidate(self, candidate_id: str) -> dict[str, Any]:
+        with self._maintenance_lock:
+            candidate = self.db.get_candidate(candidate_id)
+            if not candidate:
+                raise KeyError(candidate_id)
+            if candidate.status == "promoted":
+                raise ValueError("Promoted candidates must be managed through their long-term memory")
+            removed = self.db.purge_candidate(candidate_id, privacy=True)
+            self.rebuild_derived()
+            maintenance = self.db.maintain(vacuum=True)
+            backup = self._replace_backups_after_privacy_purge()
+            return {
+                "purged": candidate_id,
+                "removed": removed,
+                "maintenance": maintenance,
+                "clean_backup": backup.name,
+            }
+
+    def purge_candidates(self, status: str) -> dict[str, Any]:
+        if status not in {"expired", "rejected"}:
+            raise ValueError("Only expired or rejected candidates can be cleared in bulk")
+        with self._maintenance_lock:
+            candidates = self.db.list_candidates(status=status, limit=100_000)
+            removed = {"candidates": 0, "raw_turns": 0, "dream_runs": 0}
+            if not candidates:
+                return {"status": status, "removed": removed, "clean_backup": None}
+            for candidate in candidates:
+                result = self.db.purge_candidate(candidate.id, privacy=True)
+                for key in removed:
+                    removed[key] += int(result.get(key, 0))
+            self.rebuild_derived()
+            maintenance = self.db.maintain(vacuum=True)
+            backup = self._replace_backups_after_privacy_purge()
+            return {
+                "status": status,
+                "removed": removed,
+                "maintenance": maintenance,
+                "clean_backup": backup.name,
+            }
 
     def recall_traces(self, limit: int = 200) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
@@ -429,29 +535,34 @@ class MemoryService:
 
     def purge_memory(self, record_id: str) -> dict[str, Any]:
         with self._maintenance_lock:
-            if not self.db.get_memory(record_id):
+            memory = self.db.get_memory(record_id)
+            if not memory:
                 raise KeyError(record_id)
+            if memory.status != "trashed":
+                raise ValueError("Long-term memory must be moved to trash before permanent deletion")
             removed = self.db.purge_memory(record_id)
             self.rebuild_derived()
             maintenance = self.db.maintain(vacuum=True)
-            failures = []
-            for path in self.backup_dir.glob("*.db"):
-                try:
-                    path.unlink()
-                except OSError as error:
-                    failures.append(f"{path.name}: {error}")
-            if failures:
-                raise RuntimeError(
-                    "Memory data was purged, but old backup deletion failed: "
-                    + "; ".join(failures)
-                )
-            backup = self.create_backup(label="post-purge", prune=False)
+            backup = self._replace_backups_after_privacy_purge()
             return {
                 "purged": record_id,
                 "removed": removed,
                 "maintenance": maintenance,
                 "clean_backup": backup.name,
             }
+
+    def _replace_backups_after_privacy_purge(self) -> Path:
+        failures = []
+        for path in self.backup_dir.glob("*.db"):
+            try:
+                path.unlink()
+            except OSError as error:
+                failures.append(f"{path.name}: {error}")
+        if failures:
+            raise RuntimeError(
+                "Data was purged, but old backup deletion failed: " + "; ".join(failures)
+            )
+        return self.create_backup(label="post-purge", prune=False)
 
     def create_backup(self, *, label: str = "manual", prune: bool = True) -> Path:
         with self._maintenance_lock:
@@ -500,7 +611,11 @@ class MemoryService:
             if cleanup:
                 retention = self.db.get_settings()["retention"]
                 result["cleanup"] = self.db.retention_cleanup(
-                    int(retention["raw_turn_days"]), int(retention["model_call_days"])
+                    int(retention["raw_turn_days"]),
+                    int(retention["model_call_days"]),
+                    int(retention["candidate_inactive_days"]),
+                    int(retention["candidate_expired_days"]),
+                    int(retention["rejected_candidate_days"]),
                 )
             result["derived"] = self.rebuild_derived()
             return result
@@ -537,6 +652,9 @@ class MemoryService:
                                 self.db.retention_cleanup(
                                     int(retention["raw_turn_days"]),
                                     int(retention["model_call_days"]),
+                                    int(retention["candidate_inactive_days"]),
+                                    int(retention["candidate_expired_days"]),
+                                    int(retention["rejected_candidate_days"]),
                                 )
                                 with self.db.transaction(immediate=True) as conn:
                                     conn.execute(
@@ -646,8 +764,17 @@ class MemoryService:
                 raise ValueError("max_light_batches must be at least 1")
             if int(value.get("max_auto_promotions", -1)) < 0:
                 raise ValueError("max_auto_promotions cannot be negative")
+            if int(value.get("max_new_candidates", 0)) not in range(1, 21):
+                raise ValueError("max_new_candidates must be between 1 and 20")
         if section == "retention":
-            for key in ("raw_turn_days", "model_call_days", "backup_count"):
+            for key in (
+                "raw_turn_days",
+                "model_call_days",
+                "backup_count",
+                "candidate_inactive_days",
+                "candidate_expired_days",
+                "rejected_candidate_days",
+            ):
                 if int(value[key]) < 1:
                     raise ValueError(f"{key} must be at least 1")
         if section == "recall" and int(value.get("limit", 5)) not in range(1, 21):

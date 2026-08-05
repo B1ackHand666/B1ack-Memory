@@ -13,7 +13,7 @@ from typing import Any
 
 from .models import CandidateRecord, MEMORY_KINDS, MemoryRecord
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -129,7 +129,16 @@ class MemoryDatabase:
                     conflict_reason TEXT,
                     content_hash TEXT NOT NULL,
                     first_seen_at TEXT NOT NULL,
-                    last_seen_at TEXT NOT NULL
+                    last_seen_at TEXT NOT NULL,
+                    last_activity_at TEXT NOT NULL,
+                    last_recalled_at TEXT,
+                    expired_at TEXT,
+                    rejected_at TEXT,
+                    promoted_at TEXT,
+                    promotion_origin TEXT,
+                    rem_status TEXT NOT NULL DEFAULT 'unreviewed',
+                    rem_reason TEXT,
+                    rem_reviewed_at TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_pending_hash
@@ -177,6 +186,9 @@ class MemoryDatabase:
                     deep_summary TEXT,
                     input_count INTEGER NOT NULL DEFAULT 0,
                     candidate_count INTEGER NOT NULL DEFAULT 0,
+                    merged_count INTEGER NOT NULL DEFAULT 0,
+                    filtered_count INTEGER NOT NULL DEFAULT 0,
+                    expired_count INTEGER NOT NULL DEFAULT 0,
                     promoted_count INTEGER NOT NULL DEFAULT 0,
                     model TEXT,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
@@ -242,6 +254,32 @@ class MemoryDatabase:
             }
             if "conflict_reason" not in candidate_columns:
                 conn.execute("ALTER TABLE candidates ADD COLUMN conflict_reason TEXT")
+            candidate_migrations = {
+                "last_activity_at": "TEXT",
+                "last_recalled_at": "TEXT",
+                "expired_at": "TEXT",
+                "rejected_at": "TEXT",
+                "promoted_at": "TEXT",
+                "promotion_origin": "TEXT",
+                "rem_status": "TEXT NOT NULL DEFAULT 'unreviewed'",
+                "rem_reason": "TEXT",
+                "rem_reviewed_at": "TEXT",
+            }
+            for column, definition in candidate_migrations.items():
+                if column not in candidate_columns:
+                    conn.execute(f"ALTER TABLE candidates ADD COLUMN {column} {definition}")
+            conn.execute(
+                "UPDATE candidates SET last_activity_at=last_seen_at "
+                "WHERE last_activity_at IS NULL OR last_activity_at=''"
+            )
+            dream_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(dream_runs)").fetchall()
+            }
+            for column in ("merged_count", "filtered_count", "expired_count"):
+                if column not in dream_columns:
+                    conn.execute(
+                        f"ALTER TABLE dream_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
             conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
 
     def default_settings(self) -> dict[str, Any]:
@@ -259,8 +297,16 @@ class MemoryDatabase:
                 "max_light_batches": 3,
                 "batch_chars": 12000,
                 "max_auto_promotions": 3,
+                "max_new_candidates": 8,
             },
-            "retention": {"raw_turn_days": 30, "model_call_days": 30, "backup_count": 7},
+            "retention": {
+                "raw_turn_days": 30,
+                "model_call_days": 30,
+                "backup_count": 7,
+                "candidate_inactive_days": 14,
+                "candidate_expired_days": 30,
+                "rejected_candidate_days": 30,
+            },
             "recall": {"limit": 5, "max_context_chars": 4000},
         }
 
@@ -513,22 +559,39 @@ class MemoryDatabase:
         now = utc_now()
         with self.transaction(immediate=True) as conn:
             row = conn.execute(
-                "SELECT * FROM candidates WHERE content_hash=? AND status='pending'", (digest,)
+                "SELECT * FROM candidates WHERE content_hash=? "
+                "ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'expired' THEN 1 "
+                "WHEN 'rejected' THEN 2 ELSE 3 END LIMIT 1",
+                (digest,),
             ).fetchone()
+            if row and row["status"] in {"rejected", "promoted"}:
+                return self._candidate_from_row(row)
             if row:
                 candidate_id = row["id"]
                 conn.execute(
-                    "UPDATE candidates SET last_seen_at=?, model_confidence=max(model_confidence, ?) WHERE id=?",
-                    (now, confidence, candidate_id),
+                    "UPDATE candidates SET status='pending',last_seen_at=?,last_activity_at=?, "
+                    "model_confidence=max(model_confidence,?),expired_at=NULL,rejected_at=NULL, "
+                    "rem_status='unreviewed',rem_reason=NULL,rem_reviewed_at=NULL WHERE id=?",
+                    (now, now, confidence, candidate_id),
                 )
             else:
                 candidate_id = str(uuid.uuid4())
                 conn.execute(
                     """INSERT INTO candidates(
                         id,content,kind,status,model_confidence,sensitive,score,score_components,
-                        content_hash,first_seen_at,last_seen_at
-                    ) VALUES(?,?,?,'pending',?,?,0,'{}',?,?,?)""",
-                    (candidate_id, content.strip(), kind, confidence, int(sensitive), digest, now, now),
+                        content_hash,first_seen_at,last_seen_at,last_activity_at
+                    ) VALUES(?,?,?,'pending',?,?,0,'{}',?,?,?,?)""",
+                    (
+                        candidate_id,
+                        content.strip(),
+                        kind,
+                        confidence,
+                        int(sensitive),
+                        digest,
+                        now,
+                        now,
+                        now,
+                    ),
                 )
             if raw_turn_id:
                 exists = conn.execute(
@@ -556,6 +619,31 @@ class MemoryDatabase:
             )
             row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
         return self._candidate_from_row(row)
+
+    def get_candidate(self, candidate_id: str) -> CandidateRecord | None:
+        with self.connect() as conn:
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        return self._candidate_from_row(row) if row else None
+
+    def candidate_by_content(self, content: str) -> CandidateRecord | None:
+        digest = content_hash(content)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM candidates WHERE content_hash=? "
+                "ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'expired' THEN 1 "
+                "WHEN 'rejected' THEN 2 ELSE 3 END LIMIT 1",
+                (digest,),
+            ).fetchone()
+        return self._candidate_from_row(row) if row else None
+
+    def active_memory_has_content(self, content: str) -> bool:
+        with self.connect() as conn:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM memories WHERE content_hash=? AND status='active'",
+                    (content_hash(content),),
+                ).fetchone()
+            )
 
     def list_candidates(self, *, status: str = "pending", limit: int = 500) -> list[CandidateRecord]:
         with self.connect() as conn:
@@ -603,6 +691,120 @@ class MemoryDatabase:
                     (memory_id, reason, candidate_id),
                 )
 
+    def update_candidate_rem_review(
+        self,
+        *,
+        reviewed_ids: list[str],
+        durable_ids: list[str],
+        noise: dict[str, str],
+    ) -> int:
+        reviewed = set(reviewed_ids)
+        durable = reviewed.intersection(durable_ids)
+        now = utc_now()
+        expired = 0
+        with self.transaction(immediate=True) as conn:
+            for candidate_id in reviewed:
+                if candidate_id in noise:
+                    changed = conn.execute(
+                        "UPDATE candidates SET status='expired',expired_at=?,rem_status='noise',"
+                        "rem_reason=?,rem_reviewed_at=? WHERE id=? AND status='pending'",
+                        (now, noise[candidate_id][:1000], now, candidate_id),
+                    ).rowcount
+                    expired += changed
+                else:
+                    conn.execute(
+                        "UPDATE candidates SET rem_status=?,rem_reason=NULL,rem_reviewed_at=? "
+                        "WHERE id=? AND status='pending'",
+                        ("approved" if candidate_id in durable else "deferred", now, candidate_id),
+                    )
+        return expired
+
+    def expire_candidate(self, candidate_id: str, reason: str) -> bool:
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            return bool(
+                conn.execute(
+                    "UPDATE candidates SET status='expired',expired_at=?,rem_status='duplicate',"
+                    "rem_reason=?,rem_reviewed_at=? WHERE id=? AND status='pending'",
+                    (now, reason[:1000], now, candidate_id),
+                ).rowcount
+            )
+
+    def merge_candidates(self, canonical_id: str, duplicate_id: str) -> CandidateRecord:
+        if canonical_id == duplicate_id:
+            candidate = self.get_candidate(canonical_id)
+            if not candidate:
+                raise KeyError(canonical_id)
+            return candidate
+        with self.transaction(immediate=True) as conn:
+            canonical = conn.execute(
+                "SELECT * FROM candidates WHERE id=? AND status='pending'", (canonical_id,)
+            ).fetchone()
+            duplicate = conn.execute(
+                "SELECT * FROM candidates WHERE id=? AND status='pending'", (duplicate_id,)
+            ).fetchone()
+            if not canonical or not duplicate:
+                raise KeyError(duplicate_id if canonical else canonical_id)
+            conn.execute(
+                "UPDATE evidence SET candidate_id=? WHERE candidate_id=?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE recall_events SET record_id=? WHERE record_id=? AND source='candidate'",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
+                "SELECT call_id,'candidate',? FROM model_call_records "
+                "WHERE record_type='candidate' AND record_id=?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                (duplicate_id,),
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE record_id=? AND source='candidate'", (duplicate_id,)
+            )
+            conn.execute(
+                "DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (duplicate_id,)
+            )
+            conn.execute("DELETE FROM candidates WHERE id=?", (duplicate_id,))
+            evidence_days = conn.execute(
+                "SELECT COUNT(DISTINCT substr(observed_at,1,10)) FROM evidence WHERE candidate_id=?",
+                (canonical_id,),
+            ).fetchone()[0]
+            recall_count = conn.execute(
+                "SELECT COUNT(*) FROM recall_events WHERE record_id=? "
+                "AND source='candidate' AND injected=1",
+                (canonical_id,),
+            ).fetchone()[0]
+            unique_queries = conn.execute(
+                "SELECT COUNT(DISTINCT query_hash) FROM recall_events WHERE record_id=? "
+                "AND source='candidate' AND injected=1",
+                (canonical_id,),
+            ).fetchone()[0]
+            conn.execute(
+                """UPDATE candidates SET model_confidence=max(model_confidence,?),
+                sensitive=max(sensitive,?),first_seen_at=min(first_seen_at,?),
+                last_seen_at=max(last_seen_at,?),last_activity_at=max(last_activity_at,?),
+                evidence_days=max(1,?),recall_count=?,unique_query_count=?,
+                rem_status='unreviewed',rem_reason=NULL,rem_reviewed_at=NULL WHERE id=?""",
+                (
+                    duplicate["model_confidence"],
+                    duplicate["sensitive"],
+                    duplicate["first_seen_at"],
+                    duplicate["last_seen_at"],
+                    duplicate["last_activity_at"] or duplicate["last_seen_at"],
+                    evidence_days,
+                    recall_count,
+                    unique_queries,
+                    canonical_id,
+                ),
+            )
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (canonical_id,)).fetchone()
+        return self._candidate_from_row(row)
+
     def add_model_call_refs(
         self, call_id: str, references: list[tuple[str, str]]
     ) -> None:
@@ -623,7 +825,9 @@ class MemoryDatabase:
         origin: str = "review",
     ) -> MemoryRecord:
         with self.connect() as conn:
-            candidate = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+            candidate = conn.execute(
+                "SELECT * FROM candidates WHERE id=? AND status='pending'", (candidate_id,)
+            ).fetchone()
         if not candidate:
             raise KeyError(candidate_id)
         memory = self.add_memory(
@@ -635,7 +839,10 @@ class MemoryDatabase:
             supersedes_id=candidate["conflict_memory_id"],
         )
         with self.transaction(immediate=True) as conn:
-            conn.execute("UPDATE candidates SET status='promoted' WHERE id=?", (candidate_id,))
+            conn.execute(
+                "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=? WHERE id=?",
+                (utc_now(), origin, candidate_id),
+            )
             conn.execute(
                 "UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory.id, candidate_id)
             )
@@ -648,21 +855,189 @@ class MemoryDatabase:
         return memory
 
     def reject_candidate(self, candidate_id: str) -> None:
+        now = utc_now()
         with self.transaction(immediate=True) as conn:
             changed = conn.execute(
-                "UPDATE candidates SET status='rejected' WHERE id=?", (candidate_id,)
+                "UPDATE candidates SET status='rejected',rejected_at=?,last_activity_at=?,"
+                "rem_status='rejected',rem_reason='人工拒绝' WHERE id=? AND status='pending'",
+                (now, now, candidate_id),
             ).rowcount
             if not changed:
                 raise KeyError(candidate_id)
 
-    def retention_cleanup(self, raw_days: int, model_days: int) -> dict[str, int]:
-        raw_cutoff = (datetime.now(UTC) - timedelta(days=raw_days)).isoformat()
-        model_cutoff = (datetime.now(UTC) - timedelta(days=model_days)).isoformat()
+    def restore_candidate(self, candidate_id: str) -> CandidateRecord:
+        now = utc_now()
         with self.transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE candidates SET status='pending',last_activity_at=?,expired_at=NULL,"
+                "rejected_at=NULL,rem_status='unreviewed',rem_reason=NULL,rem_reviewed_at=NULL "
+                "WHERE id=? AND status IN ('expired','rejected')",
+                (now, candidate_id),
+            ).rowcount
+            if not changed:
+                raise KeyError(candidate_id)
+            row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
+        return self._candidate_from_row(row)
+
+    def count_auto_promotions_since(self, since: str) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE status='promoted' "
+                    "AND promotion_origin='dream' AND promoted_at>=?",
+                    (since,),
+                ).fetchone()[0]
+            )
+
+    def purge_candidate(self, candidate_id: str, *, privacy: bool = False) -> dict[str, int]:
+        with self.transaction(immediate=True) as conn:
+            candidate = conn.execute(
+                "SELECT id,content FROM candidates WHERE id=?", (candidate_id,)
+            ).fetchone()
+            if not candidate:
+                raise KeyError(candidate_id)
+            raw_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT raw_turn_id FROM evidence WHERE candidate_id=? "
+                    "AND raw_turn_id IS NOT NULL",
+                    (candidate_id,),
+                )
+            ]
+            affected_candidate_ids: list[str] = []
+            if privacy and raw_ids:
+                placeholders = ",".join("?" for _ in raw_ids)
+                affected_candidate_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        f"SELECT DISTINCT candidate_id FROM evidence WHERE raw_turn_id IN ({placeholders}) "
+                        "AND candidate_id IS NOT NULL AND candidate_id<>?",
+                        [*raw_ids, candidate_id],
+                    )
+                ]
+            dream_run_ids: set[str] = set()
+            if privacy:
+                references = [("candidate", candidate_id)]
+                references.extend(("raw_turn", raw_id) for raw_id in raw_ids)
+                for record_type, record_id in references:
+                    dream_run_ids.update(
+                        row[0]
+                        for row in conn.execute(
+                            "SELECT DISTINCT mc.dream_run_id FROM model_calls mc "
+                            "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                            "WHERE mcr.record_type=? AND mcr.record_id=? "
+                            "AND mc.dream_run_id IS NOT NULL",
+                            (record_type, record_id),
+                        )
+                    )
+                for call in conn.execute(
+                    "SELECT dream_run_id,request_json,response_json FROM model_calls "
+                    "WHERE dream_run_id IS NOT NULL"
+                ):
+                    stored = f"{call['request_json']}\n{call['response_json'] or ''}"
+                    if candidate["content"] in stored:
+                        dream_run_ids.add(call["dream_run_id"])
+                for run_id in dream_run_ids:
+                    conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
+            conn.execute(
+                "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
+                (candidate_id,),
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE record_id=? AND source='candidate'", (candidate_id,)
+            )
+            conn.execute(
+                "DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (candidate_id,)
+            )
+            conn.execute(
+                "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                (candidate_id,),
+            )
+            conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+            if privacy and raw_ids:
+                conn.executemany("DELETE FROM raw_turns WHERE id=?", [(item,) for item in raw_ids])
+                for affected_id in affected_candidate_ids:
+                    evidence_days = conn.execute(
+                        "SELECT COUNT(DISTINCT substr(observed_at,1,10)) FROM evidence "
+                        "WHERE candidate_id=?",
+                        (affected_id,),
+                    ).fetchone()[0]
+                    conn.execute(
+                        "UPDATE candidates SET evidence_days=max(1,?) WHERE id=?",
+                        (evidence_days, affected_id),
+                    )
+            conn.execute(
+                "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
+                ("purge-candidate" if privacy else "cleanup-candidate", candidate_id, utc_now()),
+            )
+        return {
+            "candidates": 1,
+            "raw_turns": len(raw_ids) if privacy else 0,
+            "dream_runs": len(dream_run_ids),
+        }
+
+    def retention_cleanup(
+        self,
+        raw_days: int,
+        model_days: int,
+        candidate_inactive_days: int = 14,
+        candidate_expired_days: int = 30,
+        rejected_candidate_days: int = 30,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, int]:
+        current = now or datetime.now(UTC)
+        raw_cutoff = (current - timedelta(days=raw_days)).isoformat()
+        model_cutoff = (current - timedelta(days=model_days)).isoformat()
+        inactive_cutoff = (current - timedelta(days=candidate_inactive_days)).isoformat()
+        expired_cutoff = (current - timedelta(days=candidate_expired_days)).isoformat()
+        rejected_cutoff = (current - timedelta(days=rejected_candidate_days)).isoformat()
+        current_iso = current.isoformat(timespec="seconds")
+        with self.transaction(immediate=True) as conn:
+            expired = conn.execute(
+                "UPDATE candidates SET status='expired',expired_at=?,rem_reason=coalesce(rem_reason,?) "
+                "WHERE status='pending' AND coalesce(last_activity_at,last_seen_at) < ?",
+                (current_iso, f"{candidate_inactive_days} 天无活动自动过期", inactive_cutoff),
+            ).rowcount
+            purge_ids = [
+                row[0]
+                for row in conn.execute(
+                    "SELECT id FROM candidates WHERE "
+                    "(status='expired' AND expired_at IS NOT NULL AND expired_at < ?) OR "
+                    "(status='rejected' AND rejected_at IS NOT NULL AND rejected_at < ?)",
+                    (expired_cutoff, rejected_cutoff),
+                )
+            ]
+            for candidate_id in purge_ids:
+                conn.execute(
+                    "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
+                    (candidate_id,),
+                )
+                conn.execute(
+                    "DELETE FROM embeddings WHERE record_id=? AND source='candidate'", (candidate_id,)
+                )
+                conn.execute(
+                    "DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (candidate_id,)
+                )
+                conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                    (candidate_id,),
+                )
+                conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
             raw = conn.execute("DELETE FROM raw_turns WHERE observed_at < ?", (raw_cutoff,)).rowcount
+            conn.execute(
+                "UPDATE candidates SET evidence_days=max(1,(SELECT COUNT(DISTINCT substr(e.observed_at,1,10)) "
+                "FROM evidence e WHERE e.candidate_id=candidates.id)) WHERE status='pending'"
+            )
             calls = conn.execute("DELETE FROM model_calls WHERE created_at < ?", (model_cutoff,)).rowcount
             traces = conn.execute("DELETE FROM recall_events WHERE created_at < ?", (model_cutoff,)).rowcount
-        return {"raw_turns": raw, "model_calls": calls, "recall_events": traces}
+        return {
+            "raw_turns": raw,
+            "model_calls": calls,
+            "recall_events": traces,
+            "expired_candidates": expired,
+            "purged_candidates": len(purge_ids),
+        }
 
     def acquire_lease(self, name: str, owner: str, ttl_seconds: int) -> bool:
         now = datetime.now(UTC)
@@ -723,6 +1098,7 @@ class MemoryDatabase:
         )
 
     def _candidate_from_row(self, row: sqlite3.Row) -> CandidateRecord:
+        last_seen_at = row["last_seen_at"]
         return CandidateRecord(
             id=row["id"],
             content=row["content"],
@@ -735,7 +1111,16 @@ class MemoryDatabase:
             unique_query_count=int(row["unique_query_count"]),
             evidence_days=int(row["evidence_days"]),
             first_seen_at=row["first_seen_at"],
-            last_seen_at=row["last_seen_at"],
+            last_seen_at=last_seen_at,
+            last_activity_at=row["last_activity_at"] or last_seen_at,
+            last_recalled_at=row["last_recalled_at"],
+            expired_at=row["expired_at"],
+            rejected_at=row["rejected_at"],
+            promoted_at=row["promoted_at"],
+            promotion_origin=row["promotion_origin"],
+            rem_status=row["rem_status"] or "unreviewed",
+            rem_reason=row["rem_reason"],
+            rem_reviewed_at=row["rem_reviewed_at"],
             score_components=json.loads(row["score_components"] or "{}"),
             conflict_memory_id=row["conflict_memory_id"],
             conflict_reason=row["conflict_reason"],

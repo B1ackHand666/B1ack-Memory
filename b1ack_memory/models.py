@@ -62,6 +62,15 @@ class CandidateRecord:
     evidence_days: int
     first_seen_at: str
     last_seen_at: str
+    last_activity_at: str
+    last_recalled_at: str | None = None
+    expired_at: str | None = None
+    rejected_at: str | None = None
+    promoted_at: str | None = None
+    promotion_origin: str | None = None
+    rem_status: str = "unreviewed"
+    rem_reason: str | None = None
+    rem_reviewed_at: str | None = None
     score_components: dict[str, float] = field(default_factory=dict)
     conflict_memory_id: str | None = None
     conflict_reason: str | None = None
