@@ -1,7 +1,7 @@
 {
   "name": "b1ack-memory",
   "label": "B1ack Memory",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "个人记忆白盒面板",
   "icon": "Brain",
   "tab": {

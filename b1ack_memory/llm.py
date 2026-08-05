@@ -80,29 +80,59 @@ class OpenAICompatibleClient:
             body.pop("response_format", None)
             body["messages"][0]["content"] += " Output one valid JSON object and no markdown."
             response = self._post("/chat/completions", body)
+        original_usage = response.get("usage") or {}
+        repair_used = False
         try:
-            message = response["choices"][0]["message"]
-            content = message["content"]
-            if isinstance(content, list):
-                content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
-            if not str(content or "").strip():
-                if message.get("reasoning_content"):
-                    raise LlmError(
-                        "Model returned reasoning_content but no final content; "
-                        "use non-thinking mode for structured Dream extraction"
-                    )
-                raise LlmError("Model returned an empty completion")
-            parsed = self._parse_json(str(content))
-        except LlmError:
-            raise
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as error:
-            raise LlmError(f"Invalid JSON completion: {error}") from error
+            parsed = self._parse_completion(response)
+        except LlmError as original_error:
+            if not str(original_error).startswith("Invalid JSON completion:"):
+                raise
+            malformed = self._completion_text(response)
+            repair_body = {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Repair the supplied malformed or truncated JSON. Return one compact valid "
+                            "JSON object only. Preserve complete records, discard an incomplete trailing "
+                            "record, never invent facts, keep at most 20 array items, and shorten long strings."
+                        ),
+                    },
+                    {"role": "user", "content": malformed},
+                ],
+                "temperature": 0,
+                "max_tokens": min(self.max_output_tokens, 4096),
+                "stream": False,
+                "response_format": {"type": "json_object"},
+            }
+            if model_id.startswith("deepseek-v4"):
+                repair_body["thinking"] = {"type": "disabled"}
+            repaired = self._post("/chat/completions", repair_body)
+            try:
+                parsed = self._parse_completion(repaired)
+            except LlmError as repair_error:
+                raise LlmError(
+                    f"{original_error}; automatic JSON repair failed: {repair_error}"
+                ) from repair_error
+            response = repaired
+            repair_used = True
         usage = response.get("usage") or {}
         return LlmResult(
             parsed=parsed,
             raw=response,
-            input_tokens=int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
-            output_tokens=int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
+            input_tokens=(
+                int(original_usage.get("prompt_tokens") or original_usage.get("input_tokens") or 0)
+                + int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+                if repair_used
+                else int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+            ),
+            output_tokens=(
+                int(original_usage.get("completion_tokens") or original_usage.get("output_tokens") or 0)
+                + int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+                if repair_used
+                else int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+            ),
         )
 
     def embeddings(self, texts: list[str]) -> list[list[float]]:
@@ -159,6 +189,33 @@ class OpenAICompatibleClient:
 
     def _is_local(self) -> bool:
         return self.base_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))
+
+    @classmethod
+    def _parse_completion(cls, response: dict[str, Any]) -> Any:
+        content = cls._completion_text(response)
+        try:
+            return cls._parse_json(content)
+        except json.JSONDecodeError as error:
+            raise LlmError(f"Invalid JSON completion: {error}") from error
+
+    @staticmethod
+    def _completion_text(response: dict[str, Any]) -> str:
+        try:
+            message = response["choices"][0]["message"]
+            content = message["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise LlmError(f"Invalid completion response: {error}") from error
+        if isinstance(content, list):
+            content = "".join(part.get("text", "") for part in content if isinstance(part, dict))
+        rendered = str(content or "").strip()
+        if not rendered:
+            if message.get("reasoning_content"):
+                raise LlmError(
+                    "Model returned reasoning_content but no final content; "
+                    "use non-thinking mode for structured Dream extraction"
+                )
+            raise LlmError("Model returned an empty completion")
+        return rendered
 
     @staticmethod
     def _parse_json(content: str) -> Any:

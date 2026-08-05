@@ -7,6 +7,7 @@ from unittest import mock
 
 import b1ack_memory
 from b1ack_memory.dream import DreamEngine
+from b1ack_memory.dream import LIGHT_SYSTEM, REM_SYSTEM
 from b1ack_memory.llm import LlmError, LlmResult, OpenAICompatibleClient
 from b1ack_memory.security import SecretStore, contains_secret, is_sensitive, redact_secrets
 from b1ack_memory.service import MemoryService
@@ -202,6 +203,11 @@ class SecurityTests(unittest.TestCase):
 
 
 class ClientTests(unittest.TestCase):
+    def test_dream_prompts_bound_structured_output(self) -> None:
+        self.assertIn("at most 20 candidates", LIGHT_SYSTEM)
+        self.assertIn("under 240 characters", LIGHT_SYSTEM)
+        self.assertIn("at most 10 themes and 20 conflicts", REM_SYSTEM)
+
     def test_http_client_sends_cloudflare_compatible_identity(self) -> None:
         client = OpenAICompatibleClient(
             base_url="https://opencode.ai/zen/go/v1",
@@ -260,6 +266,41 @@ class ClientTests(unittest.TestCase):
         }
         with self.assertRaisesRegex(LlmError, "reasoning_content"):
             client.chat_json(system="JSON only", user="test")
+
+    def test_malformed_json_is_automatically_repaired_once(self) -> None:
+        client = OpenAICompatibleClient(
+            base_url="https://opencode.ai/zen/go/v1",
+            model="deepseek-v4-flash",
+            api_key="test",
+            max_output_tokens=8192,
+        )
+        responses = iter(
+            [
+                {
+                    "choices": [{"message": {"content": '{"candidates":[{"content":"cut'}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 20},
+                },
+                {
+                    "choices": [{"message": {"content": '{"candidates":[]}'}}],
+                    "usage": {"prompt_tokens": 30, "completion_tokens": 5},
+                },
+            ]
+        )
+        bodies = []
+
+        def fake_post(_path, body):
+            bodies.append(body)
+            return next(responses)
+
+        client._post = fake_post  # type: ignore[method-assign]
+        result = client.chat_json(system="JSON only", user="test")
+        self.assertEqual(result.parsed, {"candidates": []})
+        self.assertEqual(result.input_tokens, 40)
+        self.assertEqual(result.output_tokens, 25)
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("Repair", bodies[1]["messages"][0]["content"])
+        self.assertEqual(bodies[1]["max_tokens"], 4096)
+        self.assertEqual(bodies[1]["thinking"], {"type": "disabled"})
 
 
 if __name__ == "__main__":

@@ -4,6 +4,14 @@
 
 ## [未发布]
 
+## [0.1.7] - 2026-08-05
+
+### 修复
+
+- Light 阶段限制每批最多提取 20 条候选，并限制候选文本长度，避免模型生成超长 JSON。
+- REM 阶段限制主题与冲突数量，并要求紧凑输出。
+- JSON 格式错误或尾部截断时自动调用模型进行一次压缩修复，丢弃不完整的尾部记录而不编造内容。
+
 ## [0.1.6] - 2026-08-04
 
 ### 修复
@@ -81,7 +89,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.6...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.1.7...HEAD
+[0.1.7]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.7
 [0.1.6]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.6
 [0.1.5]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.5
 [0.1.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.4

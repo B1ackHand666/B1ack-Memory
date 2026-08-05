@@ -18,12 +18,14 @@ LIGHT_SYSTEM = """You extract durable personal-memory candidates from redacted c
 Return one JSON object with key `candidates`, an array. Each item must have:
 content (concise standalone statement), kind (preference|fact|decision|project|procedure|relationship|correction|episode),
 confidence (0..1), sensitive (boolean), source_turn_id. Ignore greetings, transient chatter, system output and secrets.
-Never invent information. JSON only."""
+Return at most 20 candidates. Keep each content under 240 characters. Do not repeat equivalent facts.
+Never invent information. Return compact JSON only, without markdown or commentary."""
 
 REM_SYSTEM = """You review personal-memory candidates. Return JSON with keys `summary`, `themes`, and `conflicts`.
 themes is an array of short strings. conflicts is an array of objects with candidate_id,
 optional memory_id, and explanation. Report candidate-to-candidate conflicts without memory_id.
-Do not create durable memories and do not add facts. JSON only."""
+Return at most 10 themes and 20 conflicts. Keep summary and explanations concise.
+Do not create durable memories and do not add facts. Return compact JSON only."""
 
 DEEP_SYSTEM = """You compact qualified personal-memory candidates into durable statements.
 Return JSON with key `memories`, an array of objects containing candidate_id and content.
@@ -103,7 +105,7 @@ class DreamEngine:
                 )
                 candidates = result.parsed.get("candidates", []) if isinstance(result.parsed, dict) else []
                 turn_map = {row["id"]: row for row in batch}
-                for item in candidates[:100]:
+                for item in candidates[:20]:
                     if not isinstance(item, dict):
                         continue
                     content = str(item.get("content", "")).strip()
