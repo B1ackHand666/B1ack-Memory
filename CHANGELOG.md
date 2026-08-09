@@ -4,6 +4,35 @@
 
 ## [未发布]
 
+## [0.3.0] - 2026-08-09
+
+### 新增
+
+- 新增可配置的 IANA 记忆时区；每日 Dream、自动晋升额度、证据日期和分析图表统一按该时区计算，WebUI 可一键采用浏览器检测结果。
+- 数据库升级至 schema v4，加入追加式 `memory_events`，记录候选创建、证据、REM、合并、过期、恢复、拒绝、晋升以及长期记忆创建、编辑、回收和恢复。
+- 新增“记忆演化”面板：7/30/90 天或全部范围的每日变化、状态分布、晋升通道和最近事件。
+- 新增候选与长期记忆的单条演化时间线，以及 `GET /analytics/memory-flow`、`GET /lineage/candidate/{id}` 和 `GET /lineage/memory/{id}` 接口。
+- 候选页面新增“已晋升”分区；长期记忆来源改为面向使用者的“Dream 自动晋升”“Hermes 写入”“人工保存”或“人工晋升”。
+
+### 变更
+
+- “跨日 1/2”改为“不同日期证据 1/2”；证据新增、同义合并、关联会话清理或时区变更后都会重新计算。
+- Light 可向 REM 提示可能匹配的已有候选；REM 对每条候选返回耐久、同义候选、已有记忆、近期拒绝、噪声、冲突或暂缓之一，并接收证据日期，不新增模型调用或 embeddings 依赖。
+- Deep 只接收已满足晋升条件的候选 ID；候选原文、整理后内容、REM 审查、晋升通道、Dream 运行和晋升时间均可追溯。
+- WebUI 重设计为黑白灰个人记忆控制台，统一侧边栏、卡片、表单、标签、空状态、反馈和危险操作弹窗；状态仅使用低饱和绿/黄/红辅助色。
+- 增加页面淡入、卡片错峰、数字递增、图表生长、时间线绘制及 Dream Light → REM → Deep 阶段动画，并遵循 `prefers-reduced-motion`。
+
+### 迁移与安全
+
+- v3 数据库自动幂等回填已有候选、证据、晋升、长期记忆和修订历史；无法还原的旧晋升通道标记为“历史未知”。
+- 候选或长期记忆的隐私永久删除同步清除可关联演化事件；长期记忆仍需先移入回收站。
+- 修复没有证据行的人工晋升候选无法关联长期记忆、时间线和隐私删除的问题。
+
+### 测试
+
+- 覆盖 UTC/北京时间边界、相同本地日期、夏令时、时区变更重算、中文同义证据合并和 Deep 血缘。
+- 覆盖 v3 → v4 回填幂等、晋升通道、分析/血缘 API、已晋升候选和永久删除事件清理。
+
 ## [0.2.0] - 2026-08-05
 
 ### 新增
@@ -118,7 +147,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.2.0...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.0
 [0.2.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.2.0
 [0.1.7]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.7
 [0.1.6]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.6

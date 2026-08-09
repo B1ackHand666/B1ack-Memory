@@ -16,12 +16,12 @@ B1ack Memory 是面向个人的 local-first Hermes Memory Provider。优先级�
 
 ## 代码导航
 
-- `b1ack_memory/db.py`：schema、迁移、SQLite 读写、生命周期和删除。
+- `b1ack_memory/db.py`：schema、迁移、SQLite 读写、生命周期、`memory_events` 演化事件和删除。
 - `b1ack_memory/dream.py`：Light → REM → Deep、去重、评分和自动晋升。
 - `b1ack_memory/retrieval.py`：FTS、可选向量召回与召回轨迹。
-- `b1ack_memory/service.py`：业务编排、后台调度、备份、镜像和设置。
+- `b1ack_memory/service.py`：业务编排、时区调度、演化分析、备份、镜像和设置。
 - `b1ack_memory/provider.py`：Hermes Memory Provider 适配。
-- `b1ack_memory/web.py`、`b1ack_memory/static/`：API 与无构建步骤的 WebUI。
+- `b1ack_memory/web.py`、`b1ack_memory/static/`：分析/血缘 API 与无构建步骤的 WebUI。
 - `tests/`：核心、Hermes 集成和 Web API 回归测试。
 - `b1ack_memory/version.py`、`pyproject.toml`、两份 `plugin.yaml` 和两份 Dashboard manifest：发布版本来源。
 

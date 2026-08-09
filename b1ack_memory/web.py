@@ -104,6 +104,18 @@ def create_router(
     def model_calls(limit: int = 100) -> list[dict[str, Any]]:
         return memory.model_calls(min(max(limit, 1), 1000))
 
+    @router.get("/analytics/memory-flow")
+    def memory_flow(range: str = "30d") -> dict[str, Any]:
+        return memory.memory_flow(range)
+
+    @router.get("/lineage/candidate/{candidate_id}")
+    def candidate_lineage(candidate_id: str) -> dict[str, Any]:
+        return memory.candidate_lineage(candidate_id)
+
+    @router.get("/lineage/memory/{memory_id}")
+    def memory_lineage(memory_id: str) -> dict[str, Any]:
+        return memory.memory_lineage(memory_id)
+
     @router.get("/backups")
     def backups() -> list[dict[str, Any]]:
         return memory.list_backups()
