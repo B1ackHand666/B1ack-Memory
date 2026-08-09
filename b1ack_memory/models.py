@@ -68,6 +68,7 @@ class CandidateRecord:
     rejected_at: str | None = None
     promoted_at: str | None = None
     promotion_origin: str | None = None
+    promoted_memory_id: str | None = None
     rem_status: str = "unreviewed"
     rem_reason: str | None = None
     rem_reviewed_at: str | None = None

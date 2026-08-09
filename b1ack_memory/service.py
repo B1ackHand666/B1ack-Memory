@@ -384,12 +384,18 @@ class MemoryService:
         with self.db.connect() as conn:
             for item in items:
                 linked = conn.execute(
-                    "SELECT c.id,c.content,c.promoted_at,c.promotion_origin FROM candidates c "
-                    "JOIN memory_events me ON me.candidate_id=c.id "
-                    "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
-                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    "SELECT id,content,promoted_at,promotion_origin FROM candidates "
+                    "WHERE promoted_memory_id=? LIMIT 1",
                     (item["id"],),
                 ).fetchone()
+                if not linked:
+                    linked = conn.execute(
+                        "SELECT c.id,c.content,c.promoted_at,c.promotion_origin FROM candidates c "
+                        "JOIN memory_events me ON me.candidate_id=c.id "
+                        "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
+                        "ORDER BY me.occurred_at DESC LIMIT 1",
+                        (item["id"],),
+                    ).fetchone()
                 if not linked:
                     linked = conn.execute(
                         "SELECT c.id,c.content,c.promoted_at,c.promotion_origin FROM candidates c "
@@ -421,11 +427,17 @@ class MemoryService:
                 )
                 linked_memory = conn.execute(
                     "SELECT m.id,m.content,m.kind,m.origin,m.status FROM memories m "
-                    "JOIN memory_events me ON me.memory_id=m.id "
-                    "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
-                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    "JOIN candidates c ON c.promoted_memory_id=m.id WHERE c.id=? LIMIT 1",
                     (item["id"],),
                 ).fetchone()
+                if not linked_memory:
+                    linked_memory = conn.execute(
+                        "SELECT m.id,m.content,m.kind,m.origin,m.status FROM memories m "
+                        "JOIN memory_events me ON me.memory_id=m.id "
+                        "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
+                        "ORDER BY me.occurred_at DESC LIMIT 1",
+                        (item["id"],),
+                    ).fetchone()
                 if not linked_memory:
                     linked_memory = conn.execute(
                         "SELECT m.id,m.content,m.kind,m.origin,m.status FROM memories m "
@@ -538,7 +550,7 @@ class MemoryService:
                 if row["event_type"] == "candidate_promoted":
                     lane = str(data.get("promotion_lane", "unknown"))
                     lanes[lane if lane in lanes else "unknown"] += 1
-                if len(recent) < 40:
+                if len(recent) < 20:
                     recent.append(
                         {
                             "id": row["id"],
@@ -561,7 +573,8 @@ class MemoryService:
             status = {
                 row["status"]: int(row["count"])
                 for row in conn.execute(
-                    "SELECT status,COUNT(*) AS count FROM candidates GROUP BY status"
+                    "SELECT status,COUNT(*) AS count FROM candidates "
+                    "WHERE status<>'promoted' GROUP BY status"
                 )
             }
             status["active_memories"] = int(
@@ -581,12 +594,18 @@ class MemoryService:
         if not candidate:
             raise KeyError(candidate_id)
         with self.db.connect() as conn:
-            memory_row = conn.execute(
-                "SELECT m.* FROM memories m JOIN memory_events me ON me.memory_id=m.id "
-                "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
-                "ORDER BY me.occurred_at DESC LIMIT 1",
-                (candidate_id,),
-            ).fetchone()
+            memory_row = None
+            if candidate.promoted_memory_id:
+                memory_row = conn.execute(
+                    "SELECT * FROM memories WHERE id=?", (candidate.promoted_memory_id,)
+                ).fetchone()
+            if not memory_row:
+                memory_row = conn.execute(
+                    "SELECT m.* FROM memories m JOIN memory_events me ON me.memory_id=m.id "
+                    "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
+                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    (candidate_id,),
+                ).fetchone()
             if not memory_row:
                 memory_row = conn.execute(
                     "SELECT m.* FROM memories m JOIN evidence e ON e.memory_id=m.id "
@@ -601,11 +620,16 @@ class MemoryService:
             raise KeyError(memory_id)
         with self.db.connect() as conn:
             candidate_row = conn.execute(
-                "SELECT c.id FROM candidates c JOIN memory_events me ON me.candidate_id=c.id "
-                "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
-                "ORDER BY me.occurred_at DESC LIMIT 1",
+                "SELECT id FROM candidates WHERE promoted_memory_id=? LIMIT 1",
                 (memory_id,),
             ).fetchone()
+            if not candidate_row:
+                candidate_row = conn.execute(
+                    "SELECT c.id FROM candidates c JOIN memory_events me ON me.candidate_id=c.id "
+                    "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
+                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    (memory_id,),
+                ).fetchone()
             if not candidate_row:
                 candidate_row = conn.execute(
                     "SELECT c.id FROM candidates c JOIN evidence e ON e.candidate_id=c.id "

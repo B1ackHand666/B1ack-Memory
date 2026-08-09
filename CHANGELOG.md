@@ -4,6 +4,26 @@
 
 ## [未发布]
 
+## [0.3.1] - 2026-08-09
+
+### 变更
+
+- 候选页面移除“已晋升”分区和存量统计；晋升历史统一通过长期记忆的“查看演化”访问。
+- 记忆演化的“最近变化”固定返回并显示所选范围内最新 20 条，完整 `memory_events` 历史继续用于单条时间线。
+- 状态分布不再把已晋升候选作为待维护存量，但每日晋升趋势和晋升通道统计保持不变。
+
+### 迁移与修复
+
+- 数据库升级至 schema v5，为候选增加唯一的长期记忆关联；自动和人工晋升均在同一事务内写入关联。
+- v4 升级前自动创建数据库备份，并依次通过晋升事件、证据、共享模型调用和严格内容/来源/时间匹配修复旧关联。
+- 无法唯一关联的旧已晋升候选会被安全清理；不会使用模糊语义猜测长期记忆归属。
+- 长期记忆移入回收站时保留演化链；永久删除时同步清除关联候选、证据、召回、索引、事件和适用的隐私残留。
+
+### 测试
+
+- 覆盖 v4 → v5 的四种安全关联、歧义与孤儿清理、迁移幂等性及升级前备份。
+- 覆盖晋升关联、回收/恢复/永久删除一致性，以及最近变化 20 条上限与完整历史保留。
+
 ## [0.3.0] - 2026-08-09
 
 ### 新增
@@ -147,7 +167,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.3.0...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.1
 [0.3.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.0
 [0.2.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.2.0
 [0.1.7]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.1.7

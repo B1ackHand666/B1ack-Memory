@@ -126,7 +126,6 @@ function renderStatus(status) {
   const metrics = [
     ["长期有效", counts.active_memories, "durable"],
     ["待审核", counts.pending_candidates, "candidate"],
-    ["已晋升", counts.promoted_candidates, "promoted"],
     ["已过期", counts.expired_candidates, "expired"],
     ["已拒绝", counts.rejected_candidates, "rejected"],
     ["待处理会话", counts.pending_turns, "turns"],
@@ -136,7 +135,6 @@ function renderStatus(status) {
     `<div class="metric"><span>${label}</span><b data-count="${value}">0</b><small>${note}</small></div>`).join("");
   $("#metrics").querySelectorAll("[data-count]").forEach((item) => countUp(item, Number(item.dataset.count)));
   $("#candidate-pending-count").textContent = counts.pending_candidates;
-  $("#candidate-promoted-count").textContent = counts.promoted_candidates;
   $("#candidate-expired-count").textContent = counts.expired_candidates;
   $("#candidate-rejected-count").textContent = counts.rejected_candidates;
   const tz = status.general?.timezone || "system";
@@ -194,14 +192,13 @@ async function loadCandidates() {
   const rows = await api(`/candidates?status=${encodeURIComponent(candidateStatus)}`);
   document.querySelectorAll("[data-candidate-status]").forEach((button) => button.classList.toggle("active", button.dataset.candidateStatus === candidateStatus));
   const bulk = $("#purge-candidate-status");
-  bulk.hidden = ["pending", "promoted"].includes(candidateStatus) || rows.length === 0;
+  bulk.hidden = candidateStatus === "pending" || rows.length === 0;
   const list = $("#candidate-list");
   list.innerHTML = rows.map((item) => {
     const progress = item.promotion_progress;
     const evidenceDates = item.evidence_dates?.length ? item.evidence_dates.join("、") : "暂无日期";
     let lifecycle = "";
     if (candidateStatus === "pending") lifecycle = `无活动过期：${localTime(item.lifecycle.expires_at)}`;
-    else if (candidateStatus === "promoted") lifecycle = `晋升于：${localTime(item.promoted_at)}`;
     else lifecycle = `自动清理：${localTime(item.lifecycle.purge_at)}`;
     const progressHtml = candidateStatus === "pending" ? `<div class="promotion-progress">
       <span class="${progress.confidence_met ? "met" : ""}">置信度 ${Number(item.model_confidence).toFixed(2)}</span>
@@ -214,7 +211,6 @@ async function loadCandidates() {
     let actions = `<button class="ghost" data-action="lineage-candidate" data-id="${item.id}">查看演化</button>`;
     if (candidateStatus === "pending") actions += `<button data-action="promote-candidate" data-id="${item.id}">人工晋升</button><button class="danger" data-action="reject-candidate" data-id="${item.id}">拒绝</button><button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`;
     else if (["expired", "rejected"].includes(candidateStatus)) actions += `<button data-action="restore-candidate" data-id="${item.id}">恢复</button><button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`;
-    else actions += item.linked_memory ? `<button class="ghost" data-action="lineage-memory" data-id="${item.linked_memory.id}">查看长期记忆</button>` : "";
     const linked = item.linked_memory ? `<div class="candidate-reason">长期记忆：${escapeHtml(item.linked_memory.content)}</div>` : "";
     const details = escapeHtml(JSON.stringify({ score: item.score_components, evidence_dates: item.evidence_dates, evidence: item.evidence }, null, 2));
     return `<div class="card"><div class="card-content"><p class="candidate-copy">${escapeHtml(item.content)}</p><div class="meta"><span class="badge ${candidateStatus === "promoted" ? "success" : ""}">${candidateStatusName(candidateStatus)}</span> <span class="badge">${escapeHtml(item.kind)}</span> · 评分 ${Number(item.score).toFixed(2)} · 最后活动 ${localTime(item.last_activity_at)} · ${lifecycle}</div>${progressHtml}${rem}${conflict}${linked}<details><summary>证据日期 ${item.evidence_days}/2 · ${escapeHtml(evidenceDates)}</summary><pre>${details}</pre></details></div><div class="actions">${actions}</div></div>`;
@@ -303,7 +299,7 @@ async function loadEvolution() {
   $("#evolution-summary").querySelectorAll("[data-count]").forEach((item) => countUp(item, Number(item.dataset.count)));
   $("#daily-chart").innerHTML = renderDailyChart(data.daily);
   $("#status-chart").innerHTML = renderBars([
-    { label: "待审核", value: data.status.pending || 0 }, { label: "已晋升", value: data.status.promoted || 0, color: "#80aa8d" },
+    { label: "待审核", value: data.status.pending || 0 },
     { label: "长期有效", value: data.status.active_memories || 0, color: "#efefed" }, { label: "已过期", value: data.status.expired || 0, color: "#696966" },
     { label: "已拒绝", value: data.status.rejected || 0, color: "#bd7478" },
   ]);
@@ -391,7 +387,7 @@ async function handleAction(button) {
   else if (action === "reject-candidate") await mutate(`/candidates/${id}/reject`);
   else if (action === "restore-candidate") await mutate(`/candidates/${id}/restore`);
   else if (action === "purge-candidate") {
-    if (await confirmAction("这会清除候选、关联证据、召回、索引、演化事件和旧备份；若已晋升，也会清除关联长期记忆。", "永久删除候选记忆", "永久删除")) await mutate(`/candidates/${id}`, {}, "DELETE");
+    if (await confirmAction("这会清除候选、关联证据、召回、索引、演化事件和旧备份，无法撤销。", "永久删除候选记忆", "永久删除")) await mutate(`/candidates/${id}`, {}, "DELETE");
   } else if (action === "restore-backup") {
     if (await confirmAction("系统会先保存当前状态，再恢复所选备份。当前数据库内容将被替换。", "恢复数据库备份", "恢复备份")) await mutate(`/backups/${encodeURIComponent(button.dataset.name)}/restore`);
   }

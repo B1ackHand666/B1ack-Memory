@@ -284,6 +284,15 @@ class CoreTests(unittest.TestCase):
         memory_id = self.service.promote_candidate(candidate_id)["id"]
         old_backup = self.service.create_backup().name
         self.service.trash_memory(memory_id)
+        self.assertEqual(
+            self.service.db.get_candidate(candidate_id).promoted_memory_id,
+            memory_id,
+        )
+        self.assertEqual(
+            self.service.list_memories(status="trashed")[0]["lineage"]["id"],
+            candidate_id,
+        )
+        self.assertEqual(self.service.memory_lineage(memory_id)["candidate"]["id"], candidate_id)
         result = self.service.purge_memory(memory_id)
         self.assertEqual(result["removed"]["memories"], 1)
         self.assertEqual(self.service.list_memories(), [])
@@ -547,6 +556,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outcome.promoted_count, 1)
         promoted = self.service.list_candidates(status="promoted")[0]
         self.assertEqual(promoted["id"], first.id)
+        self.assertIsNotNone(promoted["promoted_memory_id"])
         self.assertEqual(promoted["evidence_days"], 2)
         self.assertEqual(promoted["rem_reason"], "稳定偏好")
         lineage = self.service.candidate_lineage(first.id)
@@ -661,6 +671,29 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "trash"):
             self.service.purge_memory(memory_id)
 
+    def test_promotion_to_an_already_linked_memory_merges_the_duplicate_candidate(self) -> None:
+        first = self.service.db.upsert_candidate(
+            "同一长期事实",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="first",
+        )
+        memory_id = self.service.promote_candidate(first.id)["id"]
+        duplicate = self.service.db.upsert_candidate(
+            "同一事实的另一种候选表述",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="duplicate",
+        )
+        self.service.promote_candidate(duplicate.id, "同一长期事实")
+        self.assertIsNone(self.service.db.get_candidate(duplicate.id))
+        self.assertEqual(self.service.db.get_candidate(first.id).promoted_memory_id, memory_id)
+        self.assertEqual(len(self.service.list_candidates(status="promoted")), 1)
+
     def test_schema_v2_candidate_migrates_without_immediate_deletion(self) -> None:
         from b1ack_memory.db import MemoryDatabase
 
@@ -706,6 +739,7 @@ class CoreTests(unittest.TestCase):
             excerpt="旧版候选",
         )
         memory = legacy.promote_candidate(candidate.id, origin="dream")
+        self.assertEqual(legacy.get_candidate(candidate.id).promoted_memory_id, memory.id)
         conn = sqlite3.connect(path)
         try:
             conn.execute("DROP TABLE memory_events")
@@ -715,7 +749,7 @@ class CoreTests(unittest.TestCase):
             conn.close()
         migrated = MemoryDatabase(path)
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 4)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
             first_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
             backfilled = conn.execute(
                 "SELECT data_json,backfilled FROM memory_events "
@@ -729,6 +763,150 @@ class CoreTests(unittest.TestCase):
         with migrated.connect() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0], first_count)
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories WHERE id=?", (memory.id,)).fetchone()[0], 1)
+
+    def test_schema_v4_links_promoted_candidates_and_cleans_only_orphans(self) -> None:
+        from b1ack_memory.db import MemoryDatabase, utc_now
+
+        path = self.root / "legacy-v4.db"
+        legacy = MemoryDatabase(path)
+
+        linked: dict[str, tuple[str, str]] = {}
+        for strategy in ("event", "evidence", "model", "exact"):
+            candidate = legacy.upsert_candidate(
+                f"{strategy} 可证明晋升",
+                kind="fact",
+                confidence=0.9,
+                sensitive=False,
+                raw_turn_id=None,
+                excerpt=strategy,
+            )
+            memory = legacy.promote_candidate(candidate.id, origin="review")
+            linked[strategy] = (candidate.id, memory.id)
+
+        orphan = legacy.upsert_candidate(
+            "没有关联的旧晋升候选",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="orphan",
+        )
+        ambiguous = legacy.upsert_candidate(
+            "存在歧义的旧晋升候选",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="ambiguous",
+        )
+        now = utc_now()
+        with legacy.transaction(immediate=True) as conn:
+            conn.execute("UPDATE candidates SET promoted_memory_id=NULL")
+            conn.execute(
+                "INSERT INTO evidence(candidate_id,memory_id,excerpt,role,observed_at) "
+                "VALUES(?,?,?,'conversation',?)",
+                (linked["evidence"][0], linked["evidence"][1], "legacy evidence", now),
+            )
+            conn.execute(
+                "DELETE FROM memory_events WHERE candidate_id=? AND event_type='candidate_promoted'",
+                (linked["evidence"][0],),
+            )
+            for strategy in ("model", "exact"):
+                conn.execute(
+                    "DELETE FROM memory_events WHERE candidate_id=? AND event_type='candidate_promoted'",
+                    (linked[strategy][0],),
+                )
+                conn.execute(
+                    "UPDATE evidence SET memory_id=NULL WHERE candidate_id=?",
+                    (linked[strategy][0],),
+                )
+            conn.execute(
+                "INSERT INTO dream_runs(id,status,started_at) VALUES('legacy-run','completed',?)",
+                (now,),
+            )
+            conn.execute(
+                "INSERT INTO model_calls(id,dream_run_id,phase,request_json,response_json,model,created_at) "
+                "VALUES('legacy-call','legacy-run','deep','{}','{}','legacy',?)",
+                (now,),
+            )
+            conn.executemany(
+                "INSERT INTO model_call_records(call_id,record_type,record_id) VALUES(?,?,?)",
+                [
+                    ("legacy-call", "candidate", linked["model"][0]),
+                    ("legacy-call", "memory", linked["model"][1]),
+                ],
+            )
+            conn.execute(
+                "UPDATE candidates SET status='promoted',promotion_origin='review',promoted_at=? "
+                "WHERE id IN (?,?)",
+                (now, orphan.id, ambiguous.id),
+            )
+            digest = conn.execute(
+                "SELECT content_hash FROM candidates WHERE id=?", (ambiguous.id,)
+            ).fetchone()[0]
+            for suffix in ("a", "b"):
+                conn.execute(
+                    "INSERT INTO memories(id,content,kind,status,origin,confidence,importance,"
+                    "sensitive,content_hash,created_at,updated_at) "
+                    "VALUES(?,?,'fact','active','review',0.9,0.5,0,?,?,?)",
+                    (
+                        f"ambiguous-memory-{suffix}",
+                        "存在歧义的旧晋升候选",
+                        digest,
+                        now,
+                        now,
+                    ),
+                )
+            conn.execute("UPDATE schema_meta SET version=4")
+
+        migrated = MemoryDatabase(path)
+        for candidate_id, memory_id in linked.values():
+            self.assertEqual(migrated.get_candidate(candidate_id).promoted_memory_id, memory_id)
+        self.assertIsNone(migrated.get_candidate(orphan.id))
+        self.assertIsNone(migrated.get_candidate(ambiguous.id))
+        with migrated.connect() as conn:
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM audit_events "
+                    "WHERE action='migration-cleanup-orphan-promoted'"
+                ).fetchone()[0],
+                2,
+            )
+            event_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
+        self.assertTrue(any((path.parent / "backups").glob("*-pre-schema-v5.db")))
+        migrated.migrate()
+        with migrated.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0], event_count)
+
+    def test_memory_flow_keeps_full_history_but_returns_latest_twenty(self) -> None:
+        base = datetime(2026, 8, 1, tzinfo=UTC)
+        expected: list[str] = []
+        for index in range(25):
+            candidate = self.service.db.upsert_candidate(
+                f"最近变化候选 {index}",
+                kind="fact",
+                confidence=0.9,
+                sensitive=False,
+                raw_turn_id=None,
+                excerpt=str(index),
+            )
+            occurred_at = (base + timedelta(minutes=index)).isoformat()
+            expected.append(occurred_at)
+            with self.service.db.transaction(immediate=True) as conn:
+                conn.execute(
+                    "UPDATE memory_events SET occurred_at=? "
+                    "WHERE candidate_id=? AND event_type='candidate_created'",
+                    (occurred_at, candidate.id),
+                )
+        flow = self.service.memory_flow("all")
+        self.assertEqual(len(flow["recent"]), 20)
+        self.assertEqual(
+            [item["occurred_at"] for item in flow["recent"]],
+            list(reversed(expected[-20:])),
+        )
+        with self.service.db.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0], 25)
 
 
 class SecurityTests(unittest.TestCase):

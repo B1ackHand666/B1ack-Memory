@@ -14,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import CandidateRecord, MEMORY_KINDS, MemoryRecord
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -57,6 +57,29 @@ class MemoryDatabase:
         self._local = threading.local()
         self.migrate()
 
+    def _backup_before_schema_v5(self) -> None:
+        """Create a safe online backup immediately before upgrading schema v4."""
+        if not self.path.is_file() or self.path.stat().st_size == 0:
+            return
+        try:
+            with contextlib.closing(sqlite3.connect(self.path)) as source:
+                table = source.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_meta'"
+                ).fetchone()
+                if not table:
+                    return
+                version = int(source.execute("SELECT version FROM schema_meta").fetchone()[0])
+                if version != 4:
+                    return
+                backup_dir = self.path.parent / "backups"
+                backup_dir.mkdir(exist_ok=True)
+                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+                target = backup_dir / f"{stamp}-pre-schema-v5.db"
+                with contextlib.closing(sqlite3.connect(target)) as destination:
+                    source.backup(destination)
+        except (OSError, sqlite3.Error, TypeError, ValueError) as error:
+            raise RuntimeError(f"Unable to create pre-schema-v5 backup: {error}") from error
+
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
             self.path, timeout=5, isolation_level=None, factory=_ClosingConnection
@@ -83,6 +106,7 @@ class MemoryDatabase:
             conn.close()
 
     def migrate(self) -> None:
+        self._backup_before_schema_v5()
         with self.transaction(immediate=True) as conn:
             conn.executescript(
                 """
@@ -151,6 +175,7 @@ class MemoryDatabase:
                     rejected_at TEXT,
                     promoted_at TEXT,
                     promotion_origin TEXT,
+                    promoted_memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
                     rem_status TEXT NOT NULL DEFAULT 'unreviewed',
                     rem_reason TEXT,
                     rem_reviewed_at TEXT
@@ -294,6 +319,7 @@ class MemoryDatabase:
                 "rejected_at": "TEXT",
                 "promoted_at": "TEXT",
                 "promotion_origin": "TEXT",
+                "promoted_memory_id": "TEXT REFERENCES memories(id) ON DELETE CASCADE",
                 "rem_status": "TEXT NOT NULL DEFAULT 'unreviewed'",
                 "rem_reason": "TEXT",
                 "rem_reviewed_at": "TEXT",
@@ -335,6 +361,12 @@ class MemoryDatabase:
                         "UPDATE candidates SET evidence_days=? WHERE id=?",
                         (evidence_days, candidate_row["id"]),
                     )
+            if current < 5:
+                self._migrate_promoted_memory_links(conn)
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_promoted_memory "
+                "ON candidates(promoted_memory_id) WHERE promoted_memory_id IS NOT NULL"
+            )
             conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
 
     def default_settings(self) -> dict[str, Any]:
@@ -494,6 +526,134 @@ class MemoryDatabase:
                 backfilled=True,
                 event_key=f"backfill:memory:revision:{row['id']}",
             )
+
+    def _migrate_promoted_memory_links(self, conn: sqlite3.Connection) -> None:
+        """Link legacy promoted candidates only when one memory is provably unique."""
+        used_memory_ids = {
+            row[0]
+            for row in conn.execute(
+                "SELECT promoted_memory_id FROM candidates WHERE promoted_memory_id IS NOT NULL"
+            )
+        }
+
+        def unique_available(rows: list[sqlite3.Row]) -> str | None:
+            ids = {str(row[0]) for row in rows if row[0]}
+            if len(ids) != 1:
+                return None
+            memory_id = next(iter(ids))
+            return None if memory_id in used_memory_ids else memory_id
+
+        promoted_rows = conn.execute(
+            "SELECT id,content,content_hash,promotion_origin,promoted_at "
+            "FROM candidates WHERE status='promoted' ORDER BY promoted_at,id"
+        ).fetchall()
+        for candidate in promoted_rows:
+            candidate_id = candidate["id"]
+            queries: list[tuple[str, tuple[Any, ...]]] = [
+                (
+                    "SELECT DISTINCT me.memory_id FROM memory_events me "
+                    "JOIN memories m ON m.id=me.memory_id "
+                    "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
+                    "AND me.memory_id IS NOT NULL",
+                    (candidate_id,),
+                ),
+                (
+                    "SELECT DISTINCT e.memory_id FROM evidence e "
+                    "JOIN memories m ON m.id=e.memory_id "
+                    "WHERE e.candidate_id=? AND e.memory_id IS NOT NULL",
+                    (candidate_id,),
+                ),
+                (
+                    "SELECT DISTINCT memory_ref.record_id FROM model_call_records candidate_ref "
+                    "JOIN model_call_records memory_ref ON memory_ref.call_id=candidate_ref.call_id "
+                    "AND memory_ref.record_type='memory' "
+                    "JOIN memories m ON m.id=memory_ref.record_id "
+                    "WHERE candidate_ref.record_type='candidate' AND candidate_ref.record_id=?",
+                    (candidate_id,),
+                ),
+            ]
+            memory_id = None
+            for sql, args in queries:
+                memory_id = unique_available(conn.execute(sql, args).fetchall())
+                if memory_id:
+                    break
+            if not memory_id and candidate["promoted_at"] and candidate["promotion_origin"]:
+                memory_id = unique_available(
+                    conn.execute(
+                        "SELECT id FROM memories WHERE content_hash=? AND origin=? "
+                        "AND abs((julianday(created_at)-julianday(?))*86400)<=600",
+                        (
+                            candidate["content_hash"],
+                            candidate["promotion_origin"],
+                            candidate["promoted_at"],
+                        ),
+                    ).fetchall()
+                )
+            if memory_id:
+                conn.execute(
+                    "UPDATE candidates SET promoted_memory_id=? WHERE id=?",
+                    (memory_id, candidate_id),
+                )
+                used_memory_ids.add(memory_id)
+
+        orphan_rows = conn.execute(
+            "SELECT id FROM candidates WHERE status='promoted' AND promoted_memory_id IS NULL"
+        ).fetchall()
+        orphan_ids = [row["id"] for row in orphan_rows]
+        if not orphan_ids:
+            return
+        placeholders = ",".join("?" for _ in orphan_ids)
+        raw_ids = [
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT raw_turn_id FROM evidence WHERE candidate_id IN ({placeholders}) "
+                "AND raw_turn_id IS NOT NULL",
+                orphan_ids,
+            )
+        ]
+        call_ids = [
+            row[0]
+            for row in conn.execute(
+                f"SELECT DISTINCT call_id FROM model_call_records WHERE record_type='candidate' "
+                f"AND record_id IN ({placeholders})",
+                orphan_ids,
+            )
+        ]
+        conn.execute(
+            f"DELETE FROM recall_events WHERE source='candidate' AND record_id IN ({placeholders})",
+            orphan_ids,
+        )
+        conn.execute(
+            f"DELETE FROM embeddings WHERE source='candidate' AND record_id IN ({placeholders})",
+            orphan_ids,
+        )
+        conn.execute(
+            f"DELETE FROM search_fts WHERE source='candidate' AND record_id IN ({placeholders})",
+            orphan_ids,
+        )
+        conn.execute(
+            f"DELETE FROM model_call_records WHERE record_type='candidate' "
+            f"AND record_id IN ({placeholders})",
+            orphan_ids,
+        )
+        conn.execute(f"DELETE FROM candidates WHERE id IN ({placeholders})", orphan_ids)
+        for raw_id in raw_ids:
+            conn.execute(
+                "DELETE FROM raw_turns WHERE id=? "
+                "AND NOT EXISTS(SELECT 1 FROM evidence WHERE raw_turn_id=?)",
+                (raw_id, raw_id),
+            )
+        for call_id in call_ids:
+            conn.execute(
+                "DELETE FROM model_calls WHERE id=? "
+                "AND NOT EXISTS(SELECT 1 FROM model_call_records WHERE call_id=?)",
+                (call_id, call_id),
+            )
+        now = utc_now()
+        conn.executemany(
+            "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
+            [("migration-cleanup-orphan-promoted", candidate_id, now) for candidate_id in orphan_ids],
+        )
 
     @staticmethod
     def _count_evidence_days(
@@ -671,8 +831,8 @@ class MemoryDatabase:
                 "LEFT JOIN evidence e ON e.candidate_id=c.id "
                 "LEFT JOIN memory_events me ON me.candidate_id=c.id "
                 "AND me.event_type='candidate_promoted' "
-                "WHERE e.memory_id=? OR me.memory_id=?",
-                (record_id, record_id),
+                "WHERE c.promoted_memory_id=? OR e.memory_id=? OR me.memory_id=?",
+                (record_id, record_id, record_id),
             ).fetchall()
             candidate_ids = [row["id"] for row in candidate_rows]
             raw_ids = [
@@ -1225,9 +1385,74 @@ class MemoryDatabase:
                         "UPDATE memories SET status='superseded',updated_at=? WHERE id=?",
                         (now, candidate["conflict_memory_id"]),
                     )
+            linked_candidate = conn.execute(
+                "SELECT id FROM candidates WHERE promoted_memory_id=? AND id<>?",
+                (memory_id, candidate_id),
+            ).fetchone()
+            if linked_candidate:
+                canonical_id = linked_candidate["id"]
+                conn.execute(
+                    "UPDATE evidence SET candidate_id=?,memory_id=? WHERE candidate_id=?",
+                    (canonical_id, memory_id, candidate_id),
+                )
+                conn.execute(
+                    "UPDATE recall_events SET record_id=? "
+                    "WHERE source='candidate' AND record_id=?",
+                    (canonical_id, candidate_id),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
+                    "SELECT call_id,'candidate',? FROM model_call_records "
+                    "WHERE record_type='candidate' AND record_id=?",
+                    (canonical_id, candidate_id),
+                )
+                conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                    (candidate_id,),
+                )
+                conn.execute(
+                    "DELETE FROM embeddings WHERE source='candidate' AND record_id=?",
+                    (candidate_id,),
+                )
+                conn.execute(
+                    "DELETE FROM search_fts WHERE source='candidate' AND record_id=?",
+                    (candidate_id,),
+                )
+                conn.execute(
+                    "UPDATE candidates SET last_seen_at=max(last_seen_at,?),"
+                    "last_activity_at=max(last_activity_at,?),"
+                    "recall_count=(SELECT COUNT(*) FROM recall_events "
+                    "WHERE source='candidate' AND record_id=? AND injected=1),"
+                    "unique_query_count=(SELECT COUNT(DISTINCT query_hash) FROM recall_events "
+                    "WHERE source='candidate' AND record_id=? AND injected=1) WHERE id=?",
+                    (
+                        candidate["last_seen_at"],
+                        candidate["last_activity_at"],
+                        canonical_id,
+                        canonical_id,
+                        canonical_id,
+                    ),
+                )
+                self._add_event(
+                    conn,
+                    "candidate_merged",
+                    candidate_id=canonical_id,
+                    memory_id=memory_id,
+                    dream_run_id=dream_run_id,
+                    occurred_at=now,
+                    data={
+                        "duplicate_candidate_id": candidate_id,
+                        "duplicate_content": candidate["content"],
+                        "reason": "晋升目标已关联同一长期记忆",
+                    },
+                )
+                conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+                row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+                return self._memory_from_row(row)
             conn.execute(
-                "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=? WHERE id=?",
-                (now, origin, candidate_id),
+                "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=?,"
+                "promoted_memory_id=? WHERE id=?",
+                (now, origin, memory_id, candidate_id),
             )
             conn.execute(
                 "UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory_id, candidate_id)
@@ -1563,6 +1788,7 @@ class MemoryDatabase:
             rejected_at=row["rejected_at"],
             promoted_at=row["promoted_at"],
             promotion_origin=row["promotion_origin"],
+            promoted_memory_id=row["promoted_memory_id"],
             rem_status=row["rem_status"] or "unreviewed",
             rem_reason=row["rem_reason"],
             rem_reviewed_at=row["rem_reviewed_at"],
