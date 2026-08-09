@@ -27,7 +27,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(bundle.status_code, 200)
         self.assertIn("B1ack Memory", bundle.json()["html"])
         self.assertIn("记忆演化", bundle.json()["html"])
-        self.assertIn("candidate-promoted-count", bundle.json()["html"])
+        self.assertNotIn('data-candidate-status="promoted"', bundle.json()["html"])
+        self.assertIn("LATEST 20", bundle.json()["html"])
         self.assertIn("prefers-reduced-motion", bundle.json()["css"])
         self.assertIn("dashboardBridge.request", bundle.json()["js"])
         self.assertEqual(self.client.post("/api/memories", json={"content": "测试"}).status_code, 403)
@@ -156,6 +157,7 @@ class WebTests(unittest.TestCase):
         memory_id = promoted.json()["id"]
         promoted_rows = self.client.get("/api/candidates?status=promoted").json()
         self.assertEqual(promoted_rows[0]["id"], candidate.id)
+        self.assertEqual(promoted_rows[0]["promoted_memory_id"], memory_id)
         self.assertEqual(promoted_rows[0]["linked_memory"]["id"], memory_id)
         memory_lineage = self.client.get(f"/api/lineage/memory/{memory_id}").json()
         event_types = {item["event_type"] for item in memory_lineage["events"]}
@@ -168,6 +170,7 @@ class WebTests(unittest.TestCase):
         analytics = self.client.get("/api/analytics/memory-flow?range=30d")
         self.assertEqual(analytics.status_code, 200)
         self.assertEqual(analytics.json()["promotion_lanes"]["manual"], 1)
+        self.assertNotIn("promoted", analytics.json()["status"])
         self.assertEqual(self.client.get("/api/analytics/memory-flow?range=bad").status_code, 400)
 
 
