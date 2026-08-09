@@ -163,6 +163,60 @@ class NoiseReviewClient(ExistingApprovingClient):
         return super().chat_json(system=system, user=user)
 
 
+class StructuredDuplicateClient(ExistingApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        import json
+
+        payload = json.loads(user)
+        if "review personal-memory" in system:
+            candidates = payload["candidates"]
+            canonical = next(item for item in candidates if "简洁" in item["content"])
+            duplicate = next(item for item in candidates if item["id"] != canonical["id"])
+            parsed = {
+                "summary": "确认两种中文措辞表达同一项稳定偏好",
+                "themes": ["表达风格"],
+                "reviews": [
+                    {
+                        "candidate_id": canonical["id"],
+                        "decision": "durable",
+                        "target_id": None,
+                        "explanation": "稳定偏好",
+                    },
+                    {
+                        "candidate_id": duplicate["id"],
+                        "decision": "duplicate_candidate",
+                        "target_id": canonical["id"],
+                        "explanation": "中文措辞不同但含义相同",
+                    },
+                ],
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        if "compact qualified" in system:
+            candidate = payload["candidates"][0]
+            parsed = {
+                "memories": [
+                    {
+                        "candidate_id": candidate["id"],
+                        "content": "用户偏好简洁、清晰的中文回答。",
+                    }
+                ]
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
+class UnknownDeepCandidateClient(ApprovingClient):
+    def chat_json(self, *, system: str, user: str) -> LlmResult:
+        if "compact qualified" in system:
+            parsed = {
+                "memories": [
+                    {"candidate_id": "not-a-qualified-candidate", "content": "不能凭空创建"}
+                ]
+            }
+            return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
+        return super().chat_json(system=system, user=user)
+
+
 class CoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -238,6 +292,13 @@ class CoreTests(unittest.TestCase):
         self.assertFalse(any(item["name"] == old_backup for item in self.service.list_backups()))
         with self.service.db.connect() as conn:
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_turns").fetchone()[0], 0)
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_events WHERE candidate_id=? OR memory_id=?",
+                    (candidate_id, memory_id),
+                ).fetchone()[0],
+                0,
+            )
 
     def test_corrupt_backup_cannot_replace_live_database(self) -> None:
         self.service.remember("当前数据")
@@ -264,6 +325,15 @@ class CoreTests(unittest.TestCase):
         candidate = self.service.list_candidates()[0]
         self.assertEqual(candidate["conflict_memory_id"], existing_id)
         self.assertEqual(candidate["conflict_reason"], "新旧偏好不一致")
+        self.assertEqual(candidate["rem_status"], "conflict")
+        lineage = self.service.candidate_lineage(candidate["id"])
+        self.assertTrue(
+            any(
+                item["event_type"] == "rem_reviewed"
+                and item["data"]["decision"] == "conflict"
+                for item in lineage["events"]
+            )
+        )
 
     def test_evidence_days_use_original_observation_date(self) -> None:
         first = self.service.db.add_raw_turn("s1", "u1", "a1", redacted=False)
@@ -287,6 +357,61 @@ class CoreTests(unittest.TestCase):
             observed_at="2026-07-02T08:00:00+00:00",
         )
         self.assertEqual(candidate.evidence_days, 2)
+
+    def test_candidate_without_conversation_evidence_starts_at_zero(self) -> None:
+        candidate = self.service.db.upsert_candidate(
+            "人工建立但尚无会话证据的候选",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="人工候选",
+        )
+        self.assertEqual(candidate.evidence_days, 0)
+
+    def test_evidence_dates_follow_configured_timezone_boundaries(self) -> None:
+        first = self.service.db.add_raw_turn("tz1", "u1", "a1", redacted=False)
+        second = self.service.db.add_raw_turn("tz2", "u2", "a2", redacted=False)
+        self.service.save_settings("general", {"timezone": "Asia/Shanghai"})
+        self.service.db.upsert_candidate(
+            "北京时间跨日偏好",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=first,
+            excerpt="第一次证据",
+            observed_at="2026-08-08T15:30:00+00:00",
+            timezone_name="Asia/Shanghai",
+        )
+        candidate = self.service.db.upsert_candidate(
+            "北京时间跨日偏好",
+            kind="preference",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=second,
+            excerpt="第二次证据",
+            observed_at="2026-08-08T16:30:00+00:00",
+            timezone_name="Asia/Shanghai",
+        )
+        self.assertEqual(candidate.evidence_days, 2)
+        self.service.save_settings("general", {"timezone": "UTC"})
+        self.assertEqual(self.service.db.get_candidate(candidate.id).evidence_days, 1)
+        self.service.save_settings("general", {"timezone": "Asia/Shanghai"})
+        self.assertEqual(self.service.db.get_candidate(candidate.id).evidence_days, 2)
+
+    def test_same_local_date_and_dst_dates_are_counted_safely(self) -> None:
+        from b1ack_memory.db import local_date
+
+        self.assertEqual(
+            local_date("2026-08-08T23:30:00+00:00", "Asia/Shanghai"),
+            local_date("2026-08-09T01:30:00+00:00", "Asia/Shanghai"),
+        )
+        self.assertNotEqual(
+            local_date("2026-03-08T04:30:00+00:00", "America/New_York"),
+            local_date("2026-03-08T07:30:00+00:00", "America/New_York"),
+        )
+        with self.assertRaisesRegex(ValueError, "IANA timezone"):
+            self.service.save_settings("general", {"timezone": "Mars/Local"})
 
     def test_dream_caps_new_candidates_at_eight(self) -> None:
         self.service.capture_turn("s1", "这里包含很多长期偏好", "好的")
@@ -313,6 +438,32 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outcome.status, "completed")
         self.assertEqual(outcome.promoted_count, 1)
         self.assertEqual(len(self.service.list_memories()), 1)
+
+    def test_deep_cannot_create_memory_without_a_qualified_candidate_id(self) -> None:
+        for index, observed in enumerate(
+            ["2026-08-07T08:00:00+00:00", "2026-08-08T08:00:00+00:00"]
+        ):
+            raw_id = self.service.db.add_raw_turn(
+                f"deep-guard-{index}", "用户偏好简洁中文", "好的", redacted=False
+            )
+            self.service.db.upsert_candidate(
+                "用户偏好简洁的中文回答",
+                kind="preference",
+                confidence=0.94,
+                sensitive=False,
+                raw_turn_id=raw_id,
+                excerpt="用户偏好简洁的中文回答",
+                observed_at=observed,
+                timezone_name="Asia/Shanghai",
+            )
+            self.service.db.mark_turns_ingested([raw_id])
+        self.service.save_settings("general", {"timezone": "Asia/Shanghai"})
+        self.service.capture_turn("deep-guard-trigger", "继续", "好的")
+        outcome = DreamEngine(self.service.db, UnknownDeepCandidateClient()).run()
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.promoted_count, 0)
+        self.assertEqual(self.service.list_memories(), [])
+        self.assertEqual(len(self.service.list_candidates()), 1)
 
     def test_utility_lane_auto_promotes_after_two_distinct_injections(self) -> None:
         candidate = self.service.db.upsert_candidate(
@@ -364,6 +515,56 @@ class CoreTests(unittest.TestCase):
         noisy = DreamEngine(self.service.db, NoiseReviewClient()).run()
         self.assertEqual(noisy.expired_count, 1)
         self.assertEqual(self.service.db.get_candidate(canonical_id).status, "expired")
+
+    def test_structured_rem_merges_chinese_evidence_and_records_deep_lineage(self) -> None:
+        first_turn = self.service.db.add_raw_turn("cn-1", "偏好简洁", "好的", redacted=False)
+        second_turn = self.service.db.add_raw_turn("cn-2", "请精炼作答", "好的", redacted=False)
+        first = self.service.db.upsert_candidate(
+            "用户偏好简洁的中文回答",
+            kind="preference",
+            confidence=0.92,
+            sensitive=False,
+            raw_turn_id=first_turn,
+            excerpt="用户偏好简洁的中文回答",
+            observed_at="2026-08-07T08:00:00+00:00",
+            timezone_name="Asia/Shanghai",
+        )
+        self.service.db.upsert_candidate(
+            "回答用户时应使用精炼中文",
+            kind="preference",
+            confidence=0.91,
+            sensitive=False,
+            raw_turn_id=second_turn,
+            excerpt="回答用户时应使用精炼中文",
+            observed_at="2026-08-08T08:00:00+00:00",
+            timezone_name="Asia/Shanghai",
+        )
+        self.service.save_settings("general", {"timezone": "Asia/Shanghai"})
+        self.service.db.mark_turns_ingested([first_turn, second_turn])
+        self.service.capture_turn("trigger-cn", "继续", "好的")
+        outcome = DreamEngine(self.service.db, StructuredDuplicateClient()).run()
+        self.assertEqual(outcome.merged_count, 1)
+        self.assertEqual(outcome.promoted_count, 1)
+        promoted = self.service.list_candidates(status="promoted")[0]
+        self.assertEqual(promoted["id"], first.id)
+        self.assertEqual(promoted["evidence_days"], 2)
+        self.assertEqual(promoted["rem_reason"], "稳定偏好")
+        lineage = self.service.candidate_lineage(first.id)
+        promotion = next(
+            item for item in lineage["events"] if item["event_type"] == "candidate_promoted"
+        )
+        self.assertEqual(promotion["data"]["promotion_lane"], "different_dates")
+        self.assertEqual(promotion["data"]["candidate_content"], "用户偏好简洁的中文回答")
+        self.assertEqual(promotion["data"]["memory_content"], "用户偏好简洁、清晰的中文回答。")
+        self.assertEqual(lineage["memory"]["origin"], "dream")
+        self.assertTrue(any(item["event_type"] == "candidate_merged" for item in lineage["events"]))
+        self.assertTrue(
+            any(
+                item["event_type"] == "rem_reviewed"
+                and item["data"]["reason"] == "稳定偏好"
+                for item in lineage["events"]
+            )
+        )
 
     def test_auto_promotion_is_capped_per_local_day(self) -> None:
         for index in range(4):
@@ -447,6 +648,13 @@ class CoreTests(unittest.TestCase):
         self.assertIsNone(self.service.db.get_candidate(candidate_id))
         self.assertNotIn(old_backup, {item["name"] for item in self.service.list_backups()})
         self.assertTrue(result["clean_backup"].endswith("-post-purge.db"))
+        with self.service.db.connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_events WHERE candidate_id=?", (candidate_id,)
+                ).fetchone()[0],
+                0,
+            )
 
     def test_active_long_term_memory_cannot_be_hard_deleted(self) -> None:
         memory_id = self.service.remember("需要先回收的长期记忆")["memory"]["id"]
@@ -483,6 +691,44 @@ class CoreTests(unittest.TestCase):
         self.assertIsNotNone(migrated)
         self.assertEqual(migrated.status, "pending")
         self.assertEqual(migrated.last_activity_at, migrated.last_seen_at)
+
+    def test_schema_v3_backfills_memory_events_idempotently(self) -> None:
+        from b1ack_memory.db import MemoryDatabase
+
+        path = self.root / "legacy-v3.db"
+        legacy = MemoryDatabase(path)
+        candidate = legacy.upsert_candidate(
+            "旧版候选",
+            kind="fact",
+            confidence=0.9,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="旧版候选",
+        )
+        memory = legacy.promote_candidate(candidate.id, origin="dream")
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("DROP TABLE memory_events")
+            conn.execute("UPDATE schema_meta SET version=3")
+            conn.commit()
+        finally:
+            conn.close()
+        migrated = MemoryDatabase(path)
+        with migrated.connect() as conn:
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 4)
+            first_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
+            backfilled = conn.execute(
+                "SELECT data_json,backfilled FROM memory_events "
+                "WHERE event_type='candidate_promoted' AND candidate_id=?",
+                (candidate.id,),
+            ).fetchone()
+        self.assertGreaterEqual(first_count, 3)
+        self.assertEqual(backfilled["backfilled"], 1)
+        self.assertIn('"promotion_lane": "unknown"', backfilled["data_json"])
+        migrated.migrate()
+        with migrated.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0], first_count)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM memories WHERE id=?", (memory.id,)).fetchone()[0], 1)
 
 
 class SecurityTests(unittest.TestCase):

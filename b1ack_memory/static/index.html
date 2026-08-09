@@ -3,79 +3,121 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
   <title>B1ack Memory</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <aside>
-    <div class="brand"><i></i><span>B1ack Memory<small>个人记忆控制台</small></span></div>
-    <nav>
-      <button class="active" data-page="overview">概览</button>
-      <button data-page="memories">长期记忆</button>
-      <button data-page="candidates">候选记忆</button>
-      <button data-page="dream">Dream 日志</button>
-      <button data-page="traces">召回轨迹</button>
-      <button data-page="settings">模型与设置</button>
-      <button data-page="maintenance">备份与维护</button>
+    <div class="brand"><i aria-hidden="true"></i><span>B1ack Memory<small>个人记忆控制台</small></span></div>
+    <nav aria-label="主导航">
+      <button class="active" data-page="overview"><span>01</span>概览</button>
+      <button data-page="evolution"><span>02</span>记忆演化</button>
+      <button data-page="memories"><span>03</span>长期记忆</button>
+      <button data-page="candidates"><span>04</span>候选记忆</button>
+      <button data-page="dream"><span>05</span>Dream 日志</button>
+      <button data-page="traces"><span>06</span>召回轨迹</button>
+      <button data-page="settings"><span>07</span>模型与设置</button>
+      <button data-page="maintenance"><span>08</span>备份与维护</button>
     </nav>
-    <div class="local">仅本机访问 · SQLite</div>
+    <div class="local"><i></i>SQLite 单文件 · 本机优先</div>
   </aside>
+
   <main>
-    <header><div><h1 id="title">概览</h1><p id="subtitle">记忆健康、处理队列和近期活动</p></div><button class="ghost" id="refresh">刷新</button></header>
-    <div id="notice" role="status"></div>
+    <header>
+      <div><span class="eyebrow">MEMORY CONTROL</span><h1 id="title">概览</h1><p id="subtitle">记忆健康、处理队列和近期活动</p></div>
+      <button class="ghost icon-button" id="refresh" title="刷新全部数据" aria-label="刷新全部数据">↻</button>
+    </header>
+    <div id="notice" role="status" aria-live="polite"></div>
 
     <section id="overview" class="page active">
-      <div id="metrics" class="metrics"></div>
+      <div id="metrics" class="metrics skeleton-group"></div>
       <div class="grid two">
-        <article><h2>系统状态</h2><div id="health"></div></article>
-        <article><h2>记忆流</h2><div class="flow"><span>会话</span><b>→</b><span>Light</span><b>→</b><span>REM</span><b>→</b><span>Deep</span></div><p class="muted">候选通过“跨日重复”或“实际帮助回答”任一通道后，才会自动固化。</p></article>
+        <article><div class="panel-heading"><span>STATUS</span><h2>系统状态</h2></div><div id="health" class="skeleton-block"></div></article>
+        <article><div class="panel-heading"><span>PIPELINE</span><h2>记忆形成路径</h2></div>
+          <div class="flow" aria-label="会话经过 Light、REM、Deep 形成长期记忆"><span>会话</span><b>→</b><span>Light</span><b>→</b><span>REM</span><b>→</b><span>Deep</span></div>
+          <p class="muted">候选通过“不同日期证据”或“实际帮助回答”任一通道，并经最新 REM 审查后自动固化。</p>
+        </article>
       </div>
+      <button class="overview-link" data-page="evolution">查看记忆如何变化 <span>→</span></button>
+    </section>
+
+    <section id="evolution" class="page">
+      <div class="toolbar split evolution-toolbar">
+        <div class="tabs range-tabs" aria-label="图表日期范围">
+          <button class="ghost" data-range="7d">7 天</button><button class="ghost active" data-range="30d">30 天</button><button class="ghost" data-range="90d">90 天</button><button class="ghost" data-range="all">全部</button>
+        </div>
+        <span id="analytics-timezone" class="meta"></span>
+      </div>
+      <div id="evolution-summary" class="metrics compact"></div>
+      <div class="grid analytics-grid">
+        <article class="chart-panel wide">
+          <div class="panel-heading"><span>DAILY FLOW</span><h2>每日变化</h2><p>候选从出现、合并到晋升或退出的变化</p></div>
+          <div class="legend" id="daily-legend"></div><div id="daily-chart" class="chart-shell skeleton-block"></div>
+        </article>
+        <article class="chart-panel">
+          <div class="panel-heading"><span>CURRENT STATE</span><h2>状态分布</h2></div><div id="status-chart" class="bar-list skeleton-block"></div>
+        </article>
+        <article class="chart-panel">
+          <div class="panel-heading"><span>PROMOTION</span><h2>晋升通道</h2></div><div id="lane-chart" class="bar-list skeleton-block"></div>
+        </article>
+      </div>
+      <article class="recent-panel"><div class="panel-heading"><span>RECENT EVENTS</span><h2>最近变化</h2></div><div id="recent-events" class="event-list skeleton-block"></div></article>
     </section>
 
     <section id="memories" class="page">
-      <div class="toolbar"><input id="memory-search" placeholder="在当前列表中筛选"><select id="memory-status"><option value="active">有效</option><option value="trashed">回收站</option></select><button id="add-memory">新增记忆</button></div>
-      <div id="memory-list" class="cards"></div>
+      <div class="toolbar split"><div class="row no-margin grow"><input id="memory-search" placeholder="筛选当前列表" aria-label="筛选长期记忆"><select id="memory-status" aria-label="长期记忆状态"><option value="active">有效记忆</option><option value="trashed">回收站</option></select></div><button id="add-memory">＋ 新增记忆</button></div>
+      <div id="memory-list" class="cards skeleton-group"></div>
     </section>
 
     <section id="candidates" class="page">
-      <div class="callout">候选是尚未固化的短期记忆。14 天没有新证据、实际召回或人工恢复时会过期；人工拒绝与过期内容默认再保留 30 天。</div>
-      <div class="toolbar candidate-toolbar">
+      <div class="callout neutral"><b>候选是长期记忆的观察区。</b> 无活动 14 天后移入已过期；不同日期不是等待天数，而是内容在两个本地日期中各自获得了真实证据。</div>
+      <div class="toolbar split candidate-toolbar">
         <div class="tabs">
           <button class="ghost active" data-candidate-status="pending">待审核 <span id="candidate-pending-count">0</span></button>
+          <button class="ghost success-tab" data-candidate-status="promoted">已晋升 <span id="candidate-promoted-count">0</span></button>
           <button class="ghost" data-candidate-status="expired">已过期 <span id="candidate-expired-count">0</span></button>
           <button class="ghost" data-candidate-status="rejected">已拒绝 <span id="candidate-rejected-count">0</span></button>
         </div>
         <button class="danger" id="purge-candidate-status" hidden>清空当前分区</button>
       </div>
-      <div id="candidate-list" class="cards"></div>
+      <div id="candidate-list" class="cards skeleton-group"></div>
     </section>
 
     <section id="dream" class="page">
       <div class="toolbar"><button id="run-dream">立即运行 Dream</button><button class="ghost" id="dry-dream" title="会调用模型，但不会修改记忆数据库">试运行（不写入）</button></div>
-      <div id="dream-list" class="cards"></div>
-      <h2 class="section-title">模型调用明细</h2><div id="call-list" class="cards"></div>
+      <div id="dream-list" class="cards skeleton-group"></div>
+      <div class="section-heading"><span>MODEL CALLS</span><h2>模型调用明细</h2></div><div id="call-list" class="cards"></div>
     </section>
 
-    <section id="traces" class="page"><div id="trace-list" class="table-wrap"></div></section>
+    <section id="traces" class="page"><div id="trace-list" class="table-wrap skeleton-block"></div></section>
 
     <section id="settings" class="page">
-      <div class="grid two">
-        <form id="llm-form"><h2>Dream 模型</h2><label>OpenAI 兼容地址<input name="base_url" required></label><label>模型名<input name="model" required></label><label>超时（秒）<input name="timeout_seconds" type="number" min="1"></label><label>最大输出 Token<input name="max_output_tokens" type="number" min="64"></label><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="llm">测试连接</button></div><small id="llm-key"></small></form>
-        <form id="embedding-form"><h2>向量检索（可选）</h2><label class="check"><input name="enabled" type="checkbox">启用 embeddings</label><label>兼容地址<input name="base_url"></label><label>模型名<input name="model"></label><label>超时（秒）<input name="timeout_seconds" type="number" min="1" value="60"></label><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="embedding">测试连接</button></div><small id="embedding-key"></small></form>
-        <form id="dream-form"><h2>Dream 调度</h2><label class="check"><input name="enabled" type="checkbox">启用每日 Dream</label><label>本地时间<input name="daily_at" type="time"></label><label>Light 单批最大字符<input name="batch_chars" type="number" min="1000"></label><label>Light 最大批数<input name="max_light_batches" type="number" min="1"></label><label>单次新增候选上限<input name="max_new_candidates" type="number" min="1" max="20"></label><label>每日最大自动晋升数<input name="max_auto_promotions" type="number" min="0"></label><small>晋升采用内置双通道推荐规则，复杂阈值无需维护。</small><button type="submit">保存</button></form>
-        <form id="recall-form"><h2>召回</h2><label>返回条数<input name="limit" type="number" min="1" max="20"></label><label>最大注入字符<input name="max_context_chars" type="number" min="500"></label><button type="submit">保存</button></form>
+      <div class="grid two settings-grid">
+        <form id="general-form"><div class="panel-heading"><span>GENERAL</span><h2>时间与日期</h2></div><label>记忆时区<input name="timezone" list="timezone-options" placeholder="system 或 IANA 时区"></label><datalist id="timezone-options"><option value="system"><option value="Asia/Shanghai"><option value="Asia/Tokyo"><option value="Europe/London"><option value="America/New_York"><option value="America/Los_Angeles"></datalist><div class="timezone-detect"><span id="detected-timezone">正在检测浏览器时区…</span><button type="button" class="ghost small" id="adopt-timezone">采用</button></div><small>证据日期、每日 Dream 和演化图统一使用此时区；system 表示服务器时区。</small><button type="submit">保存时间设置</button></form>
+        <form id="llm-form"><div class="panel-heading"><span>DREAM MODEL</span><h2>Dream 模型</h2></div><label>OpenAI 兼容地址<input name="base_url" required></label><label>模型名<input name="model" required></label><div class="form-pair"><label>超时（秒）<input name="timeout_seconds" type="number" min="1"></label><label>最大输出 Token<input name="max_output_tokens" type="number" min="64"></label></div><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="llm">测试连接</button></div><small id="llm-key"></small></form>
+        <form id="embedding-form"><div class="panel-heading"><span>OPTIONAL</span><h2>向量检索</h2></div><label class="check"><input name="enabled" type="checkbox">启用 embeddings</label><label>兼容地址<input name="base_url"></label><label>模型名<input name="model"></label><label>超时（秒）<input name="timeout_seconds" type="number" min="1" value="60"></label><label>API Key<input name="api_key" type="password" placeholder="留空表示不修改"></label><div class="row"><button type="submit">保存</button><button type="button" class="ghost" data-test="embedding">测试连接</button></div><small id="embedding-key"></small></form>
+        <form id="dream-form"><div class="panel-heading"><span>SCHEDULE</span><h2>Dream 调度</h2></div><label class="check"><input name="enabled" type="checkbox">启用每日 Dream</label><label>每天运行时间<input name="daily_at" type="time"></label><div class="form-pair"><label>Light 单批最大字符<input name="batch_chars" type="number" min="1000"></label><label>Light 最大批数<input name="max_light_batches" type="number" min="1"></label></div><div class="form-pair"><label>单次新增候选上限<input name="max_new_candidates" type="number" min="1" max="20"></label><label>每日自动晋升上限<input name="max_auto_promotions" type="number" min="0"></label></div><small>晋升阈值采用内置推荐值；Dream 不会绕过候选直接创建长期记忆。</small><button type="submit">保存</button></form>
+        <form id="recall-form"><div class="panel-heading"><span>RECALL</span><h2>召回注入</h2></div><label>返回条数<input name="limit" type="number" min="1" max="20"></label><label>最大注入字符<input name="max_context_chars" type="number" min="500"></label><small>系统按当前问题检索相关记忆，不会把全部长期记忆和候选一次性注入。</small><button type="submit">保存</button></form>
       </div>
     </section>
 
     <section id="maintenance" class="page">
       <div class="grid two">
-        <article><h2>维护操作</h2><div class="stack"><button id="create-backup">创建备份</button><button id="rebuild">重建全文索引与镜像</button><button id="rebuild-vector" class="ghost">重建全文与向量索引</button><button id="vacuum" class="ghost">清理过期数据并压缩数据库</button><a id="export" class="button ghost" href="#">导出 JSONL</a></div></article>
-        <form id="retention-form"><h2>保留策略</h2><label>原始会话（天）<input name="raw_turn_days" type="number" min="1"></label><label>模型调用日志（天）<input name="model_call_days" type="number" min="1"></label><label>候选无活动后过期（天）<input name="candidate_inactive_days" type="number" min="1"></label><label>过期候选保留（天）<input name="candidate_expired_days" type="number" min="1"></label><label>拒绝候选保留（天）<input name="rejected_candidate_days" type="number" min="1"></label><label>保留备份数<input name="backup_count" type="number" min="1"></label><button type="submit">保存</button></form>
+        <article><div class="panel-heading"><span>MAINTENANCE</span><h2>维护操作</h2></div><div class="stack"><button id="create-backup">创建备份</button><button id="rebuild">重建全文索引与镜像</button><button id="rebuild-vector" class="ghost">重建全文与向量索引</button><button id="vacuum" class="ghost">清理过期数据并压缩数据库</button><a id="export" class="button ghost" href="#">导出 JSONL</a></div></article>
+        <form id="retention-form"><div class="panel-heading"><span>RETENTION</span><h2>保留策略</h2></div><div class="form-pair"><label>原始会话（天）<input name="raw_turn_days" type="number" min="1"></label><label>模型调用日志（天）<input name="model_call_days" type="number" min="1"></label></div><label>候选无活动后过期（天）<input name="candidate_inactive_days" type="number" min="1"></label><div class="form-pair"><label>过期候选保留（天）<input name="candidate_expired_days" type="number" min="1"></label><label>拒绝候选保留（天）<input name="rejected_candidate_days" type="number" min="1"></label></div><label>保留备份数<input name="backup_count" type="number" min="1"></label><button type="submit">保存</button></form>
       </div>
-      <h2>数据库备份</h2><div id="backup-list" class="cards"></div>
+      <div class="section-heading"><span>BACKUPS</span><h2>数据库备份</h2></div><div id="backup-list" class="cards"></div>
     </section>
   </main>
-  <dialog id="editor"><form method="dialog"><h2 id="editor-title">记忆</h2><label>类型<select id="edit-kind"><option>fact</option><option>preference</option><option>decision</option><option>project</option><option>procedure</option><option>relationship</option><option>correction</option><option>episode</option></select></label><label>内容<textarea id="edit-content" rows="7"></textarea></label><div class="row end"><button value="cancel" class="ghost">取消</button><button value="save" id="editor-save">保存</button></div></form></dialog>
+
+  <dialog id="editor" class="modal"><form method="dialog"><button class="modal-close" value="cancel" aria-label="关闭">×</button><div class="panel-heading"><span>MEMORY</span><h2 id="editor-title">记忆</h2></div><label>类型<select id="edit-kind"><option>fact</option><option>preference</option><option>decision</option><option>project</option><option>procedure</option><option>relationship</option><option>correction</option><option>episode</option></select></label><label>内容<textarea id="edit-content" rows="7"></textarea></label><div class="row end"><button value="cancel" class="ghost">取消</button><button value="save" id="editor-save">保存</button></div></form></dialog>
+
+  <dialog id="confirm-dialog" class="modal compact-modal"><form method="dialog"><div class="danger-symbol">!</div><h2 id="confirm-title">确认操作</h2><p id="confirm-message" class="muted"></p><div class="row end"><button value="cancel" class="ghost">取消</button><button value="confirm" class="danger filled" id="confirm-submit">确认</button></div></form></dialog>
+
+  <dialog id="lineage-dialog" class="modal lineage-modal"><form method="dialog"><button class="modal-close" value="close" aria-label="关闭">×</button><div class="panel-heading"><span>MEMORY LINEAGE</span><h2 id="lineage-title">记忆演化</h2><p id="lineage-subtitle"></p></div><div id="lineage-content"></div></form></dialog>
+
+  <div id="dream-overlay" class="dream-overlay" aria-live="polite" aria-hidden="true"><div class="dream-box"><span class="eyebrow">DREAMING</span><h2>正在整理记忆</h2><div class="dream-stages"><span>Light</span><i></i><span>REM</span><i></i><span>Deep</span></div><p>提取候选、核对证据，再整理符合条件的长期记忆。</p></div></div>
   <script src="app.js"></script>
 </body>
 </html>

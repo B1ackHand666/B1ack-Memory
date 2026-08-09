@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .db import MemoryDatabase, content_hash, utc_now
+from .db import MemoryDatabase, content_hash, local_date, resolve_timezone, utc_now
 from .llm import LlmError, OpenAICompatibleClient
 from .retrieval import search_tokens
 from .security import is_sensitive
@@ -18,25 +18,25 @@ LIGHT_SYSTEM = """You extract durable personal-memory candidates from redacted c
 Only extract information that is truly suitable for long-term personal memory.
 Return one JSON object with key `candidates`, an array. Each item must have:
 content (concise standalone statement), kind (preference|fact|decision|project|procedure|relationship|correction),
-confidence (0..1), sensitive (boolean), source_turn_id.
+confidence (0..1), sensitive (boolean), source_turn_id, and optional match_candidate_id.
+When known_candidates contains the same durable meaning, set match_candidate_id to that candidate ID.
 Keep only stable preferences or facts, long-term goals/projects, important decisions, relationships,
 explicit corrections, and recurring procedures. Exclude greetings, transient progress, one-off tasks or
 episodes, quoted/source material, system or tool output, unconfirmed assistant claims, and secrets.
 Return at most 8 candidates. Keep each content under 240 characters. Do not repeat equivalent facts.
 Never invent information. Return compact JSON only, without markdown or commentary."""
 
-REM_SYSTEM = """You review personal-memory candidates for durable personal use. Return JSON with keys
-`summary`, `themes`, `durable_candidate_ids`, `noise`, `duplicates`, and `conflicts`.
-themes is an array of short strings. conflicts is an array of objects with candidate_id,
-optional memory_id, and explanation. Report candidate-to-candidate conflicts without memory_id.
-durable_candidate_ids contains candidate IDs that are genuinely durable. noise is an array of objects
-with candidate_id and explanation for transient, one-off, system-generated, quoted, or otherwise noisy items.
-duplicates is an array of objects with candidate_id, optional canonical_candidate_id, optional memory_id,
-optional rejected_candidate_id, and explanation. Use canonical_candidate_id for equivalent pending candidates,
-memory_id when active durable memory covers the same meaning, and rejected_candidate_id when the owner recently
-rejected the same meaning. Return at most 10 themes, 20 conflicts, 20 noise items and 20 duplicates.
-Keep summary and explanations concise.
-Do not create durable memories and do not add facts. Return compact JSON only."""
+REM_SYSTEM = """You review personal-memory candidates for durable personal use. Return compact JSON with
+`summary`, `themes`, and `reviews`. reviews must contain exactly one verdict for every supplied candidate.
+Each review has candidate_id, decision, explanation, and an optional target_id. decision is one of:
+durable, duplicate_candidate, duplicate_memory, rejected_equivalent, noise, conflict, deferred.
+Use duplicate_candidate with a pending candidate target_id for the same meaning even when wording differs.
+Use duplicate_memory when an active memory already covers the meaning; rejected_equivalent when a recently
+rejected candidate covers it; noise for transient, one-off, system-generated or quoted content; conflict for
+incompatible durable facts; durable only for genuinely durable information. Evidence dates are observational
+context: never invent another date. Respect any suggested_match_id only when the meanings actually match.
+Return at most 10 short themes. Do not create memories or add facts. JSON only.
+For compatibility you may additionally return durable_candidate_ids, noise, duplicates, and conflicts."""
 
 DEEP_SYSTEM = """You compact qualified personal-memory candidates into durable statements.
 Return JSON with key `memories`, an array of objects containing candidate_id and content.
@@ -95,7 +95,10 @@ class DreamEngine:
             if not self.client.configured:
                 raise LlmError("LLM is not configured")
 
-            settings = self.db.get_settings()["dream"]
+            all_settings = self.db.get_settings()
+            settings = all_settings["dream"]
+            timezone_name = str(all_settings["general"]["timezone"])
+            known_candidates = self.db.list_candidates(limit=20)
             batches = self._make_batches(
                 turns,
                 max_chars=int(settings["batch_chars"]),
@@ -113,7 +116,11 @@ class DreamEngine:
                             "assistant": row["assistant_content"],
                         }
                         for row in batch
-                    ]
+                    ],
+                    "known_candidates": [
+                        {"id": item.id, "content": item.content, "kind": item.kind}
+                        for item in known_candidates
+                    ],
                 }
                 result = self._call(
                     run_id,
@@ -163,10 +170,12 @@ class DreamEngine:
                             "sensitive": bool(item.get("sensitive", False))
                             or is_sensitive(content),
                             "sources": [turn_map[source_id]],
+                            "suggested_match_id": str(item.get("match_candidate_id", "")),
                         }
                 processed_ids.extend(turn_map)
 
             max_new = int(settings.get("max_new_candidates", 8))
+            suggested_matches: dict[str, str] = {}
             for item in sorted(
                 extracted.values(), key=lambda value: value["confidence"], reverse=True
             ):
@@ -181,7 +190,7 @@ class DreamEngine:
                     filtered_count += 1
                     continue
                 for source in item["sources"]:
-                    self.db.upsert_candidate(
+                    stored = self.db.upsert_candidate(
                         item["content"],
                         kind=item["kind"],
                         confidence=item["confidence"],
@@ -189,7 +198,12 @@ class DreamEngine:
                         raw_turn_id=source["id"],
                         excerpt=item["content"],
                         observed_at=source["observed_at"],
+                        timezone_name=timezone_name,
+                        dream_run_id=run_id,
                     )
+                    suggested_id = item.get("suggested_match_id", "")
+                    if suggested_id and suggested_id != stored.id:
+                        suggested_matches[stored.id] = suggested_id
                 if existing:
                     merged_count += 1
                 else:
@@ -205,9 +219,26 @@ class DreamEngine:
                 reviewed_ids = {item.id for item in reviewed}
                 existing_memories = self.db.list_memories(status="active", limit=100)
                 rejected_candidates = self.db.list_candidates(status="rejected", limit=100)
+                evidence_dates: dict[str, list[str]] = {}
+                with self.db.connect() as conn:
+                    for item in reviewed:
+                        dates = {
+                            local_date(row["observed_at"], timezone_name)
+                            for row in conn.execute(
+                                "SELECT observed_at FROM evidence WHERE candidate_id=?",
+                                (item.id,),
+                            )
+                        }
+                        evidence_dates[item.id] = sorted(dates)
                 rem_payload = {
                     "candidates": [
-                        {"id": item.id, "content": item.content, "kind": item.kind}
+                        {
+                            "id": item.id,
+                            "content": item.content,
+                            "kind": item.kind,
+                            "evidence_dates": evidence_dates[item.id],
+                            "suggested_match_id": suggested_matches.get(item.id),
+                        }
                         for item in reviewed
                     ],
                     "existing_memories": [
@@ -230,12 +261,72 @@ class DreamEngine:
                 )
                 if isinstance(rem.parsed, dict):
                     rem_summary = str(rem.parsed.get("summary", ""))
-                    duplicates = rem.parsed.get("duplicates", [])
+                    duplicates = list(rem.parsed.get("duplicates", [])) if isinstance(
+                        rem.parsed.get("duplicates", []), list
+                    ) else []
                     durable_ids = {
                         str(item) for item in rem.parsed.get("durable_candidate_ids", [])
                     } if isinstance(rem.parsed.get("durable_candidate_ids", []), list) else set()
                     existing_memory_ids = {item.id for item in existing_memories}
                     rejected_candidate_ids = {item.id for item in rejected_candidates}
+                    conflicts = list(rem.parsed.get("conflicts", [])) if isinstance(
+                        rem.parsed.get("conflicts", []), list
+                    ) else []
+                    noise_items = list(rem.parsed.get("noise", [])) if isinstance(
+                        rem.parsed.get("noise", []), list
+                    ) else []
+                    review_reasons: dict[str, str] = {}
+                    reviews = rem.parsed.get("reviews", [])
+                    if isinstance(reviews, list):
+                        for review in reviews:
+                            if not isinstance(review, dict):
+                                continue
+                            candidate_id = str(review.get("candidate_id", ""))
+                            if candidate_id not in reviewed_ids:
+                                continue
+                            decision = str(review.get("decision", "deferred"))
+                            target_id = str(review.get("target_id", ""))
+                            reason = str(review.get("explanation", "")).strip()
+                            if reason:
+                                review_reasons[candidate_id] = reason
+                            if decision == "durable":
+                                durable_ids.add(candidate_id)
+                            elif decision == "duplicate_candidate":
+                                duplicates.append(
+                                    {
+                                        "candidate_id": candidate_id,
+                                        "canonical_candidate_id": target_id,
+                                        "explanation": reason,
+                                    }
+                                )
+                            elif decision == "duplicate_memory":
+                                duplicates.append(
+                                    {
+                                        "candidate_id": candidate_id,
+                                        "memory_id": target_id,
+                                        "explanation": reason,
+                                    }
+                                )
+                            elif decision == "rejected_equivalent":
+                                duplicates.append(
+                                    {
+                                        "candidate_id": candidate_id,
+                                        "rejected_candidate_id": target_id,
+                                        "explanation": reason,
+                                    }
+                                )
+                            elif decision == "noise":
+                                noise_items.append(
+                                    {"candidate_id": candidate_id, "explanation": reason}
+                                )
+                            elif decision == "conflict":
+                                conflicts.append(
+                                    {
+                                        "candidate_id": candidate_id,
+                                        "memory_id": target_id if target_id in existing_memory_ids else None,
+                                        "explanation": reason or "REM 判定存在冲突",
+                                    }
+                                )
                     if isinstance(duplicates, list):
                         for duplicate in duplicates:
                             if not isinstance(duplicate, dict):
@@ -249,7 +340,9 @@ class DreamEngine:
                                 continue
                             if memory_id in existing_memory_ids:
                                 if self.db.expire_candidate(
-                                    duplicate_id, reason or "已有长期记忆覆盖相同含义"
+                                    duplicate_id,
+                                    reason or "已有长期记忆覆盖相同含义",
+                                    dream_run_id=run_id,
                                 ):
                                     expired_count += 1
                                     filtered_count += 1
@@ -257,7 +350,9 @@ class DreamEngine:
                                 continue
                             if rejected_id in rejected_candidate_ids:
                                 if self.db.expire_candidate(
-                                    duplicate_id, reason or "与近期人工拒绝的内容含义相同"
+                                    duplicate_id,
+                                    reason or "与近期人工拒绝的内容含义相同",
+                                    dream_run_id=run_id,
                                 ):
                                     expired_count += 1
                                     filtered_count += 1
@@ -265,7 +360,13 @@ class DreamEngine:
                                 continue
                             if canonical_id in reviewed_ids and canonical_id != duplicate_id:
                                 try:
-                                    self.db.merge_candidates(canonical_id, duplicate_id)
+                                    self.db.merge_candidates(
+                                        canonical_id,
+                                        duplicate_id,
+                                        timezone_name=timezone_name,
+                                        dream_run_id=run_id,
+                                        reason=reason or "REM 确认同义",
+                                    )
                                 except KeyError:
                                     continue
                                 merged_count += 1
@@ -273,13 +374,14 @@ class DreamEngine:
                                 if duplicate_id in durable_ids:
                                     durable_ids.add(canonical_id)
                                 durable_ids.discard(duplicate_id)
-                    conflicts = rem.parsed.get("conflicts", [])
                     if isinstance(conflicts, list):
-                        self.db.update_candidate_conflicts(
+                        conflict_ids = self.db.update_candidate_conflicts(
                             [item for item in conflicts if isinstance(item, dict)],
                             reviewed_ids=list(reviewed_ids),
+                            dream_run_id=run_id,
                         )
-                    noise_items = rem.parsed.get("noise", [])
+                        reviewed_ids.difference_update(conflict_ids)
+                        durable_ids.difference_update(conflict_ids)
                     noise: dict[str, str] = {}
                     if isinstance(noise_items, list):
                         for item in noise_items:
@@ -294,10 +396,13 @@ class DreamEngine:
                         reviewed_ids=list(reviewed_ids),
                         durable_ids=list(durable_ids),
                         noise=noise,
+                        reasons=review_reasons,
+                        dream_run_id=run_id,
                     )
                     pending = self.db.list_candidates(limit=100)
 
             eligible = []
+            promotion_lanes: dict[str, str] = {}
             for candidate in pending:
                 score, components = self.score(candidate)
                 self.db.update_candidate_score(candidate.id, score, components)
@@ -318,8 +423,15 @@ class DreamEngine:
                     and not candidate.conflict_reason
                 ):
                     eligible.append(candidate)
+                    promotion_lanes[candidate.id] = (
+                        "both"
+                        if repeat_evidence and demonstrated_utility
+                        else "different_dates"
+                        if repeat_evidence
+                        else "demonstrated_utility"
+                    )
             eligible.sort(key=lambda item: item.score, reverse=True)
-            local_now = datetime.now().astimezone()
+            local_now = datetime.now(resolve_timezone(timezone_name))
             local_midnight = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
             already_promoted = self.db.count_auto_promotions_since(
                 local_midnight.astimezone(UTC).isoformat()
@@ -349,7 +461,11 @@ class DreamEngine:
                     rewritten = rewrites.get(candidate.id)
                     if rewritten:
                         self.db.promote_candidate(
-                            candidate.id, edited_content=rewritten, origin="dream"
+                            candidate.id,
+                            edited_content=rewritten,
+                            origin="dream",
+                            promotion_lane=promotion_lanes[candidate.id],
+                            dream_run_id=run_id,
                         )
                         promoted_count += 1
             self._finish_run(

@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .db import MemoryDatabase, utc_now
+from .db import MemoryDatabase, local_date, resolve_timezone, utc_now
 from .dream import DreamEngine
 from .llm import LlmError, OpenAICompatibleClient
 from .models import MEMORY_KINDS, SearchHit
@@ -142,6 +142,7 @@ class MemoryService:
                     sensitive=True,
                     raw_turn_id=None,
                     excerpt=content,
+                    timezone_name=str(self.db.get_settings()["general"]["timezone"]),
                 )
                 self.rebuild_derived()
                 return {"status": "review_required", "candidate": candidate.to_dict()}
@@ -237,13 +238,15 @@ class MemoryService:
         return self.secrets.masked_status(name)
 
     def save_settings(self, section: str, value: dict[str, Any]) -> dict[str, Any]:
-        if section not in {"llm", "embedding", "dream", "retention", "recall"}:
+        if section not in {"general", "llm", "embedding", "dream", "retention", "recall"}:
             raise ValueError("Unsupported settings section")
         with self._maintenance_lock:
             current = self.db.get_settings()[section]
             current.update(value)
             self._validate_settings(section, current)
             self.db.save_setting(section, current)
+            if section == "general":
+                self.db.recompute_evidence_days(str(current["timezone"]))
             return current
 
     def run_dream(self, *, dry_run: bool = False) -> dict[str, Any]:
@@ -331,6 +334,9 @@ class MemoryService:
                 "rejected_candidates": conn.execute(
                     "SELECT COUNT(*) FROM candidates WHERE status='rejected'"
                 ).fetchone()[0],
+                "promoted_candidates": conn.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE status='promoted'"
+                ).fetchone()[0],
                 "pending_turns": conn.execute(
                     "SELECT COUNT(*) FROM raw_turns WHERE ingested_at IS NULL"
                 ).fetchone()[0],
@@ -354,6 +360,7 @@ class MemoryService:
                 **settings["embedding"],
             },
             "dream": settings["dream"],
+            "general": settings["general"],
             "last_dream": dict(last_dream) if last_dream else None,
             "secret_permissions_safe": self.secrets.permissions_safe(),
             "next_dream": self._next_dream_at().isoformat(),
@@ -367,13 +374,40 @@ class MemoryService:
         return [dict(row) for row in rows]
 
     def list_memories(self, *, status: str = "active", limit: int = 500) -> list[dict[str, Any]]:
-        return [item.to_dict() for item in self.db.list_memories(status=status, limit=limit)]
+        items = [item.to_dict() for item in self.db.list_memories(status=status, limit=limit)]
+        labels = {
+            "dream": "Dream 自动晋升",
+            "hermes-builtin": "Hermes 写入",
+            "manual": "人工保存",
+            "review": "人工晋升",
+        }
+        with self.db.connect() as conn:
+            for item in items:
+                linked = conn.execute(
+                    "SELECT c.id,c.content,c.promoted_at,c.promotion_origin FROM candidates c "
+                    "JOIN memory_events me ON me.candidate_id=c.id "
+                    "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
+                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    (item["id"],),
+                ).fetchone()
+                if not linked:
+                    linked = conn.execute(
+                        "SELECT c.id,c.content,c.promoted_at,c.promotion_origin FROM candidates c "
+                        "JOIN evidence e ON e.candidate_id=c.id WHERE e.memory_id=? "
+                        "ORDER BY c.promoted_at DESC LIMIT 1",
+                        (item["id"],),
+                    ).fetchone()
+                item["origin_label"] = labels.get(item["origin"], item["origin"])
+                item["lineage"] = dict(linked) if linked else None
+        return items
 
     def list_candidates(self, *, status: str = "pending", limit: int = 500) -> list[dict[str, Any]]:
         if status not in {"pending", "expired", "rejected", "promoted"}:
             raise ValueError("Unsupported candidate status")
         items = [item.to_dict() for item in self.db.list_candidates(status=status, limit=limit)]
-        retention = self.db.get_settings()["retention"]
+        settings = self.db.get_settings()
+        retention = settings["retention"]
+        timezone_name = str(settings["general"]["timezone"])
         with self.db.connect() as conn:
             for item in items:
                 rows = conn.execute(
@@ -382,6 +416,23 @@ class MemoryService:
                     (item["id"],),
                 ).fetchall()
                 item["evidence"] = [dict(row) for row in rows]
+                item["evidence_dates"] = sorted(
+                    {local_date(row["observed_at"], timezone_name) for row in rows}
+                )
+                linked_memory = conn.execute(
+                    "SELECT m.id,m.content,m.kind,m.origin,m.status FROM memories m "
+                    "JOIN memory_events me ON me.memory_id=m.id "
+                    "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
+                    "ORDER BY me.occurred_at DESC LIMIT 1",
+                    (item["id"],),
+                ).fetchone()
+                if not linked_memory:
+                    linked_memory = conn.execute(
+                        "SELECT m.id,m.content,m.kind,m.origin,m.status FROM memories m "
+                        "JOIN evidence e ON e.memory_id=m.id WHERE e.candidate_id=? LIMIT 1",
+                        (item["id"],),
+                    ).fetchone()
+                item["linked_memory"] = dict(linked_memory) if linked_memory else None
                 activity = datetime.fromisoformat(item["last_activity_at"])
                 expires_at = activity + timedelta(
                     days=int(retention["candidate_inactive_days"])
@@ -432,10 +483,225 @@ class MemoryService:
                 }
         return items
 
+    def memory_flow(self, range_key: str = "30d") -> dict[str, Any]:
+        allowed = {"7d": 7, "30d": 30, "90d": 90, "all": None}
+        if range_key not in allowed:
+            raise ValueError("range must be 7d, 30d, 90d or all")
+        timezone_name = str(self.db.get_settings()["general"]["timezone"])
+        timezone = resolve_timezone(timezone_name)
+        today = datetime.now(timezone).date()
+        days = allowed[range_key]
+        start_date = today - timedelta(days=days - 1) if days else None
+        series: dict[str, dict[str, Any]] = {}
+
+        def bucket(date_value: str) -> dict[str, Any]:
+            return series.setdefault(
+                date_value,
+                {
+                    "date": date_value,
+                    "candidates": 0,
+                    "merged": 0,
+                    "promoted": 0,
+                    "expired": 0,
+                    "rejected": 0,
+                    "edited": 0,
+                    "recalls": 0,
+                },
+            )
+
+        if days:
+            for offset in range(days):
+                bucket((start_date + timedelta(days=offset)).isoformat())
+
+        type_to_metric = {
+            "candidate_created": "candidates",
+            "candidate_merged": "merged",
+            "candidate_promoted": "promoted",
+            "candidate_expired": "expired",
+            "candidate_rejected": "rejected",
+            "memory_updated": "edited",
+        }
+        lanes = {"different_dates": 0, "demonstrated_utility": 0, "both": 0, "manual": 0, "unknown": 0}
+        recent: list[dict[str, Any]] = []
+        with self.db.connect() as conn:
+            event_rows = conn.execute(
+                "SELECT * FROM memory_events ORDER BY occurred_at DESC"
+            ).fetchall()
+            for row in event_rows:
+                date_value = local_date(row["occurred_at"], timezone_name)
+                if start_date and datetime.fromisoformat(date_value).date() < start_date:
+                    continue
+                data = json.loads(row["data_json"] or "{}")
+                metric = type_to_metric.get(row["event_type"])
+                if metric:
+                    bucket(date_value)[metric] += 1
+                if row["event_type"] == "candidate_promoted":
+                    lane = str(data.get("promotion_lane", "unknown"))
+                    lanes[lane if lane in lanes else "unknown"] += 1
+                if len(recent) < 40:
+                    recent.append(
+                        {
+                            "id": row["id"],
+                            "event_type": row["event_type"],
+                            "candidate_id": row["candidate_id"],
+                            "memory_id": row["memory_id"],
+                            "dream_run_id": row["dream_run_id"],
+                            "occurred_at": row["occurred_at"],
+                            "data": data,
+                            "backfilled": bool(row["backfilled"]),
+                        }
+                    )
+            for row in conn.execute(
+                "SELECT created_at FROM recall_events WHERE injected=1 ORDER BY created_at"
+            ):
+                date_value = local_date(row["created_at"], timezone_name)
+                if start_date and datetime.fromisoformat(date_value).date() < start_date:
+                    continue
+                bucket(date_value)["recalls"] += 1
+            status = {
+                row["status"]: int(row["count"])
+                for row in conn.execute(
+                    "SELECT status,COUNT(*) AS count FROM candidates GROUP BY status"
+                )
+            }
+            status["active_memories"] = int(
+                conn.execute("SELECT COUNT(*) FROM memories WHERE status='active'").fetchone()[0]
+            )
+        return {
+            "range": range_key,
+            "timezone": timezone_name,
+            "daily": [series[key] for key in sorted(series)],
+            "status": status,
+            "promotion_lanes": lanes,
+            "recent": recent,
+        }
+
+    def candidate_lineage(self, candidate_id: str) -> dict[str, Any]:
+        candidate = self.db.get_candidate(candidate_id)
+        if not candidate:
+            raise KeyError(candidate_id)
+        with self.db.connect() as conn:
+            memory_row = conn.execute(
+                "SELECT m.* FROM memories m JOIN memory_events me ON me.memory_id=m.id "
+                "WHERE me.candidate_id=? AND me.event_type='candidate_promoted' "
+                "ORDER BY me.occurred_at DESC LIMIT 1",
+                (candidate_id,),
+            ).fetchone()
+            if not memory_row:
+                memory_row = conn.execute(
+                    "SELECT m.* FROM memories m JOIN evidence e ON e.memory_id=m.id "
+                    "WHERE e.candidate_id=? LIMIT 1",
+                    (candidate_id,),
+                ).fetchone()
+        return self._lineage(candidate_id, memory_row["id"] if memory_row else None)
+
+    def memory_lineage(self, memory_id: str) -> dict[str, Any]:
+        memory = self.db.get_memory(memory_id)
+        if not memory:
+            raise KeyError(memory_id)
+        with self.db.connect() as conn:
+            candidate_row = conn.execute(
+                "SELECT c.id FROM candidates c JOIN memory_events me ON me.candidate_id=c.id "
+                "WHERE me.memory_id=? AND me.event_type='candidate_promoted' "
+                "ORDER BY me.occurred_at DESC LIMIT 1",
+                (memory_id,),
+            ).fetchone()
+            if not candidate_row:
+                candidate_row = conn.execute(
+                    "SELECT c.id FROM candidates c JOIN evidence e ON e.candidate_id=c.id "
+                    "WHERE e.memory_id=? ORDER BY c.promoted_at DESC LIMIT 1",
+                    (memory_id,),
+                ).fetchone()
+        return self._lineage(candidate_row["id"] if candidate_row else None, memory_id)
+
+    def _lineage(self, candidate_id: str | None, memory_id: str | None) -> dict[str, Any]:
+        timezone_name = str(self.db.get_settings()["general"]["timezone"])
+        candidate = self.db.get_candidate(candidate_id).to_dict() if candidate_id else None
+        memory = self.db.get_memory(memory_id).to_dict() if memory_id else None
+        clauses = []
+        args: list[Any] = []
+        if candidate_id:
+            clauses.append("me.candidate_id=?")
+            args.append(candidate_id)
+        if memory_id:
+            clauses.append("me.memory_id=?")
+            args.append(memory_id)
+        with self.db.connect() as conn:
+            events = []
+            if clauses:
+                rows = conn.execute(
+                    "SELECT me.*,dr.status AS dream_status,dr.started_at AS dream_started_at "
+                    "FROM memory_events me LEFT JOIN dream_runs dr ON dr.id=me.dream_run_id "
+                    f"WHERE {' OR '.join(clauses)} ORDER BY me.occurred_at,me.id",
+                    args,
+                ).fetchall()
+                for row in rows:
+                    item = dict(row)
+                    item["data"] = json.loads(item.pop("data_json") or "{}")
+                    item["backfilled"] = bool(item["backfilled"])
+                    item["local_date"] = local_date(item["occurred_at"], timezone_name)
+                    events.append(item)
+            evidence = []
+            if candidate_id:
+                for row in conn.execute(
+                    "SELECT id,excerpt,role,observed_at,raw_turn_id,memory_id FROM evidence "
+                    "WHERE candidate_id=? ORDER BY observed_at",
+                    (candidate_id,),
+                ):
+                    item = dict(row)
+                    item["local_date"] = local_date(item["observed_at"], timezone_name)
+                    evidence.append(item)
+            revisions = []
+            if memory_id:
+                revisions = [
+                    dict(row)
+                    for row in conn.execute(
+                        "SELECT content,kind,changed_at FROM memory_revisions "
+                        "WHERE memory_id=? ORDER BY changed_at",
+                        (memory_id,),
+                    )
+                ]
+            recall_summary = {"candidate": 0, "memory": 0, "injected": 0}
+            if candidate_id:
+                recall_summary["candidate"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM recall_events WHERE record_id=? AND source='candidate'",
+                        (candidate_id,),
+                    ).fetchone()[0]
+                )
+            if memory_id:
+                recall_summary["memory"] = int(
+                    conn.execute(
+                        "SELECT COUNT(*) FROM recall_events WHERE record_id=? AND source='memory'",
+                        (memory_id,),
+                    ).fetchone()[0]
+                )
+            ids = [value for value in (candidate_id, memory_id) if value]
+            if ids:
+                placeholders = ",".join("?" for _ in ids)
+                recall_summary["injected"] = int(
+                    conn.execute(
+                        f"SELECT COUNT(*) FROM recall_events WHERE record_id IN ({placeholders}) AND injected=1",
+                        ids,
+                    ).fetchone()[0]
+                )
+        return {
+            "timezone": timezone_name,
+            "candidate": candidate,
+            "memory": memory,
+            "events": events,
+            "evidence": evidence,
+            "revisions": revisions,
+            "recall_summary": recall_summary,
+        }
+
     def promote_candidate(self, candidate_id: str, content: str | None = None) -> dict[str, Any]:
         with self._maintenance_lock:
             memory = self.db.promote_candidate(
-                candidate_id, edited_content=content, origin="review"
+                candidate_id,
+                edited_content=content,
+                origin="review",
+                promotion_lane="manual",
             )
             self.rebuild_derived()
             return memory.to_dict()
@@ -458,7 +724,10 @@ class MemoryService:
                 raise KeyError(candidate_id)
             if candidate.status == "promoted":
                 raise ValueError("Promoted candidates must be managed through their long-term memory")
-            removed = self.db.purge_candidate(candidate_id, privacy=True)
+            timezone_name = str(self.db.get_settings()["general"]["timezone"])
+            removed = self.db.purge_candidate(
+                candidate_id, privacy=True, timezone_name=timezone_name
+            )
             self.rebuild_derived()
             maintenance = self.db.maintain(vacuum=True)
             backup = self._replace_backups_after_privacy_purge()
@@ -477,8 +746,11 @@ class MemoryService:
             removed = {"candidates": 0, "raw_turns": 0, "dream_runs": 0}
             if not candidates:
                 return {"status": status, "removed": removed, "clean_backup": None}
+            timezone_name = str(self.db.get_settings()["general"]["timezone"])
             for candidate in candidates:
-                result = self.db.purge_candidate(candidate.id, privacy=True)
+                result = self.db.purge_candidate(
+                    candidate.id, privacy=True, timezone_name=timezone_name
+                )
                 for key in removed:
                     removed[key] += int(result.get(key, 0))
             self.rebuild_derived()
@@ -616,6 +888,7 @@ class MemoryService:
                     int(retention["candidate_inactive_days"]),
                     int(retention["candidate_expired_days"]),
                     int(retention["rejected_candidate_days"]),
+                    timezone_name=str(self.db.get_settings()["general"]["timezone"]),
                 )
             result["derived"] = self.rebuild_derived()
             return result
@@ -637,7 +910,8 @@ class MemoryService:
         last_backup_day = ""
         while not self._stop.wait(30):
             try:
-                now = datetime.now().astimezone()
+                timezone_name = str(self.db.get_settings()["general"]["timezone"])
+                now = datetime.now(resolve_timezone(timezone_name))
                 if now.date().isoformat() != last_backup_day and now.hour >= 4:
                     if self.db.acquire_lease("daily-backup", owner, 300):
                         try:
@@ -655,6 +929,7 @@ class MemoryService:
                                     int(retention["candidate_inactive_days"]),
                                     int(retention["candidate_expired_days"]),
                                     int(retention["rejected_candidate_days"]),
+                                    timezone_name=timezone_name,
                                 )
                                 with self.db.transaction(immediate=True) as conn:
                                     conn.execute(
@@ -689,7 +964,8 @@ class MemoryService:
         return row["status"] == "failed" and now - last >= timedelta(hours=1)
 
     def _next_dream_at(self) -> datetime:
-        now = datetime.now().astimezone()
+        timezone_name = str(self.db.get_settings()["general"]["timezone"])
+        now = datetime.now(resolve_timezone(timezone_name))
         hour, minute = (int(part) for part in self.db.get_settings()["dream"]["daily_at"].split(":"))
         target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return target if target > now else target + timedelta(days=1)
@@ -734,6 +1010,10 @@ class MemoryService:
 
     @staticmethod
     def _validate_settings(section: str, value: dict[str, Any]) -> None:
+        if section == "general":
+            timezone_name = str(value.get("timezone", "system")).strip()
+            resolve_timezone(timezone_name)
+            value["timezone"] = timezone_name
         if section == "llm":
             if not str(value.get("base_url", "")).startswith(("http://", "https://")):
                 raise ValueError("base_url must start with http:// or https://")

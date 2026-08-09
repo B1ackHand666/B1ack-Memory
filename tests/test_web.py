@@ -26,6 +26,9 @@ class WebTests(unittest.TestCase):
         bundle = self.client.get("/api/ui-bundle")
         self.assertEqual(bundle.status_code, 200)
         self.assertIn("B1ack Memory", bundle.json()["html"])
+        self.assertIn("记忆演化", bundle.json()["html"])
+        self.assertIn("candidate-promoted-count", bundle.json()["html"])
+        self.assertIn("prefers-reduced-motion", bundle.json()["css"])
         self.assertIn("dashboardBridge.request", bundle.json()["js"])
         self.assertEqual(self.client.post("/api/memories", json={"content": "测试"}).status_code, 403)
         token = self.client.get("/api/bootstrap").json()["token"]
@@ -116,6 +119,56 @@ class WebTests(unittest.TestCase):
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["candidate_inactive_days"], 21)
+
+    def test_timezone_settings_validate_and_recompute(self) -> None:
+        token = self.client.get("/api/bootstrap").json()["token"]
+        headers = {"X-B1ack-Memory-Token": token}
+        response = self.client.post(
+            "/api/settings/general", json={"timezone": "Asia/Shanghai"}, headers=headers
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["timezone"], "Asia/Shanghai")
+        self.assertEqual(
+            self.client.get("/api/status").json()["general"]["timezone"], "Asia/Shanghai"
+        )
+        invalid = self.client.post(
+            "/api/settings/general", json={"timezone": "Not/AZone"}, headers=headers
+        )
+        self.assertEqual(invalid.status_code, 400)
+        self.assertIn("IANA timezone", invalid.json()["detail"])
+
+    def test_analytics_lineage_and_promoted_candidate_api(self) -> None:
+        token = self.client.get("/api/bootstrap").json()["token"]
+        headers = {"X-B1ack-Memory-Token": token}
+        candidate = self.service.db.upsert_candidate(
+            "演化接口候选",
+            kind="project",
+            confidence=0.91,
+            sensitive=False,
+            raw_turn_id=None,
+            excerpt="演化接口候选",
+        )
+        candidate_lineage = self.client.get(f"/api/lineage/candidate/{candidate.id}")
+        self.assertEqual(candidate_lineage.status_code, 200)
+        self.assertEqual(candidate_lineage.json()["candidate"]["id"], candidate.id)
+        promoted = self.client.post(f"/api/candidates/{candidate.id}/promote", headers=headers)
+        self.assertEqual(promoted.status_code, 200)
+        memory_id = promoted.json()["id"]
+        promoted_rows = self.client.get("/api/candidates?status=promoted").json()
+        self.assertEqual(promoted_rows[0]["id"], candidate.id)
+        self.assertEqual(promoted_rows[0]["linked_memory"]["id"], memory_id)
+        memory_lineage = self.client.get(f"/api/lineage/memory/{memory_id}").json()
+        event_types = {item["event_type"] for item in memory_lineage["events"]}
+        self.assertIn("candidate_promoted", event_types)
+        promotion = next(
+            item for item in memory_lineage["events"] if item["event_type"] == "candidate_promoted"
+        )
+        self.assertEqual(promotion["data"]["promotion_lane"], "manual")
+
+        analytics = self.client.get("/api/analytics/memory-flow?range=30d")
+        self.assertEqual(analytics.status_code, 200)
+        self.assertEqual(analytics.json()["promotion_lanes"]["manual"], 1)
+        self.assertEqual(self.client.get("/api/analytics/memory-flow?range=bad").status_code, 400)
 
 
 if __name__ == "__main__":
