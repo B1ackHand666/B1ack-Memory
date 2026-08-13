@@ -4,6 +4,12 @@
 
 ## [未发布]
 
+## [0.5.2] - 2026-08-13
+
+### 修复
+
+- Dashboard 部署在反向代理路径前缀下时，iframe 现在保留当前路由前缀再请求插件 `/ui/`；不再错误请求域名根目录的 API 并显示 Not Found。
+
 ## [0.5.1] - 2026-08-13
 
 ### 修复
@@ -239,7 +245,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.1...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.2
 [0.5.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.1
 [0.5.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.4.0
