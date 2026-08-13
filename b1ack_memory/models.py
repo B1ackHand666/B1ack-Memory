@@ -116,6 +116,7 @@ class ReviewItem:
     resolution: str | None = None
     subject_id: str | None = None
     queue: str = "decision"
+    proposal: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -147,6 +148,8 @@ class SearchHit:
     vector_rank: int | None = None
     unverified: bool = False
     project_id: str | None = None
+    project_ids: list[str] = field(default_factory=list)
+    scope_state: str = "global"
     temporal_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

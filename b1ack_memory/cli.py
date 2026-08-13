@@ -55,6 +55,7 @@ def run(args: argparse.Namespace) -> int:
         from .web import create_app
 
         url = f"http://{args.host}:{args.port}/api/ui/"
+        print(f"B1ack Memory API Bearer token: {service.mutation_token}")
         if not args.no_open:
             webbrowser.open(url)
         uvicorn.run(create_app(service), host=args.host, port=args.port, log_level="info")

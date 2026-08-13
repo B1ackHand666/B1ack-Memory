@@ -2,7 +2,6 @@ const base = location.pathname.replace(/\/ui\/?$/, "");
 const bridge = window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
-let token = "";
 let settings = {};
 let statusData = {};
 let libraryTab = "memories";
@@ -19,13 +18,12 @@ const workspaceMeta = {
   system: ["系统", "Dream、召回、模型、存储和高级设置"],
 };
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
-const when = (value) => { if (!value) return "—"; const d = new Date(String(value).replace(" ", "T")); return Number.isNaN(d.valueOf()) ? esc(value) : d.toLocaleString("zh-CN", {hour12:false}); };
+const when = (value) => { if (!value) return "—"; const d = typeof value === "number" ? new Date(value) : new Date(String(value).replace(" ", "T")); return Number.isNaN(d.valueOf()) ? esc(value) : d.toLocaleString("zh-CN", {hour12:false}); };
 const badge = (text, tone="") => `<span class="badge ${tone}">${esc(text)}</span>`;
 const empty = (text) => `<div class="empty">${esc(text)}</div>`;
 
 async function api(path, options={}) {
   const headers = {"Content-Type":"application/json", ...(options.headers || {})};
-  if (options.method && options.method !== "GET") headers["X-B1ack-Memory-Token"] = token;
   if (bridge) return bridge.request(path, {...options, headers});
   const response = await fetch(base + path, {...options, headers});
   if (!response.ok) {
@@ -57,8 +55,8 @@ function fail(error) { console.error(error); notice(error.message || String(erro
 
 async function loadAll() {
   try {
-    const bootstrap = await api("/bootstrap"); token = bootstrap.token; statusData = bootstrap.status;
-    await Promise.all([loadOverview(), loadSettings(), loadLibrary(), loadProjects(), loadReviews(), loadDreams(), loadTraces(), loadCalls(), loadStorage(), loadBackups()]);
+    const bootstrap = await api("/bootstrap"); statusData = bootstrap.status;
+    await Promise.all([loadOverview(), loadSettings(), loadLibrary(), loadProjects(), loadReviews(), loadDreams(), loadTraces(), loadCalls(), loadStorage(), loadIngestionIssues(), loadBackups()]);
   } catch (error) { fail(error); }
 }
 
@@ -110,10 +108,11 @@ async function loadReviews() {
 async function loadDreams(){const rows=await api('/dream-runs?limit=80');$("#dream-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${when(r.started_at)} · ${esc(r.status)}</div><div class="list-meta">输入 ${r.input_count||0} · admit ${r.admitted_count||0} · observe ${r.observed_count||0} · discard ${r.discarded_count||0} · 工作项 ${r.work_item_count||0} · 归属 ${r.assignment_count||0} · 摘要 ${r.summary_count||0} · 投影 ${r.projection_count||0}</div>${r.error?`<div class="list-meta">${esc(r.error)}</div>`:''}</div>${badge(r.blocked_count?`${r.blocked_count} 阻塞`:'完成',r.blocked_count?'danger':'good')}</div>`).join('')||empty('暂无 Dream 日志');}
 async function loadTraces(){const rows=await api('/recall-traces?limit=200');$("#trace-list").innerHTML=`<table><thead><tr><th>时间</th><th>查询</th><th>来源</th><th>项目</th><th>注入</th><th>分数</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${when(r.created_at)}</td><td>${esc(r.query_text)}</td><td>${esc(r.source)}</td><td>${r.project_id?`${esc(r.project_reason||'')} · ${Math.round((r.project_confidence||0)*100)}%`:'未识别'}</td><td>${r.injected?'是':'否'}</td><td>${Number(r.final_score||0).toFixed(3)}</td></tr>`).join('')}</tbody></table>`;}
 async function loadCalls(){const rows=await api('/model-calls?limit=40');$("#call-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.phase)} · ${esc(r.model)}</div><div class="list-meta">${when(r.created_at)} · input ${r.input_tokens||0} · output ${r.output_tokens||0}</div></div>${r.error?badge('失败','danger'):badge('成功','good')}</div>`).join('')||empty('暂无模型调用');}
-async function loadStorage(){const s=await api('/maintenance/storage');$("#storage-health").innerHTML=[["SQLite integrity",s.database_integrity],["待处理投影",s.projection_pending],["已校验 vault 文件",s.vault_files_checked],["状态",s.ok?'正常':(s.errors||[]).join('；')]].map(([a,b])=>`<div class="health-row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join('');}
+async function loadStorage(){const s=await api('/maintenance/storage');const permissions=(s.permissions||[]).map(p=>[p.path.split(/[\\/]/).pop()||p.path,p.managed_by==='windows_acl'?'Windows ACL':(p.safe?`安全 ${p.mode}`:`需修复 ${p.mode}`)]);$("#storage-health").innerHTML=[["SQLite integrity",s.database_integrity],["待处理投影",s.projection_pending],["已校验 vault 文件",s.vault_files_checked],["状态",s.ok?'正常':(s.errors||[]).join('；')],...permissions].map(([a,b])=>`<div class="health-row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join('');}
+async function loadIngestionIssues(){const rows=await api('/maintenance/ingestion-issues');$("#ingestion-issues").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.session_id||'未知会话')} · ${esc(r.ingest_status)}</div><div class="list-meta">${when(r.observed_at)} · 尝试 ${r.ingest_attempts} 次 · 游标 ${r.ingest_cursor}/${r.content_length}<br>${esc(r.last_ingest_error||'')}</div></div><button class="quiet small" data-retry-ingestion="${r.id}">重新处理</button></div>`).join('')||empty('没有隔离或待重试条目');}
 async function loadBackups(){const rows=await api('/backups');$("#backup-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.name)}</div><div class="list-meta">${(r.bytes/1024/1024).toFixed(2)} MB · ${when(r.modified*1000)}</div></div><button class="quiet small" data-preview-backup="${esc(r.name)}">恢复预演</button></div>`).join('')||empty('还没有备份');}
 
-async function loadSettings(){settings=await api('/settings');for(const section of ['general','llm','embedding','dream','recall','retention']){const form=$(`#${section}-form`);if(!form)continue;for(const [key,value] of Object.entries(settings[section]||{})){const input=form.elements[key];if(!input)continue;if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value??'';}}$("#llm-key").textContent=`Key：${settings.secrets.llm_api_key.masked||'未配置'}`;$("#embedding-key").textContent=`Key：${settings.secrets.embedding_api_key.masked||'未配置'}`;$("#detected-timezone").textContent=`浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone||'system'}`;}
+async function loadSettings(){settings=await api('/settings');for(const section of ['general','llm','embedding','dream','recall','retention']){const form=$(`#${section}-form`);if(!form)continue;for(const [key,value] of Object.entries(settings[section]||{})){const input=form.elements[key];if(!input)continue;if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value??'';}}$("#llm-key").textContent=`Key：${settings.secrets.llm_api_key.configured?'已配置':'未配置'}`;$("#embedding-key").textContent=`Key：${settings.secrets.embedding_api_key.configured?'已配置':'未配置'}`;$("#detected-timezone").textContent=`浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone||'system'}`;}
 
 function openDrawer(html){$("#drawer-content").innerHTML=html;$("#drawer").classList.add('open');$("#drawer").setAttribute('aria-hidden','false');$("#drawer-scrim").hidden=false;}
 function closeDrawer(){$("#drawer").classList.remove('open');$("#drawer").setAttribute('aria-hidden','true');$("#drawer-scrim").hidden=true;}
@@ -161,6 +160,7 @@ document.addEventListener('click',async event=>{const b=event.target.closest('bu
   if(b.id==='run-dream'||b.id==='dry-dream'){$("#dream-overlay").hidden=false;try{await mutate('/dream/run',{dry_run:b.id==='dry-dream'});}finally{$("#dream-overlay").hidden=true;}return;}
   if(b.dataset.test){const r=await mutate('/model/test',{kind:b.dataset.test},'POST',false);notice(r.ok?'连接成功':'连接失败');return;}
   if(b.id==='validate-storage'){const r=await mutate('/maintenance/validate',{},'POST',false);notice(r.ok?'存储校验通过':r.errors.join('；'),!r.ok);await loadStorage();return;}
+  if(b.dataset.retryIngestion){await mutate(`/maintenance/ingestion-issues/${b.dataset.retryIngestion}/retry`);await loadIngestionIssues();return;}
   if(b.id==='rebuild-projections'){await mutate('/maintenance/rebuild-projections');return;}
   if(b.id==='rebuild-index'){await mutate('/rebuild',{embeddings:false});return;}
   if(b.id==='create-backup'){await mutate('/backup');return;}

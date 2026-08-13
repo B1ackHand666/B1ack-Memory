@@ -162,10 +162,12 @@ class OpenAICompatibleClient:
                     follow_redirects=True,
                 )
             except httpx.HTTPError as error:
-                raise LlmError(str(error)) from error
+                raise LlmError(f"LLM transport error: {type(error).__name__}") from error
             raw = response.text
             if response.status_code >= 400:
-                raise LlmError(f"HTTP {response.status_code}: {raw[:500]}")
+                request_id = response.headers.get("x-request-id") or response.headers.get("request-id")
+                suffix = f" request_id={request_id[:128]}" if request_id else ""
+                raise LlmError(f"LLM HTTP {response.status_code}: HTTPStatusError{suffix}")
             try:
                 return json.loads(raw)
             except json.JSONDecodeError as error:
@@ -182,10 +184,11 @@ class OpenAICompatibleClient:
                 raw = response.read().decode("utf-8")
                 return json.loads(raw)
         except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")[:500]
-            raise LlmError(f"HTTP {error.code}: {detail}") from error
+            request_id = error.headers.get("x-request-id") or error.headers.get("request-id")
+            suffix = f" request_id={request_id[:128]}" if request_id else ""
+            raise LlmError(f"LLM HTTP {error.code}: HTTPError{suffix}") from error
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
-            raise LlmError(str(error)) from error
+            raise LlmError(f"LLM transport error: {type(error).__name__}") from error
 
     def _is_local(self) -> bool:
         return self.base_url.startswith(("http://127.0.0.1", "http://localhost", "http://[::1]"))

@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import Callable
 from typing import Any
 
-from .db import MemoryDatabase, utc_now
+from .db import MemoryDatabase, eligible_memory_predicate, utc_now
 from .models import SearchHit
 
 _CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]+")
@@ -55,35 +55,33 @@ class RetrievalEngine:
         workspace_count = 0
         with self.db.transaction(immediate=True) as conn:
             conn.execute("DELETE FROM search_fts")
+            predicate, predicate_args = eligible_memory_predicate("m")
             memories = conn.execute(
-                "SELECT id,content FROM memories WHERE status='active' "
-                "AND temporal_status='current' "
-                "AND (valid_until IS NULL OR valid_until > ?) "
-                "AND (valid_from IS NULL OR valid_from <= ?) "
-                "AND (valid_to IS NULL OR valid_to > ?)",
-                (utc_now(), utc_now(), utc_now()),
+                f"SELECT m.id,m.content FROM memories m WHERE {predicate}",
+                predicate_args,
             ).fetchall()
             for row in memories:
                 conn.execute(
-                    "INSERT INTO search_fts(record_id,source,content,search_text) VALUES(?,?,?,?)",
-                    (row["id"], "memory", row["content"], normalized_search_text(row["content"])),
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "memory", "recall", row["content"], normalized_search_text(row["content"])),
                 )
             memory_count = len(memories)
             candidates = conn.execute(
-                "SELECT id,content FROM candidates WHERE status='pending'"
+                "SELECT id,content,admission_state FROM candidates WHERE status='pending'"
             ).fetchall()
             for row in candidates:
                 conn.execute(
-                    "INSERT INTO search_fts(record_id,source,content,search_text) VALUES(?,?,?,?)",
-                    (row["id"], "candidate", row["content"], normalized_search_text(row["content"])),
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "candidate", "explicit_search" if row["admission_state"] == "admitted" else "integration_only",
+                     row["content"], normalized_search_text(row["content"])),
                 )
             candidate_count = len(candidates)
             for row in conn.execute(
                 "SELECT id,content FROM work_items WHERE status IN ('suggested','active')"
             ):
                 conn.execute(
-                    "INSERT INTO search_fts(record_id,source,content,search_text) VALUES(?,?,?,?)",
-                    (row["id"], "work_item", row["content"], normalized_search_text(row["content"])),
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "work_item", "explicit_search", row["content"], normalized_search_text(row["content"])),
                 )
                 workspace_count += 1
             for row in conn.execute("SELECT id,name,description FROM subjects WHERE status<>'archived'"):
@@ -94,14 +92,14 @@ class RetrievalEngine:
                 )
                 content = " ".join(part for part in (row["name"], row["description"], aliases) if part)
                 conn.execute(
-                    "INSERT INTO search_fts(record_id,source,content,search_text) VALUES(?,?,?,?)",
-                    (row["id"], "subject", content, normalized_search_text(content)),
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "subject", "explicit_search", content, normalized_search_text(content)),
                 )
                 workspace_count += 1
             for row in conn.execute("SELECT id,content FROM summary_versions WHERE status='current'"):
                 conn.execute(
-                    "INSERT INTO search_fts(record_id,source,content,search_text) VALUES(?,?,?,?)",
-                    (row["id"], "summary", row["content"], normalized_search_text(row["content"])),
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "summary", "explicit_search", row["content"], normalized_search_text(row["content"])),
                 )
                 workspace_count += 1
         return {"memories": memory_count, "candidates": candidate_count, "workspace": workspace_count}
@@ -131,10 +129,13 @@ class RetrievalEngine:
         keyword_rows: list[sqlite3.Row]
         with self.db.connect() as conn:
             try:
+                pool = "recall" if injected else "integration_only"
+                pool_operator = "=" if injected else "<>"
                 keyword_rows = conn.execute(
                     "SELECT record_id,source,content,bm25(search_fts) AS score "
-                    "FROM search_fts WHERE search_fts MATCH ? ORDER BY score LIMIT ?",
-                    (match, max(limit * 4, 20)),
+                    f"FROM search_fts WHERE search_fts MATCH ? AND pool{pool_operator}? "
+                    "ORDER BY score LIMIT ?",
+                    (match, pool, max(limit * 4, 20)),
                 ).fetchall()
             except sqlite3.OperationalError:
                 keyword_rows = []
@@ -142,10 +143,14 @@ class RetrievalEngine:
             vector_rows: list[tuple[str, str, str, float]] = []
             if query_vector:
                 for row in conn.execute(
-                    "SELECT e.record_id,e.source,e.vector_json,f.content "
+                    "SELECT e.record_id,e.source,e.vector_json,f.content,f.pool "
                     "FROM embeddings e JOIN search_fts f "
                     "ON f.record_id=e.record_id AND f.source=e.source"
                 ):
+                    if (injected and row["pool"] != "recall") or (
+                        not injected and row["pool"] == "integration_only"
+                    ):
+                        continue
                     vector = json.loads(row["vector_json"])
                     score = cosine_similarity(query_vector, vector)
                     if score >= 0:
@@ -177,9 +182,13 @@ class RetrievalEngine:
 
         hits: list[SearchHit] = []
         for (record_id, source), score in ranked:
-            hit_project_id = self._project_for(record_id, source)
-            if injected and source == "memory" and hit_project_id and hit_project_id != project_id:
-                continue
+            project_ids, scope_state = self._project_scope(record_id, source)
+            hit_project_id = project_ids[0] if project_ids else None
+            if injected and source == "memory":
+                if scope_state == "pending":
+                    continue
+                if scope_state == "scoped" and (not project_id or project_id not in project_ids):
+                    continue
             if (
                 project_id
                 and source in {"work_item", "summary", "subject"}
@@ -198,6 +207,8 @@ class RetrievalEngine:
                     vector_rank=vector_rank.get((record_id, source)),
                     unverified=source in {"candidate", "work_item"},
                     project_id=hit_project_id,
+                    project_ids=project_ids,
+                    scope_state=scope_state,
                     temporal_status=self._temporal_status_for(record_id, source),
                 )
             )
@@ -346,31 +357,42 @@ class RetrievalEngine:
             row = conn.execute(f"SELECT {column} AS kind FROM {table} WHERE id=?", (record_id,)).fetchone()
         return row["kind"] if row else "fact"
 
-    def _project_for(self, record_id: str, source: str) -> str | None:
+    def _project_scope(self, record_id: str, source: str) -> tuple[list[str], str]:
         with self.db.connect() as conn:
-            if source == "work_item":
-                row = conn.execute(
-                    "SELECT wi.subject_id FROM work_items wi JOIN subjects s ON s.id=wi.subject_id "
-                    "WHERE wi.id=? AND s.subject_type='project'", (record_id,)
-                ).fetchone()
-                return str(row["subject_id"]) if row and row["subject_id"] else None
             if source == "summary":
                 row = conn.execute(
                     "SELECT sv.subject_id FROM summary_versions sv JOIN subjects s ON s.id=sv.subject_id "
                     "WHERE sv.id=? AND s.subject_type='project'", (record_id,)
                 ).fetchone()
-                return str(row["subject_id"]) if row and row["subject_id"] else None
+                ids = [str(row["subject_id"])] if row and row["subject_id"] else []
+                return ids, "scoped" if ids else "global"
             if source == "subject":
                 row = conn.execute("SELECT subject_type FROM subjects WHERE id=?", (record_id,)).fetchone()
-                return record_id if row and row["subject_type"] == "project" else None
-            row = conn.execute(
-                "SELECT sl.subject_id FROM subject_links sl JOIN subjects s ON s.id=sl.subject_id "
+                ids = [record_id] if row and row["subject_type"] == "project" else []
+                return ids, "scoped" if ids else "global"
+            rows = conn.execute(
+                "SELECT sl.subject_id,sl.assignment_status FROM subject_links sl "
+                "JOIN subjects s ON s.id=sl.subject_id "
                 "WHERE sl.object_type=? AND sl.object_id=? AND s.subject_type='project' "
-                "AND sl.assignment_status IN ('confirmed','automatic') "
-                "ORDER BY sl.confidence DESC LIMIT 1",
+                "ORDER BY sl.confidence DESC,sl.subject_id",
                 (source, record_id),
-            ).fetchone()
-            return str(row["subject_id"]) if row else None
+            ).fetchall()
+            confirmed = [
+                str(row["subject_id"]) for row in rows
+                if row["assignment_status"] in {"confirmed", "automatic"}
+            ]
+            if confirmed:
+                return list(dict.fromkeys(confirmed)), "scoped"
+            if rows:
+                return [], "pending"
+            if source == "work_item":
+                row = conn.execute(
+                    "SELECT wi.subject_id FROM work_items wi JOIN subjects s ON s.id=wi.subject_id "
+                    "WHERE wi.id=? AND s.subject_type='project'", (record_id,)
+                ).fetchone()
+                if row and row["subject_id"]:
+                    return [], "pending"
+            return [], "global"
 
     def _temporal_status_for(self, record_id: str, source: str) -> str | None:
         if source != "memory":

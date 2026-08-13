@@ -31,9 +31,9 @@
 
 ### 从 v0.4.0 升级
 
-v6 数据库会先创建 `backups/*-pre-schema-v7.db`，完整性校验后再向前迁移至 schema v7。已有长期记忆保持全局 `current`，不会自动归属或改写；最近 30 天且仍有证据的旧 `observe` 日志只转换为 `suggested` 工作项。首次启动会生成 `vault/profile.md`、项目/主题页与索引 manifest，这些文件都能从 `memory.db` 一键重建。
+v6 数据库会先创建 `backups/*-pre-schema-v7.db`，完整性校验后再向前迁移至 schema v7。已有长期记忆保持全局 `current`，不会自动归属或改写；全部旧 `observe` 日志都会保留，生命周期内的转换为 `suggested`，已过期的转换为 `expired` 历史。开发期已生成的临时 schema v7 数据库会按列检测原地补齐，不需要降级或重建。旧版无法唯一关联长期记忆的 promoted candidate 会转为 `legacy_review` 并保留证据、模型调用和召回数据，不再删除。首次启动会生成 `vault/profile.md`、项目/主题页与索引 manifest，这些文件都能从 `memory.db` 一键重建。
 
-备份现在是带 manifest 和 SHA-256 校验的 ZIP 整包，默认不包含 API Key。恢复必须先通过归档、SQLite 和 schema 校验并展示差异，执行前还会自动备份当前状态。
+备份现在是带 manifest 和 SHA-256 校验的 ZIP 整包，默认不包含 API Key。恢复必须先通过归档、SQLite 和 schema 校验并展示差异，执行前还会自动备份当前状态；执行时先在同目录 `.restore.tmp` 完成迁移和 fsync，再原子替换事实库。高于当前实现的 schema 会被拒绝，仍有迁移路径的旧 schema 可直接恢复。
 
 <p align="center">
   <img src="screenshots/webui-overview-v0.4.0.png" width="100%" alt="B1ack Memory v0.4.0 记忆质量治理概览">
@@ -214,7 +214,9 @@ Light 会把项目进度、迁移记录、完成操作、待落实方案和临�
 | `backups/` | 带 manifest、schema 版本和 SHA-256 校验的 ZIP 整包备份；默认排除 API Key。 |
 | `b1ack-memory.log` | 轮转日志，单文件 1 MB，保留 5 份。 |
 
-WebUI 和 API 默认只接受 loopback 客户端；写操作还需要进程启动时生成的临时令牌。会话入库前会执行常见密钥模式脱敏，疑似敏感内容不会自动晋升。
+独立 WebUI 和 API 同时校验 loopback 客户端与合法 `Host`：打开 `/ui/` 会建立 HttpOnly、SameSite=Strict 的进程会话，CLI 也会在终端显示可供脚本使用的临时 Bearer token。所有数据读取都需要其中一种凭据，基于会话的写入还必须通过同源 Origin 校验；`/bootstrap` 不返回令牌。Hermes Dashboard 路由则复用宿主 session/cookie 鉴权。会话入库前会执行常见密钥模式脱敏，疑似敏感内容不会自动晋升。
+
+Linux/macOS 上，数据根目录、`backups/`、`vault/` 和 `indexes/` 使用 `0700`，数据库、WAL/SHM、Markdown、日志、投影和 ZIP 使用 `0600`。Windows 的权限由 ACL 管理，系统页会逐路径显示平台状态和修复建议。连续三次提取失败的 raw turn 会进入隔离区，不再自动调用模型；可在“系统 → 存储与备份”中核对错误并单条重试。
 
 <details>
 <summary><strong>回收、永久删除与备份边界</strong></summary>

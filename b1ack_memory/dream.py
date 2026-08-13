@@ -155,9 +155,13 @@ class DreamEngine:
             all_settings = self.db.get_settings()
             settings = all_settings["dream"]
             timezone_name = str(all_settings["general"]["timezone"])
-            light_summary = self._run_light(
-                run_id, turns, settings, timezone_name, counts
-            )
+            try:
+                light_summary = self._run_light(
+                    run_id, turns, settings, timezone_name, counts
+                )
+            except Exception as error:
+                self.db.mark_turn_ingestion_failed([str(row["id"]) for row in turns], str(error))
+                raise
             self.retrieval.rebuild_index()
             rem_summary = self._run_rem(run_id, timezone_name, counts)
             deep_summary = self._run_deep(run_id, settings, timezone_name, counts)
@@ -180,12 +184,14 @@ class DreamEngine:
         counts: dict[str, int],
     ) -> str:
         known = self.db.list_candidates(status="pending", limit=50)
+        prepared_turns = self._prepare_turn_chunks(turns, max_chars=int(settings["batch_chars"]))
         batches = self._make_batches(
-            turns,
+            prepared_turns,
             max_chars=int(settings["batch_chars"]),
             max_batches=int(settings["max_light_batches"]),
         )
         processed_ids: list[str] = []
+        progress: dict[str, int] = {}
         new_hashes: set[str] = set()
         max_new = int(settings.get("max_new_candidates", 8))
         for batch in batches:
@@ -370,7 +376,11 @@ class DreamEngine:
                     new_hashes.add(digest)
                     counts["candidates"] += 1
             processed_ids.extend(turn_map)
-        self.db.mark_turns_ingested(processed_ids)
+            for row in batch:
+                progress[str(row["id"])] = max(
+                    progress.get(str(row["id"]), 0), int(row.get("_ingest_end", 0))
+                )
+        self.db.advance_turn_ingestion(progress)
         counts["input"] = len(set(processed_ids))
         return (
             f"admit {counts['admitted']}, observe {counts['observed']}, "
@@ -709,6 +719,30 @@ class DreamEngine:
                 "VALUES(?,?,?)",
                 [(call_id, record_type, record_id) for record_type, record_id in references],
             )
+
+    @staticmethod
+    def _prepare_turn_chunks(rows: list[Any], *, max_chars: int) -> list[dict[str, Any]]:
+        """Process one resumable user chunk per turn; assistant text is bounded context only."""
+        prepared: list[dict[str, Any]] = []
+        user_budget = max(256, int(max_chars * 0.75))
+        assistant_budget = max(128, max_chars - user_budget)
+        for row in rows:
+            item = dict(row)
+            original = str(row["user_content"])
+            start = max(0, int(row["ingest_cursor"] or 0))
+            proposed = min(len(original), start + user_budget)
+            end = proposed
+            if proposed < len(original):
+                window = original[start:proposed]
+                boundaries = [window.rfind(mark) for mark in ("\n", "。", "！", "？", ". ", "! ", "? ")]
+                boundary = max(boundaries)
+                if boundary >= max(64, len(window) // 2):
+                    end = start + boundary + 1
+            item["user_content"] = original[start:end]
+            item["assistant_content"] = str(row["assistant_content"])[:assistant_budget]
+            item["_ingest_end"] = end
+            prepared.append(item)
+        return prepared
 
     @staticmethod
     def _make_batches(rows: list[Any], *, max_chars: int, max_batches: int) -> list[list[Any]]:

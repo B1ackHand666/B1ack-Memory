@@ -17,16 +17,32 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from .db import MemoryDatabase, content_hash, local_date, resolve_timezone, utc_now
+from .db import (
+    MemoryDatabase, content_hash, eligible_memory_predicate, local_date, resolve_timezone, utc_now,
+)
 from .dream import DreamEngine
 from .governance import MemoryGovernance
 from .llm import LlmError, OpenAICompatibleClient
 from .models import MEMORY_KINDS, SearchHit
 from .retrieval import RetrievalEngine
-from .security import SecretStore, contains_secret, is_sensitive, redact_secrets
+from .security import (
+    SecretStore, contains_secret, is_sensitive, redact_secrets, secure_directory, secure_file,
+)
 from .workspace import WorkspaceManager
 
 LOGGER = logging.getLogger("b1ack_memory")
+
+
+class _SecureRotatingFileHandler(logging.handlers.RotatingFileHandler):
+    def emit(self, record: logging.LogRecord) -> None:
+        super().emit(record)
+        secure_file(Path(self.baseFilename))
+
+    def doRollover(self) -> None:
+        super().doRollover()
+        secure_file(Path(self.baseFilename))
+        for index in range(1, self.backupCount + 1):
+            secure_file(Path(f"{self.baseFilename}.{index}"))
 
 
 def default_data_root() -> Path:
@@ -40,10 +56,11 @@ def default_data_root() -> Path:
 class MemoryService:
     def __init__(self, root: Path | None = None, *, start_background: bool = False):
         self.root = (root or default_data_root()).resolve()
-        self.root.mkdir(parents=True, exist_ok=True)
+        secure_directory(self.root)
         self.backup_dir = self.root / "backups"
-        self.backup_dir.mkdir(exist_ok=True)
+        secure_directory(self.backup_dir)
         self.db = MemoryDatabase(self.root / "memory.db")
+        self.db.refresh_temporal_statuses()
         self.secrets = SecretStore(self.root / "secrets.json")
         self.workspace = WorkspaceManager(self.db, self.root, self.llm_client)
         self.retrieval = RetrievalEngine(self.db)
@@ -58,6 +75,7 @@ class MemoryService:
         self._mutation_token = os.urandom(24).hex()
         self.regenerate_markdown()
         self.workspace.rebuild_projections()
+        self._secure_existing_assets()
         if start_background:
             self.start_background()
 
@@ -66,7 +84,7 @@ class MemoryService:
         return self._mutation_token
 
     def _configure_logging(self) -> None:
-        handler = logging.handlers.RotatingFileHandler(
+        handler = _SecureRotatingFileHandler(
             self.root / "b1ack-memory.log",
             maxBytes=1_000_000,
             backupCount=5,
@@ -76,6 +94,15 @@ class MemoryService:
         LOGGER.addHandler(handler)
         LOGGER.setLevel(logging.INFO)
         self._log_handler = handler
+        secure_file(self.root / "b1ack-memory.log")
+
+    def _secure_existing_assets(self) -> None:
+        for directory in (self.root, self.backup_dir, self.root / "vault", self.root / "indexes"):
+            if directory.exists():
+                secure_directory(directory)
+        for path in self.root.rglob("*"):
+            if path.is_file():
+                secure_file(path)
 
     def start_background(self) -> None:
         if self._writer and self._writer.is_alive():
@@ -115,6 +142,8 @@ class MemoryService:
             time.sleep(0.02)
 
     def capture_turn(self, session_id: str, user: str, assistant: str) -> str:
+        if not all(isinstance(value, str) for value in (session_id, user, assistant)):
+            raise ValueError("session_id, user, and assistant must be strings")
         safe_user, user_redacted = redact_secrets(user)
         safe_assistant, assistant_redacted = redact_secrets(assistant)
         with self._maintenance_lock:
@@ -134,6 +163,8 @@ class MemoryService:
         allow_sensitive: bool = False,
         project_id: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(content, str):
+            raise ValueError("Memory content must be a string")
         content = content.strip()
         if not content:
             raise ValueError("Memory content is empty")
@@ -143,18 +174,14 @@ class MemoryService:
             raise ValueError(f"Unsupported memory kind: {kind}")
         sensitive = is_sensitive(content)
         with self._maintenance_lock:
+            self._validate_project_id(project_id)
             result = self._governance().remember(
                 content,
                 kind=kind,
                 origin=origin,
                 sensitive=sensitive,
+                project_id=project_id,
             )
-            linked = result.get("memory") or result.get("candidate")
-            if project_id and isinstance(linked, dict) and linked.get("id"):
-                object_type = "memory" if result.get("memory") else "candidate"
-                self.workspace.link_subject(
-                    project_id, object_type, str(linked["id"]), method="explicit_remember"
-                )
             self.rebuild_derived()
             self._attach_incremental_audit(result)
             return result
@@ -171,6 +198,12 @@ class MemoryService:
         project_confidence: float | None = None,
         project_reason: str | None = None,
     ) -> list[SearchHit]:
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("Search query must be a non-empty string")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 20):
+            raise ValueError("Search limit must be an integer between 1 and 20")
+        if project_id is not None:
+            self._validate_project_id(project_id)
         settings = self.db.get_settings()
         query_vector: list[float] | None = None
         embedding = settings["embedding"]
@@ -220,13 +253,16 @@ class MemoryService:
         )
         items: list[dict[str, Any]] = []
         excluded: list[dict[str, Any]] = []
+        durable_limit = int(settings.get("durable_limit", 6))
         if project:
             summary = self.workspace.current_summary("project", str(project["id"]))
-            if summary:
+            if summary and not summary.get("stale"):
                 items.append({
                     "id": summary["id"], "source": "summary", "kind": "project_summary",
                     "content": summary["content"], "project_id": project["id"], "limit_group": "summary",
                 })
+            elif summary:
+                excluded.append({"id": summary["id"], "reason": "summary_sources_changed"})
             work_items = self.workspace.list_work_items(subject_id=str(project["id"]), limit=100)
             limits = {"current_state": 3, "decision": 3, "open_question": 2}
             used = {key: 0 for key in limits}
@@ -249,28 +285,13 @@ class MemoryService:
                     "id": item["id"], "source": "work_item", "kind": item_type,
                     "content": item["content"], "project_id": project["id"], "limit_group": item_type,
                 })
-            with self.db.connect() as conn:
-                linked_memories = conn.execute(
-                    "SELECT m.* FROM subject_links sl JOIN memories m ON m.id=sl.object_id "
-                    "WHERE sl.subject_id=? AND sl.object_type='memory' "
-                    "AND sl.assignment_status IN ('confirmed','automatic') "
-                    "AND m.status='active' AND m.temporal_status='current' "
-                    "ORDER BY m.updated_at DESC LIMIT 6",
-                    (str(project["id"]),),
-                ).fetchall()
-            for memory in linked_memories:
-                items.append({
-                    "id": memory["id"], "source": "memory", "kind": memory["kind"],
-                    "content": memory["content"], "project_id": project["id"],
-                    "score": 1.0, "limit_group": "durable",
-                })
         seen = {content_hash(str(item["content"])) for item in items}
         for hit in hits:
             digest = content_hash(hit.content)
             if digest in seen:
                 excluded.append({"id": hit.id, "reason": "duplicate_content"})
                 continue
-            if sum(1 for item in items if item["source"] == "memory") >= 6:
+            if sum(1 for item in items if item["source"] == "memory") >= durable_limit:
                 excluded.append({"id": hit.id, "reason": "durable_budget"})
                 continue
             seen.add(digest)
@@ -278,6 +299,29 @@ class MemoryService:
                 "id": hit.id, "source": "memory", "kind": hit.kind, "content": hit.content,
                 "project_id": hit.project_id, "score": hit.final_score, "limit_group": "durable",
             })
+        if project and sum(1 for item in items if item["source"] == "memory") < durable_limit:
+            predicate, predicate_args = eligible_memory_predicate("m")
+            with self.db.connect() as conn:
+                linked_memories = conn.execute(
+                    "SELECT m.* FROM subject_links sl JOIN memories m ON m.id=sl.object_id "
+                    "WHERE sl.subject_id=? AND sl.object_type='memory' "
+                    "AND sl.assignment_status IN ('confirmed','automatic') "
+                    f"AND {predicate} ORDER BY m.updated_at DESC LIMIT ?",
+                    [str(project["id"]), *predicate_args, durable_limit * 2],
+                ).fetchall()
+            for memory in linked_memories:
+                digest = content_hash(str(memory["content"]))
+                if digest in seen:
+                    continue
+                if sum(1 for item in items if item["source"] == "memory") >= durable_limit:
+                    excluded.append({"id": memory["id"], "reason": "durable_budget"})
+                    continue
+                seen.add(digest)
+                items.append({
+                    "id": memory["id"], "source": "memory", "kind": memory["kind"],
+                    "content": memory["content"], "project_id": project["id"],
+                    "score": 0.0, "limit_group": "durable",
+                })
         max_chars = int(settings["max_context_chars"])
         rendered_items: list[dict[str, Any]] = []
         used_chars = 0
@@ -383,6 +427,8 @@ class MemoryService:
 
     def run_dream(self, *, dry_run: bool = False) -> dict[str, Any]:
         with self._maintenance_lock:
+            if not dry_run:
+                self.db.refresh_temporal_statuses()
             outcome = DreamEngine(
                 self.db,
                 self.llm_client(),
@@ -427,7 +473,13 @@ class MemoryService:
         suggested_project = detection.get("project")
         project = suggested_project if detection.get("confidence", 0.0) >= 0.90 else None
         commitment = str(observation.get("commitment", "")).casefold()
-        confirmed = commitment == "confirmed" and item_type != "proposal"
+        confirmed = (
+            commitment == "confirmed"
+            and item_type != "proposal"
+            and self._explicit_work_confirmation(
+                str(observation.get("evidence_quote", "")), item_type
+            )
+        )
         item = self.workspace.create_work_item(
             str(observation.get("content", "")),
             item_type=item_type,
@@ -463,6 +515,35 @@ class MemoryService:
             )
         return item
 
+    @staticmethod
+    def _explicit_work_confirmation(quote: str, item_type: str) -> bool:
+        normalized = " ".join(quote.casefold().split())
+        if not normalized:
+            return False
+        negative = (
+            "考虑", "可能", "也许", "如果", "假如", "建议", "提议", "可以考虑",
+            "未确定", "还没决定", "could", "might", "maybe", "if ", "consider",
+            "suggest", "proposal", "not decided",
+        )
+        if any(marker in normalized for marker in negative):
+            return False
+        patterns = {
+            "decision": (
+                "决定", "确定", "确认采用", "改为", "选择", "从现在起", "必须",
+                "i decided", "i choose", "we decided", "will use", "must use",
+            ),
+            "current_state": (
+                "目前", "现在", "已经", "正在", "当前", "现状", "是", "有",
+                "currently", "right now", "is now", "has been", "we are", "i am",
+            ),
+            "open_question": (
+                "？", "?", "尚未决定", "待确认", "需要确定", "还需确认",
+                "open question", "undecided", "need to decide",
+            ),
+            "milestone": ("完成", "已完成", "上线", "发布", "completed", "shipped", "released"),
+        }
+        return any(marker in normalized for marker in patterns.get(item_type, ()))
+
     def rebuild_derived(self, *, embeddings: bool = False) -> dict[str, Any]:
         with self._maintenance_lock:
             result: dict[str, Any] = {"fts": self.retrieval.rebuild_index()}
@@ -477,8 +558,12 @@ class MemoryService:
             return result
 
     def regenerate_markdown(self) -> None:
-        memories = self.db.list_memories(status="active", limit=100_000)
-        memories = [memory for memory in memories if memory.temporal_status == "current"]
+        valid_sql, valid_params = eligible_memory_predicate("m")
+        with self.db.connect() as conn:
+            memories = [self.db._memory_from_row(row) for row in conn.execute(
+                f"SELECT m.* FROM memories m WHERE {valid_sql} ORDER BY m.updated_at DESC LIMIT 100000",
+                valid_params,
+            ).fetchall()]
         grouped: dict[str, list[Any]] = {kind: [] for kind in MEMORY_KINDS}
         for memory in memories:
             grouped[memory.kind].append(memory)
@@ -493,7 +578,7 @@ class MemoryService:
                 continue
             memory_lines.extend([f"## {kind.title()}", ""])
             for record in sorted(records, key=lambda item: item.updated_at, reverse=True):
-                memory_lines.append(f"- {record.content} <!-- b1ack:id={record.id} -->")
+                memory_lines.append(f"- {WorkspaceManager._safe_markdown(record.content)} <!-- b1ack:id={record.id} -->")
             memory_lines.append("")
         self._atomic_text(self.root / "MEMORY.md", "\n".join(memory_lines).rstrip() + "\n")
 
@@ -1137,22 +1222,29 @@ class MemoryService:
         temporal_reason: str | None = None,
         project_id: str | None = None,
     ) -> dict[str, Any]:
+        if not isinstance(content, str) or not isinstance(kind, str):
+            raise ValueError("Memory content and kind must be strings")
         if contains_secret(content):
             raise ValueError("Potential secret detected")
         with self._maintenance_lock:
-            result = self._governance().update_memory(record_id, content=content, kind=kind)
-            memory = result.get("memory")
-            if isinstance(memory, dict) and temporal_status:
-                updated = self.db.update_memory_temporal(
-                    str(memory["id"]), valid_from=valid_from, valid_to=valid_to,
-                    temporal_status=temporal_status, temporal_reason=temporal_reason,
-                )
-                result["memory"] = updated.to_dict()
-            if project_id and isinstance(result.get("memory"), dict):
-                self.workspace.link_subject(project_id, "memory", str(result["memory"]["id"]))
+            self._validate_project_id(project_id)
+            result = self._governance().update_memory(
+                record_id, content=content, kind=kind, valid_from=valid_from,
+                valid_to=valid_to, temporal_status=temporal_status,
+                temporal_reason=temporal_reason, project_id=project_id,
+            )
             self.rebuild_derived()
             self._attach_incremental_audit(result)
             return result
+
+    def _validate_project_id(self, project_id: str | None) -> None:
+        if project_id is None:
+            return
+        if not isinstance(project_id, str) or not project_id.strip():
+            raise ValueError("project_id must be a non-empty string")
+        project = self.workspace.get_subject(project_id)
+        if project["subject_type"] != "project" or project["status"] == "archived":
+            raise KeyError(project_id)
 
     # Project workspace ---------------------------------------------------------------
     def list_projects(self, *, status: str | None = None) -> list[dict[str, Any]]:
@@ -1183,6 +1275,7 @@ class MemoryService:
         return project
 
     def create_project(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._validate_subject_body(body, require_name=True)
         with self._maintenance_lock:
             project = self.workspace.create_subject(
                 str(body.get("name", "")), subject_type="project",
@@ -1197,6 +1290,7 @@ class MemoryService:
             return project
 
     def update_project(self, project_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._validate_subject_body(body)
         with self._maintenance_lock:
             project = self.workspace.update_subject(project_id, body)
             self.rebuild_derived()
@@ -1206,12 +1300,16 @@ class MemoryService:
         return self.update_project(project_id, {"status": "archived"})
 
     def set_session_project(self, session_id: str, project_id: str) -> dict[str, Any]:
+        if not isinstance(session_id, str) or not session_id.strip():
+            raise ValueError("session_id must be a non-empty string")
+        self._validate_project_id(project_id)
         return self.workspace.set_session_project(session_id, project_id, confirmed=True)
 
     def list_subjects(self, *, subject_type: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
         return self.workspace.list_subjects(subject_type=subject_type, status=status)
 
     def create_subject(self, body: dict[str, Any]) -> dict[str, Any]:
+        self._validate_subject_body(body, require_name=True)
         with self._maintenance_lock:
             subject = self.workspace.create_subject(
                 str(body.get("name", "")), subject_type=str(body.get("subject_type", "topic")),
@@ -1228,12 +1326,20 @@ class MemoryService:
             return result
 
     def update_subject(self, subject_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        self._validate_subject_body(body)
         with self._maintenance_lock:
             result = self.workspace.update_subject(subject_id, body)
             self.rebuild_derived()
             return result
 
     def split_subject(self, subject_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict) or not isinstance(body.get("name"), str):
+            raise ValueError("Subject split requires a string name")
+        for key in ("object_ids", "work_item_ids"):
+            if key in body and (
+                not isinstance(body[key], list) or not all(isinstance(item, str) for item in body[key])
+            ):
+                raise ValueError(f"{key} must be a list of strings")
         with self._maintenance_lock:
             result = self.workspace.split_subject(
                 subject_id,
@@ -1245,6 +1351,10 @@ class MemoryService:
             return result
 
     def link_subject(self, subject_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict) or not all(
+            isinstance(body.get(key), str) for key in ("object_type", "object_id")
+        ):
+            raise ValueError("object_type and object_id must be strings")
         with self._maintenance_lock:
             result = self.workspace.link_subject(
                 subject_id,
@@ -1264,6 +1374,10 @@ class MemoryService:
             return result
 
     def add_subject_relation(self, subject_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict) or not all(
+            isinstance(body.get(key), str) for key in ("target_subject_id", "relation_type")
+        ):
+            raise ValueError("target_subject_id and relation_type must be strings")
         return self.workspace.add_relation(
             subject_id,
             str(body.get("target_subject_id", "")),
@@ -1275,15 +1389,46 @@ class MemoryService:
         return self.workspace.list_work_items(**filters)
 
     def update_work_item(self, item_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise ValueError("Work item update must be an object")
+        allowed = {key: body[key] for key in ("content", "item_type", "subject_id") if key in body}
+        for key, value in allowed.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{key} must be a string")
         with self._maintenance_lock:
-            item = self.workspace.update_work_item(item_id, body)
+            item = self.workspace.update_work_item(item_id, allowed)
             self.rebuild_derived()
             return item
+
+    @staticmethod
+    def _validate_subject_body(body: dict[str, Any], *, require_name: bool = False) -> None:
+        if not isinstance(body, dict):
+            raise ValueError("Subject body must be an object")
+        if require_name and not isinstance(body.get("name"), str):
+            raise ValueError("Subject name must be a string")
+        for key in ("name", "description", "status", "subject_type"):
+            if key in body and not isinstance(body[key], str):
+                raise ValueError(f"{key} must be a string")
+        for key in ("aliases", "workspace_aliases"):
+            if key in body and (
+                not isinstance(body[key], list) or not all(isinstance(item, str) for item in body[key])
+            ):
+                raise ValueError(f"{key} must be a list of strings")
+
+    def ingestion_issues(self, limit: int = 100) -> list[dict[str, Any]]:
+        return self.db.ingestion_issues(limit=min(max(int(limit), 1), 1000))
+
+    def retry_ingestion(self, turn_id: str) -> dict[str, Any]:
+        if not isinstance(turn_id, str) or not turn_id.strip():
+            raise ValueError("turn_id must be a non-empty string")
+        return self.db.retry_ingestion(turn_id.strip())
 
     def work_item_action(self, item_id: str, action: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         with self._maintenance_lock:
             if action == "promote":
                 item = self.workspace.get_work_item(item_id)
+                if body and "content" in body and not isinstance(body["content"], str):
+                    raise ValueError("content must be a string")
                 result = self.remember(
                     str(body.get("content", item["content"]) if body else item["content"]),
                     kind="decision" if item["item_type"] == "decision" else "project",
@@ -1534,6 +1679,7 @@ class MemoryService:
                         if path.is_file():
                             archive.write(path, path.relative_to(self.root).as_posix())
                     archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+            secure_file(target)
             if prune:
                 self._prune_backups()
             return target
@@ -1585,6 +1731,8 @@ class MemoryService:
                     for table in ("memories", "candidates", "raw_turns")
                 }
                 version = int(restored.execute("SELECT version FROM schema_meta").fetchone()[0])
+                if version > 7:
+                    raise ValueError(f"Backup schema v{version} is newer than supported schema v7")
         return {
             "ok": True,
             "name": source.name,
@@ -1601,32 +1749,62 @@ class MemoryService:
             source = (self.backup_dir / Path(name).name).resolve()
             if source.parent != self.backup_dir.resolve() or not source.is_file():
                 raise FileNotFoundError(name)
-            with tempfile.TemporaryDirectory(prefix=".restore-", dir=self.root) as directory:
-                protected_source = Path(directory) / "source.db"
+            restore_temp = self.root / ".restore.tmp"
+            rollback_database = self.root / ".restore.rollback"
+            for path in (restore_temp, rollback_database):
+                path.unlink(missing_ok=True)
+            try:
                 if source.suffix.casefold() == ".zip":
                     self.preview_restore(name)
                     with zipfile.ZipFile(source) as archive:
-                        protected_source.write_bytes(archive.read("memory.db"))
+                        restore_temp.write_bytes(archive.read("memory.db"))
                 else:
-                    self._copy_database(source, protected_source)
-                self._validate_database(protected_source)
-                # Keep both a user-visible archive and a plain local rollback
-                # database. The latter remains usable even if archive handling
-                # itself is what fails during restore.
+                    self._copy_database(source, restore_temp)
+                secure_file(restore_temp)
+                self._validate_database(restore_temp)
+                with contextlib.closing(sqlite3.connect(restore_temp)) as candidate:
+                    version = int(candidate.execute("SELECT version FROM schema_meta").fetchone()[0])
+                if version > 7:
+                    raise ValueError(f"Backup schema v{version} is newer than supported schema v7")
+                # Migrate and validate the isolated copy before replacing the fact source.
+                MemoryDatabase(restore_temp)
+                self._validate_database(restore_temp)
                 self.create_backup(label="pre-restore", prune=False)
-                rollback_database = Path(directory) / "rollback.db"
                 self.db.backup(rollback_database)
                 try:
-                    self._copy_database(protected_source, self.db.path)
-                    self.db.migrate()
+                    with self.db.connect() as conn:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    self._fsync_file(restore_temp)
+                    for suffix in ("-wal", "-shm"):
+                        Path(f"{self.db.path}{suffix}").unlink(missing_ok=True)
+                    os.replace(restore_temp, self.db.path)
+                    secure_file(self.db.path)
                     self._validate_database(self.db.path)
-                    self.rebuild_derived()
                 except Exception:
-                    self._copy_database(rollback_database, self.db.path)
-                    self.db.migrate()
-                    self.rebuild_derived()
+                    self._fsync_file(rollback_database)
+                    os.replace(rollback_database, self.db.path)
+                    secure_file(self.db.path)
                     raise
+                # The restored database is already the successful fact; derived failures retry later.
+                try:
+                    self.rebuild_derived()
+                except Exception as error:
+                    LOGGER.exception("Restore succeeded but derived rebuild failed")
+                    with self.db.transaction(immediate=True) as conn:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO projection_jobs(id,projection_type,target_id,revision,status,attempts,error,created_at,updated_at) "
+                            "VALUES('restore-rebuild','all','all',0,'failed',1,?,?,?)",
+                            (str(error)[:500], utc_now(), utc_now()),
+                        )
+            finally:
+                restore_temp.unlink(missing_ok=True)
+                rollback_database.unlink(missing_ok=True)
             self._prune_backups()
+
+    @staticmethod
+    def _fsync_file(path: Path) -> None:
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
 
     def export_jsonl(self) -> str:
         rows = self.db.list_memories(status=None, limit=100_000)
@@ -1690,7 +1868,18 @@ class MemoryService:
             try:
                 if item is None:
                     return
-                self.capture_turn(*item)
+                attempt = 0
+                while True:
+                    try:
+                        self.capture_turn(*item)
+                        break
+                    except sqlite3.OperationalError as error:
+                        if not any(marker in str(error).casefold() for marker in ("locked", "busy")):
+                            raise
+                        attempt += 1
+                        delay = min(2.0, 0.05 * (2 ** min(attempt, 6)))
+                        LOGGER.warning("Writer database busy; retrying turn in %.2fs", delay)
+                        time.sleep(delay)
             except Exception:
                 LOGGER.exception("Failed to capture turn")
             finally:
@@ -1701,37 +1890,38 @@ class MemoryService:
         last_backup_day = ""
         while not self._stop.wait(30):
             try:
-                timezone_name = str(self.db.get_settings()["general"]["timezone"])
-                now = datetime.now(resolve_timezone(timezone_name))
-                if now.date().isoformat() != last_backup_day and now.hour >= 4:
-                    if self.db.acquire_lease("daily-backup", owner, 300):
-                        try:
-                            action = f"daily-backup:{now.date().isoformat()}"
-                            with self.db.connect() as conn:
-                                already_done = conn.execute(
-                                    "SELECT 1 FROM audit_events WHERE action=?", (action,)
-                                ).fetchone()
-                            if not already_done:
-                                self.create_backup(label="automatic")
-                                retention = self.db.get_settings()["retention"]
-                                self.db.retention_cleanup(
-                                    int(retention["raw_turn_days"]),
-                                    int(retention["model_call_days"]),
-                                    int(retention["candidate_inactive_days"]),
-                                    int(retention["candidate_expired_days"]),
-                                    int(retention["rejected_candidate_days"]),
-                                    timezone_name=timezone_name,
-                                )
-                                with self.db.transaction(immediate=True) as conn:
-                                    conn.execute(
-                                        "INSERT INTO audit_events(action,created_at) VALUES(?,?)",
-                                        (action, utc_now()),
+                with self._maintenance_lock:
+                    timezone_name = str(self.db.get_settings()["general"]["timezone"])
+                    now = datetime.now(resolve_timezone(timezone_name))
+                    if now.date().isoformat() != last_backup_day and now.hour >= 4:
+                        if self.db.acquire_lease("daily-backup", owner, 300):
+                            try:
+                                action = f"daily-backup:{now.date().isoformat()}"
+                                with self.db.connect() as conn:
+                                    already_done = conn.execute(
+                                        "SELECT 1 FROM audit_events WHERE action=?", (action,)
+                                    ).fetchone()
+                                if not already_done:
+                                    self.create_backup(label="automatic")
+                                    retention = self.db.get_settings()["retention"]
+                                    self.db.retention_cleanup(
+                                        int(retention["raw_turn_days"]),
+                                        int(retention["model_call_days"]),
+                                        int(retention["candidate_inactive_days"]),
+                                        int(retention["candidate_expired_days"]),
+                                        int(retention["rejected_candidate_days"]),
+                                        timezone_name=timezone_name,
                                     )
-                            last_backup_day = now.date().isoformat()
-                        finally:
-                            self.db.release_lease("daily-backup", owner)
-                if self._dream_due(now):
-                    self.run_dream()
+                                    with self.db.transaction(immediate=True) as conn:
+                                        conn.execute(
+                                            "INSERT INTO audit_events(action,created_at) VALUES(?,?)",
+                                            (action, utc_now()),
+                                        )
+                                last_backup_day = now.date().isoformat()
+                            finally:
+                                self.db.release_lease("daily-backup", owner)
+                    if self._dream_due(now):
+                        self.run_dream()
             except Exception:
                 LOGGER.exception("Scheduled maintenance failed")
 
@@ -1850,11 +2040,16 @@ class MemoryService:
                     raise ValueError(f"{key} must be at least 1")
         if section == "recall" and int(value.get("limit", 5)) not in range(1, 21):
             raise ValueError("recall limit must be between 1 and 20")
+        if section == "recall" and int(value.get("durable_limit", 6)) not in range(1, 21):
+            raise ValueError("durable_limit must be between 1 and 20")
         if section == "recall" and int(value.get("max_context_chars", 0)) < 500:
             raise ValueError("max_context_chars must be at least 500")
 
     @staticmethod
     def _atomic_text(path: Path, content: str) -> None:
+        secure_directory(path.parent)
         temp = path.with_name(f".{path.name}.tmp")
         temp.write_text(content, encoding="utf-8")
+        secure_file(temp)
         os.replace(temp, path)
+        secure_file(path)

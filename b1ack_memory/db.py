@@ -13,6 +13,7 @@ from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .models import AuditRun, CandidateRecord, MEMORY_KINDS, MemoryRecord, ReviewItem
+from .security import secure_directory, secure_file
 
 SCHEMA_VERSION = 7
 
@@ -50,12 +51,32 @@ def content_hash(content: str) -> str:
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
+def eligible_memory_predicate(alias: str = "m", *, now: str | None = None) -> tuple[str, list[str]]:
+    """Return the one authoritative SQL predicate for injectable memories."""
+    prefix = f"{alias}." if alias else ""
+    current = now or utc_now()
+    predicate = (
+        f"{prefix}status='active' AND {prefix}temporal_status='current' "
+        f"AND ({prefix}valid_until IS NULL OR datetime({prefix}valid_until)>datetime(?)) "
+        f"AND ({prefix}valid_from IS NULL OR CASE WHEN length({prefix}valid_from)=10 "
+        f"THEN date({prefix}valid_from)<=date(?) ELSE datetime({prefix}valid_from)<=datetime(?) END) "
+        f"AND ({prefix}valid_to IS NULL OR CASE WHEN length({prefix}valid_to)=10 "
+        f"THEN date({prefix}valid_to)>=date(?) ELSE datetime({prefix}valid_to)>=datetime(?) END)"
+    )
+    return predicate, [current, current, current, current, current]
+
+
 class MemoryDatabase:
     def __init__(self, path: Path):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        secure_directory(self.path.parent)
         self._local = threading.local()
         self.migrate()
+        self._secure_database_files()
+
+    def _secure_database_files(self) -> None:
+        for suffix in ("", "-wal", "-shm"):
+            secure_file(Path(f"{self.path}{suffix}"))
 
     def schema_version(self) -> int:
         with self.connect() as conn:
@@ -76,11 +97,12 @@ class MemoryDatabase:
                 if version not in {4, 5, 6}:
                     return
                 backup_dir = self.path.parent / "backups"
-                backup_dir.mkdir(exist_ok=True)
+                secure_directory(backup_dir)
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
                 target = backup_dir / f"{stamp}-pre-schema-v{version + 1}.db"
                 with contextlib.closing(sqlite3.connect(target)) as destination:
                     source.backup(destination)
+                secure_file(target)
         except (OSError, sqlite3.Error, TypeError, ValueError) as error:
             raise RuntimeError(
                 f"Unable to create pre-schema upgrade backup: {error}"
@@ -96,6 +118,7 @@ class MemoryDatabase:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA secure_delete=ON")
+        self._secure_database_files()
         return conn
 
     @contextlib.contextmanager
@@ -114,8 +137,7 @@ class MemoryDatabase:
     def migrate(self) -> None:
         self._backup_before_schema_upgrade()
         with self.transaction(immediate=True) as conn:
-            conn.executescript(
-                """
+            self._execute_schema(conn, """
                 CREATE TABLE IF NOT EXISTS schema_meta (
                     version INTEGER NOT NULL
                 );
@@ -160,7 +182,12 @@ class MemoryDatabase:
                     observed_at TEXT NOT NULL,
                     ingested_at TEXT,
                     secret_redacted INTEGER NOT NULL DEFAULT 0,
-                    subject_id TEXT
+                    subject_id TEXT,
+                    ingest_status TEXT NOT NULL DEFAULT 'pending',
+                    ingest_attempts INTEGER NOT NULL DEFAULT 0,
+                    ingest_cursor INTEGER NOT NULL DEFAULT 0,
+                    last_ingest_error TEXT,
+                    next_retry_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS candidates (
@@ -355,7 +382,8 @@ class MemoryDatabase:
                     resolved_at TEXT,
                     resolution TEXT,
                     subject_id TEXT,
-                    queue TEXT NOT NULL DEFAULT 'decision'
+                    queue TEXT NOT NULL DEFAULT 'decision',
+                    proposal_json TEXT NOT NULL DEFAULT '{}'
                 );
                 CREATE INDEX IF NOT EXISTS idx_memory_review_items_status
                     ON memory_review_items(status, created_at DESC);
@@ -479,6 +507,8 @@ class MemoryDatabase:
                     change_reason TEXT NOT NULL DEFAULT '',
                     mode TEXT NOT NULL DEFAULT 'automatic',
                     status TEXT NOT NULL DEFAULT 'current',
+                    source_revision TEXT NOT NULL DEFAULT '',
+                    newest_source_updated_at TEXT,
                     created_at TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_summary_versions_target
@@ -512,12 +542,12 @@ class MemoryDatabase:
                 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                     record_id UNINDEXED,
                     source UNINDEXED,
+                    pool UNINDEXED,
                     content,
                     search_text,
                     tokenize='unicode61 remove_diacritics 2'
                 );
-                """
-            )
+                """)
             current = int(conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             if current > SCHEMA_VERSION:
                 raise RuntimeError(f"Database schema {current} is newer than supported {SCHEMA_VERSION}")
@@ -546,6 +576,11 @@ class MemoryDatabase:
                 "memory_review_items": {
                     "subject_id": "TEXT",
                     "queue": "TEXT NOT NULL DEFAULT 'decision'",
+                    "proposal_json": "TEXT NOT NULL DEFAULT '{}'",
+                },
+                "summary_versions": {
+                    "source_revision": "TEXT NOT NULL DEFAULT ''",
+                    "newest_source_updated_at": "TEXT",
                 },
             }.items():
                 columns = {
@@ -554,6 +589,32 @@ class MemoryDatabase:
                 for column, definition in migrations.items():
                     if column not in columns:
                         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            raw_turn_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(raw_turns)").fetchall()
+            }
+            for column, definition in {
+                "ingest_status": "TEXT NOT NULL DEFAULT 'pending'",
+                "ingest_attempts": "INTEGER NOT NULL DEFAULT 0",
+                "ingest_cursor": "INTEGER NOT NULL DEFAULT 0",
+                "last_ingest_error": "TEXT",
+                "next_retry_at": "TEXT",
+            }.items():
+                if column not in raw_turn_columns:
+                    conn.execute(f"ALTER TABLE raw_turns ADD COLUMN {column} {definition}")
+            conn.execute(
+                "UPDATE raw_turns SET ingest_status=CASE WHEN ingested_at IS NULL THEN 'pending' "
+                "ELSE 'processed' END WHERE ingest_status IS NULL OR ingest_status=''"
+            )
+            fts_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(search_fts)").fetchall()
+            }
+            if "pool" not in fts_columns:
+                conn.execute("DROP TABLE search_fts")
+                conn.execute(
+                    "CREATE VIRTUAL TABLE search_fts USING fts5("
+                    "record_id UNINDEXED,source UNINDEXED,pool UNINDEXED,content,search_text,"
+                    "tokenize='unicode61 remove_diacritics 2')"
+                )
             candidate_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()
             }
@@ -635,13 +696,11 @@ class MemoryDatabase:
                     "WHERE status='pending'"
                 )
             if current < 7:
-                cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
                 legacy_observations = conn.execute(
                     "SELECT ad.id,ad.content,ad.confidence,ad.raw_turn_id,ad.evidence_quote,"
                     "ad.created_at FROM admission_decisions ad "
                     "JOIN raw_turns rt ON rt.id=ad.raw_turn_id "
-                    "WHERE ad.disposition='observe' AND ad.created_at>=?",
-                    (cutoff,),
+                    "WHERE ad.disposition='observe'",
                 ).fetchall()
                 for observation in legacy_observations:
                     work_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"b1ack:observe:{observation['id']}"))
@@ -649,15 +708,17 @@ class MemoryDatabase:
                     expires = (
                         datetime.fromisoformat(created) + timedelta(days=14)
                     ).isoformat(timespec="seconds")
+                    legacy_status = "suggested" if expires > utc_now() else "expired"
                     conn.execute(
                         "INSERT OR IGNORE INTO work_items("
                         "id,item_type,content,content_hash,status,confirmed,confidence,raw_turn_id,"
                         "admission_decision_id,evidence_quote,source,expires_at,created_at,updated_at"
-                        ") VALUES(?, 'proposal', ?, ?, 'suggested', 0, ?, ?, ?, ?, 'migration_v7', ?, ?, ?)",
+                        ") VALUES(?, 'proposal', ?, ?, ?, 0, ?, ?, ?, ?, 'migration_v7', ?, ?, ?)",
                         (
                             work_id,
                             observation["content"],
                             content_hash(observation["content"]),
+                            legacy_status,
                             float(observation["confidence"]),
                             observation["raw_turn_id"],
                             observation["id"],
@@ -667,18 +728,32 @@ class MemoryDatabase:
                             created,
                         ),
                     )
-                revision = content_hash(f"schema-v7:{utc_now()}")
+                revision = content_hash("schema-v7:initial-projection")
                 conn.execute(
                     "INSERT OR IGNORE INTO projection_jobs("
                     "id,projection_type,target_id,revision,status,created_at,updated_at"
                     ") VALUES(?, 'all', '', ?, 'pending', ?, ?)",
-                    (str(uuid.uuid4()), revision, utc_now(), utc_now()),
+                    (str(uuid.uuid5(uuid.NAMESPACE_URL, "b1ack:schema-v7:initial-projection")), revision, utc_now(), utc_now()),
                 )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_candidates_promoted_memory "
                 "ON candidates(promoted_memory_id) WHERE promoted_memory_id IS NOT NULL"
             )
             conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
+
+    @staticmethod
+    def _execute_schema(conn: sqlite3.Connection, script: str) -> None:
+        """Execute DDL without sqlite3.executescript's implicit pre-COMMIT."""
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                sql = statement.strip()
+                if sql:
+                    conn.execute(sql)
+                statement = ""
+        if statement.strip():
+            raise sqlite3.OperationalError("Incomplete schema statement")
 
     def default_settings(self) -> dict[str, Any]:
         return {
@@ -706,7 +781,7 @@ class MemoryDatabase:
                 "candidate_expired_days": 30,
                 "rejected_candidate_days": 30,
             },
-            "recall": {"limit": 5, "max_context_chars": 4000},
+            "recall": {"limit": 5, "durable_limit": 6, "max_context_chars": 4000},
         }
 
     def get_settings(self) -> dict[str, Any]:
@@ -908,63 +983,65 @@ class MemoryDatabase:
                 used_memory_ids.add(memory_id)
 
         orphan_rows = conn.execute(
-            "SELECT id FROM candidates WHERE status='promoted' AND promoted_memory_id IS NULL"
+            "SELECT id,content_hash FROM candidates WHERE status='promoted' AND promoted_memory_id IS NULL"
         ).fetchall()
-        orphan_ids = [row["id"] for row in orphan_rows]
-        if not orphan_ids:
+        if not orphan_rows:
             return
-        placeholders = ",".join("?" for _ in orphan_ids)
-        raw_ids = [
-            row[0]
-            for row in conn.execute(
-                f"SELECT DISTINCT raw_turn_id FROM evidence WHERE candidate_id IN ({placeholders}) "
-                "AND raw_turn_id IS NOT NULL",
-                orphan_ids,
-            )
-        ]
-        call_ids = [
-            row[0]
-            for row in conn.execute(
-                f"SELECT DISTINCT call_id FROM model_call_records WHERE record_type='candidate' "
-                f"AND record_id IN ({placeholders})",
-                orphan_ids,
-            )
-        ]
-        conn.execute(
-            f"DELETE FROM recall_events WHERE source='candidate' AND record_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.execute(
-            f"DELETE FROM embeddings WHERE source='candidate' AND record_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.execute(
-            f"DELETE FROM search_fts WHERE source='candidate' AND record_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.execute(
-            f"DELETE FROM model_call_records WHERE record_type='candidate' "
-            f"AND record_id IN ({placeholders})",
-            orphan_ids,
-        )
-        conn.execute(f"DELETE FROM candidates WHERE id IN ({placeholders})", orphan_ids)
-        for raw_id in raw_ids:
-            conn.execute(
-                "DELETE FROM raw_turns WHERE id=? "
-                "AND NOT EXISTS(SELECT 1 FROM evidence WHERE raw_turn_id=?)",
-                (raw_id, raw_id),
-            )
-        for call_id in call_ids:
-            conn.execute(
-                "DELETE FROM model_calls WHERE id=? "
-                "AND NOT EXISTS(SELECT 1 FROM model_call_records WHERE call_id=?)",
-                (call_id, call_id),
-            )
         now = utc_now()
-        conn.executemany(
-            "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
-            [("migration-cleanup-orphan-promoted", candidate_id, now) for candidate_id in orphan_ids],
-        )
+        for orphan in orphan_rows:
+            orphan_id = str(orphan["id"])
+            pending = conn.execute(
+                "SELECT id FROM candidates WHERE content_hash=? AND status='pending' LIMIT 1",
+                (orphan["content_hash"],),
+            ).fetchone()
+            if pending:
+                canonical_id = str(pending["id"])
+                conn.execute("UPDATE evidence SET candidate_id=? WHERE candidate_id=?", (canonical_id, orphan_id))
+                conn.execute("UPDATE memory_events SET candidate_id=? WHERE candidate_id=?", (canonical_id, orphan_id))
+                conn.execute("UPDATE admission_decisions SET candidate_id=? WHERE candidate_id=?", (canonical_id, orphan_id))
+                conn.execute("UPDATE memory_review_items SET candidate_id=? WHERE candidate_id=?", (canonical_id, orphan_id))
+                conn.execute("UPDATE memory_review_items SET related_candidate_id=? WHERE related_candidate_id=?", (canonical_id, orphan_id))
+                conn.execute(
+                    "UPDATE recall_events SET record_id=? WHERE source='candidate' AND record_id=?",
+                    (canonical_id, orphan_id),
+                )
+                conn.execute(
+                    "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
+                    "SELECT call_id,'candidate',? FROM model_call_records "
+                    "WHERE record_type='candidate' AND record_id=?",
+                    (canonical_id, orphan_id),
+                )
+                conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                    (orphan_id,),
+                )
+                for link in conn.execute(
+                    "SELECT * FROM subject_links WHERE object_type='candidate' AND object_id=?", (orphan_id,)
+                ).fetchall():
+                    conn.execute(
+                        "INSERT OR IGNORE INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+                        "assignment_status,method,created_at,updated_at) VALUES(?,?, 'candidate',?,?,?,?,?,?)",
+                        (str(uuid.uuid4()), link["subject_id"], canonical_id, link["confidence"],
+                         link["assignment_status"], "migration_merge", link["created_at"], now),
+                    )
+                conn.execute("DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?", (orphan_id,))
+                conn.execute("DELETE FROM embeddings WHERE source='candidate' AND record_id=?", (orphan_id,))
+                conn.execute("DELETE FROM search_fts WHERE source='candidate' AND record_id=?", (orphan_id,))
+                conn.execute("DELETE FROM candidates WHERE id=?", (orphan_id,))
+                action = "migration-merge-unlinked-promoted"
+            else:
+                conn.execute(
+                    "UPDATE candidates SET status='pending',admission_state='legacy_review',"
+                    "source_type='legacy',admission_reason='Legacy promotion could not be linked safely',"
+                    "promoted_at=NULL,promotion_origin=NULL,rem_status='unreviewed',rem_reason=NULL,"
+                    "rem_reviewed_at=NULL WHERE id=?",
+                    (orphan_id,),
+                )
+                action = "migration-review-unlinked-promoted"
+            conn.execute(
+                "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
+                (action, orphan_id, now),
+            )
 
     @staticmethod
     def _count_evidence_days(
@@ -1003,6 +1080,7 @@ class MemoryDatabase:
         importance: float = 0.5,
         sensitive: bool = False,
         supersedes_id: str | None = None,
+        subject_id: str | None = None,
     ) -> MemoryRecord:
         if kind not in MEMORY_KINDS:
             raise ValueError(f"Unsupported memory kind: {kind}")
@@ -1041,6 +1119,16 @@ class MemoryDatabase:
                 occurred_at=now,
                 data={"content": content.strip(), "kind": kind, "origin": origin},
             )
+            if subject_id:
+                self._link_subject_in_tx(
+                    conn,
+                    subject_id,
+                    "memory",
+                    record_id,
+                    assignment_status="confirmed",
+                    method="explicit_remember",
+                    now=now,
+                )
             if supersedes_id:
                 conn.execute(
                     "UPDATE memories SET status='superseded',temporal_status='historical',"
@@ -1074,7 +1162,18 @@ class MemoryDatabase:
             row = conn.execute("SELECT * FROM memories WHERE id=?", (record_id,)).fetchone()
         return self._memory_from_row(row) if row else None
 
-    def update_memory(self, record_id: str, *, content: str, kind: str) -> MemoryRecord:
+    def update_memory(
+        self,
+        record_id: str,
+        *,
+        content: str,
+        kind: str,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        temporal_status: str | None = None,
+        temporal_reason: str | None = None,
+        subject_id: str | None = None,
+    ) -> MemoryRecord:
         if kind not in MEMORY_KINDS:
             raise ValueError(f"Unsupported memory kind: {kind}")
         now = utc_now()
@@ -1086,10 +1185,34 @@ class MemoryDatabase:
                 "INSERT INTO memory_revisions(memory_id,content,kind,changed_at) VALUES(?,?,?,?)",
                 (record_id, old["content"], old["kind"], now),
             )
+            next_temporal = temporal_status or old["temporal_status"]
+            if next_temporal not in {"current", "historical", "disputed"}:
+                raise ValueError("Unsupported temporal status")
             conn.execute(
-                "UPDATE memories SET content=?, kind=?, content_hash=?, updated_at=? WHERE id=?",
-                (content.strip(), kind, content_hash(content), now, record_id),
+                "UPDATE memories SET content=?,kind=?,content_hash=?,valid_from=?,valid_to=?,"
+                "temporal_status=?,temporal_reason=?,updated_at=? WHERE id=?",
+                (
+                    content.strip(),
+                    kind,
+                    content_hash(content),
+                    valid_from if valid_from is not None else old["valid_from"],
+                    valid_to if valid_to is not None else old["valid_to"],
+                    next_temporal,
+                    temporal_reason if temporal_reason is not None else old["temporal_reason"],
+                    now,
+                    record_id,
+                ),
             )
+            if subject_id:
+                self._link_subject_in_tx(
+                    conn,
+                    subject_id,
+                    "memory",
+                    record_id,
+                    assignment_status="confirmed",
+                    method="memory_edit",
+                    now=now,
+                )
             self._add_event(
                 conn,
                 "memory_updated",
@@ -1135,68 +1258,55 @@ class MemoryDatabase:
             )
 
     def purge_memory(self, record_id: str) -> dict[str, int]:
-        with self.transaction(immediate=True) as conn:
-            memory = conn.execute(
-                "SELECT id,content FROM memories WHERE id=?", (record_id,)
-            ).fetchone()
+        # Potentially expensive legacy model-text scanning is deliberately read-only.
+        with self.connect() as scan:
+            memory = scan.execute("SELECT id,content FROM memories WHERE id=?", (record_id,)).fetchone()
             if not memory:
                 raise KeyError(record_id)
-            candidate_rows = conn.execute(
+            candidate_rows = scan.execute(
                 "SELECT DISTINCT c.id,c.content FROM candidates c "
                 "LEFT JOIN evidence e ON e.candidate_id=c.id "
-                "LEFT JOIN memory_events me ON me.candidate_id=c.id "
-                "AND me.event_type='candidate_promoted' "
+                "LEFT JOIN memory_events me ON me.candidate_id=c.id AND me.event_type='candidate_promoted' "
                 "WHERE c.promoted_memory_id=? OR e.memory_id=? OR me.memory_id=?",
                 (record_id, record_id, record_id),
             ).fetchall()
             candidate_ids = [row["id"] for row in candidate_rows]
-            raw_ids = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT DISTINCT raw_turn_id FROM evidence WHERE memory_id=? AND raw_turn_id IS NOT NULL",
-                    (record_id,),
-                )
-            ]
-            references = [("memory", record_id)]
-            references.extend(("candidate", item) for item in candidate_ids)
-            references.extend(("raw_turn", item) for item in raw_ids)
+            raw_ids = [row[0] for row in scan.execute(
+                "SELECT DISTINCT raw_turn_id FROM evidence WHERE memory_id=? AND raw_turn_id IS NOT NULL",
+                (record_id,),
+            )]
+            references = [("memory", record_id), *[("candidate", item) for item in candidate_ids], *[("raw_turn", item) for item in raw_ids]]
             dream_run_ids: set[str] = set()
+            call_ids: set[str] = set()
             for record_type, linked_id in references:
-                dream_run_ids.update(
-                    row[0]
-                    for row in conn.execute(
-                        "SELECT DISTINCT mc.dream_run_id FROM model_calls mc "
-                        "JOIN model_call_records mcr ON mcr.call_id=mc.id "
-                        "WHERE mcr.record_type=? AND mcr.record_id=? "
-                        "AND mc.dream_run_id IS NOT NULL",
-                        (record_type, linked_id),
-                    )
-                )
-
-            # Databases created before schema v2 have no explicit call links.
-            # Remove legacy runs whose stored request/response contains deleted content.
-            raw_rows = []
-            if raw_ids:
-                placeholders = ",".join("?" for _ in raw_ids)
-                raw_rows = conn.execute(
-                    f"SELECT user_content,assistant_content FROM raw_turns WHERE id IN ({placeholders})",
-                    raw_ids,
+                linked_calls = scan.execute(
+                    "SELECT DISTINCT mc.id,mc.dream_run_id FROM model_calls mc JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                    "WHERE mcr.record_type=? AND mcr.record_id=?",
+                    (record_type, linked_id),
                 ).fetchall()
-            terms = [memory["content"]]
-            terms.extend(row["content"] for row in candidate_rows)
-            terms.extend(value for row in raw_rows for value in row if value)
+                call_ids.update(row["id"] for row in linked_calls)
+                dream_run_ids.update(row["dream_run_id"] for row in linked_calls if row["dream_run_id"])
+            raw_rows = [] if not raw_ids else scan.execute(
+                f"SELECT user_content,assistant_content FROM raw_turns WHERE id IN ({','.join('?' for _ in raw_ids)})",
+                raw_ids,
+            ).fetchall()
+            terms = [memory["content"], *[row["content"] for row in candidate_rows], *[value for row in raw_rows for value in row if value]]
             terms = [term for term in terms if len(term.strip()) >= 4]
             if terms:
-                for call in conn.execute(
-                    "SELECT dream_run_id,request_json,response_json FROM model_calls "
-                    "WHERE dream_run_id IS NOT NULL"
-                ):
+                for call in scan.execute("SELECT dream_run_id,request_json,response_json FROM model_calls WHERE dream_run_id IS NOT NULL"):
                     stored = f"{call['request_json']}\n{call['response_json'] or ''}"
                     if any(term in stored for term in terms):
                         dream_run_ids.add(call["dream_run_id"])
-
+        with self.transaction(immediate=True) as conn:
+            if not conn.execute("SELECT 1 FROM memories WHERE id=?", (record_id,)).fetchone():
+                raise KeyError(record_id)
             for run_id in dream_run_ids:
                 conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
+            for record_type, linked_id in references:
+                conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
+                    (record_type, linked_id),
+                )
             for candidate_id in candidate_ids:
                 conn.execute(
                     "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?",
@@ -1250,6 +1360,12 @@ class MemoryDatabase:
                 "INSERT INTO audit_events(action,record_id,created_at) VALUES('purge',?,?)",
                 (record_id, utc_now()),
             )
+            for call_id in call_ids:
+                conn.execute(
+                    "DELETE FROM model_calls WHERE id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM model_call_records WHERE call_id=?)",
+                    (call_id, call_id),
+                )
         return {
             "memories": 1,
             "candidates": len(candidate_ids),
@@ -1271,7 +1387,10 @@ class MemoryDatabase:
     def pending_raw_turns(self, limit: int = 500) -> list[sqlite3.Row]:
         with self.connect() as conn:
             return conn.execute(
-                "SELECT * FROM raw_turns WHERE ingested_at IS NULL ORDER BY observed_at LIMIT ?", (limit,)
+                "SELECT * FROM raw_turns WHERE ingested_at IS NULL "
+                "AND ingest_status IN ('pending','retrying') "
+                "AND (next_retry_at IS NULL OR next_retry_at<=?) ORDER BY observed_at LIMIT ?",
+                (utc_now(), limit),
             ).fetchall()
 
     def mark_turns_ingested(self, ids: list[str]) -> None:
@@ -1279,8 +1398,63 @@ class MemoryDatabase:
             return
         with self.transaction(immediate=True) as conn:
             conn.executemany(
-                "UPDATE raw_turns SET ingested_at=? WHERE id=?", [(utc_now(), item) for item in ids]
+                "UPDATE raw_turns SET ingested_at=?,ingest_status='processed',last_ingest_error=NULL,next_retry_at=NULL,"
+                "ingest_cursor=length(user_content) WHERE id=?", [(utc_now(), item) for item in ids]
             )
+
+    def advance_turn_ingestion(self, progress: dict[str, int]) -> None:
+        if not progress:
+            return
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            for turn_id, cursor in progress.items():
+                row = conn.execute("SELECT length(user_content) FROM raw_turns WHERE id=?", (turn_id,)).fetchone()
+                if not row:
+                    continue
+                finished = int(cursor) >= int(row[0])
+                conn.execute(
+                    "UPDATE raw_turns SET ingest_cursor=?,ingest_status=?,ingested_at=?,"
+                    "last_ingest_error=NULL,next_retry_at=NULL WHERE id=?",
+                    (int(cursor), "processed" if finished else "pending", now if finished else None, turn_id),
+                )
+
+    def mark_turn_ingestion_failed(self, ids: list[str], error: str) -> None:
+        if not ids:
+            return
+        with self.transaction(immediate=True) as conn:
+            for turn_id in ids:
+                row = conn.execute("SELECT ingest_attempts FROM raw_turns WHERE id=?", (turn_id,)).fetchone()
+                if not row:
+                    continue
+                attempts = int(row[0]) + 1
+                status = "quarantined" if attempts >= 3 else "retrying"
+                retry_at = None if status == "quarantined" else (
+                    datetime.now(UTC) + timedelta(minutes=2 ** attempts)
+                ).isoformat(timespec="seconds")
+                conn.execute(
+                    "UPDATE raw_turns SET ingest_status=?,ingest_attempts=?,last_ingest_error=?,next_retry_at=? WHERE id=?",
+                    (status, attempts, error[:500], retry_at, turn_id),
+                )
+
+    def ingestion_issues(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT id,session_id,observed_at,ingest_status,ingest_attempts,ingest_cursor,"
+                "last_ingest_error,next_retry_at,length(user_content) AS content_length "
+                "FROM raw_turns WHERE ingest_status IN ('retrying','quarantined') "
+                "ORDER BY observed_at DESC LIMIT ?", (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def retry_ingestion(self, turn_id: str) -> dict[str, Any]:
+        with self.transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE raw_turns SET ingest_status='pending',ingest_attempts=0,last_ingest_error=NULL,next_retry_at=NULL "
+                "WHERE id=? AND ingest_status IN ('retrying','quarantined')", (turn_id,),
+            ).rowcount
+            if not changed:
+                raise KeyError(turn_id)
+            return dict(conn.execute("SELECT * FROM raw_turns WHERE id=?", (turn_id,)).fetchone())
 
     def upsert_candidate(
         self,
@@ -1297,6 +1471,7 @@ class MemoryDatabase:
         admission_state: str = "admitted",
         source_type: str = "dream_user",
         admission_reason: str | None = None,
+        subject_id: str | None = None,
     ) -> CandidateRecord:
         if kind not in MEMORY_KINDS:
             kind = "fact"
@@ -1399,8 +1574,65 @@ class MemoryDatabase:
                 "UPDATE candidates SET evidence_days=? WHERE id=?",
                 (evidence_days, candidate_id),
             )
+            if subject_id:
+                conn.execute("UPDATE candidates SET subject_id=? WHERE id=?", (subject_id, candidate_id))
+                self._link_subject_in_tx(
+                    conn,
+                    subject_id,
+                    "candidate",
+                    candidate_id,
+                    assignment_status=(
+                        "confirmed" if source_type == "explicit_remember" else "automatic"
+                    ),
+                    method=source_type,
+                    now=now,
+                )
             row = conn.execute("SELECT * FROM candidates WHERE id=?", (candidate_id,)).fetchone()
         return self._candidate_from_row(row)
+
+    @staticmethod
+    def _link_subject_in_tx(
+        conn: sqlite3.Connection,
+        subject_id: str,
+        object_type: str,
+        object_id: str,
+        *,
+        assignment_status: str,
+        method: str,
+        now: str,
+        confidence: float = 1.0,
+    ) -> None:
+        subject = conn.execute(
+            "SELECT subject_type,status FROM subjects WHERE id=?", (subject_id,)
+        ).fetchone()
+        if not subject or subject["subject_type"] != "project" or subject["status"] == "archived":
+            raise KeyError(subject_id)
+        conn.execute(
+            "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+            "assignment_status,method,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET "
+            "confidence=max(confidence,excluded.confidence),assignment_status=excluded.assignment_status,"
+            "method=excluded.method,updated_at=excluded.updated_at",
+            (
+                str(uuid.uuid4()), subject_id, object_type, object_id, confidence,
+                assignment_status, method, now, now,
+            ),
+        )
+
+    def link_subject_record(
+        self,
+        subject_id: str,
+        object_type: str,
+        object_id: str,
+        *,
+        method: str = "manual",
+        assignment_status: str = "confirmed",
+    ) -> None:
+        with self.transaction(immediate=True) as conn:
+            self._link_subject_in_tx(
+                conn, subject_id, object_type, object_id,
+                assignment_status=assignment_status, method=method, now=utc_now(),
+            )
 
     def get_candidate(self, candidate_id: str) -> CandidateRecord | None:
         with self.connect() as conn:
@@ -1668,6 +1900,25 @@ class MemoryDatabase:
             conn.execute(
                 "DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (duplicate_id,)
             )
+            for link in conn.execute(
+                "SELECT * FROM subject_links WHERE object_type='candidate' AND object_id=?",
+                (duplicate_id,),
+            ).fetchall():
+                conn.execute(
+                    "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+                    "assignment_status,method,created_at,updated_at) VALUES(?,?, 'candidate',?,?,?,?,?,?) "
+                    "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET "
+                    "confidence=max(confidence,excluded.confidence),updated_at=excluded.updated_at",
+                    (str(uuid.uuid4()), link["subject_id"], canonical_id, link["confidence"],
+                     link["assignment_status"], "candidate_merge", link["created_at"], utc_now()),
+                )
+            conn.execute(
+                "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?", (duplicate_id,)
+            )
+            if not canonical["subject_id"] and duplicate["subject_id"]:
+                conn.execute(
+                    "UPDATE candidates SET subject_id=? WHERE id=?", (duplicate["subject_id"], canonical_id)
+                )
             conn.execute("DELETE FROM candidates WHERE id=?", (duplicate_id,))
             evidence_days = self._count_evidence_days(conn, canonical_id, timezone_name)
             recall_count = conn.execute(
@@ -1732,6 +1983,8 @@ class MemoryDatabase:
         origin: str = "review",
         promotion_lane: str = "manual",
         dream_run_id: str | None = None,
+        review_id: str | None = None,
+        review_resolution: str | None = None,
     ) -> MemoryRecord:
         now = utc_now()
         with self.transaction(immediate=True) as conn:
@@ -1741,103 +1994,107 @@ class MemoryDatabase:
             if not candidate:
                 raise KeyError(candidate_id)
             memory_content = (edited_content or candidate["content"]).strip()
-            existing = conn.execute(
-                "SELECT * FROM memories WHERE content_hash=? AND status='active'",
-                (content_hash(memory_content),),
-            ).fetchone()
-            if existing:
-                memory_id = existing["id"]
-            else:
-                memory_id = str(uuid.uuid4())
-                conn.execute(
-                    """INSERT INTO memories(
-                        id,content,kind,status,origin,confidence,importance,sensitive,
-                        supersedes_id,content_hash,created_at,updated_at
-                    ) VALUES(?,?,?,'active',?,?,?,?,?,?,?,?)""",
-                    (
-                        memory_id,
-                        memory_content,
-                        candidate["kind"],
-                        origin,
-                        float(candidate["model_confidence"]),
-                        0.5,
-                        int(candidate["sensitive"]),
-                        None,
-                        content_hash(memory_content),
-                        now,
-                        now,
-                    ),
-                )
-                self._add_event(
-                    conn,
-                    "memory_created",
-                    candidate_id=candidate_id,
-                    memory_id=memory_id,
-                    dream_run_id=dream_run_id,
-                    occurred_at=now,
-                    data={
-                        "content": memory_content,
-                        "kind": candidate["kind"],
-                        "origin": origin,
-                    },
-                )
-                # Conflict resolution is deliberately handled by the review service.
-                # Promoting a candidate must never silently supersede an active memory.
-            conn.execute(
-                "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=?,"
-                "promoted_memory_id=? WHERE id=?",
-                (now, origin, memory_id, candidate_id),
+            row = self._promote_candidate_in_tx(
+                conn, candidate, memory_content=memory_content, origin=origin,
+                promotion_lane=promotion_lane, dream_run_id=dream_run_id, now=now,
             )
+            if review_id:
+                changed = conn.execute(
+                    "UPDATE memory_review_items SET status='resolved',resolution=?,resolved_at=? "
+                    "WHERE id=? AND status='open'",
+                    (review_resolution or promotion_lane, now, review_id),
+                ).rowcount
+                if changed != 1:
+                    raise KeyError(review_id)
+        return self._memory_from_row(row)
+
+    def _promote_candidate_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        candidate: sqlite3.Row,
+        *,
+        memory_content: str,
+        origin: str,
+        promotion_lane: str,
+        dream_run_id: str | None,
+        now: str,
+    ) -> sqlite3.Row:
+        """Promote and carry evidence, model lineage and subject scope atomically."""
+        candidate_id = str(candidate["id"])
+        existing = conn.execute(
+            "SELECT * FROM memories WHERE content_hash=? AND status='active'",
+            (content_hash(memory_content),),
+        ).fetchone()
+        memory_id = str(existing["id"]) if existing else str(uuid.uuid4())
+        if not existing:
             conn.execute(
-                "UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory_id, candidate_id)
-            )
-            conn.execute(
-                "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
-                "SELECT call_id,'memory',? FROM model_call_records "
-                "WHERE record_type='candidate' AND record_id=?",
-                (memory_id, candidate_id),
+                """INSERT INTO memories(
+                    id,content,kind,status,origin,confidence,importance,sensitive,
+                    supersedes_id,content_hash,created_at,updated_at
+                ) VALUES(?,?,?,'active',?,?,?,?,?,?,?,?)""",
+                (memory_id, memory_content, candidate["kind"], origin,
+                 float(candidate["model_confidence"]), 0.5, int(candidate["sensitive"]),
+                 None, content_hash(memory_content), now, now),
             )
             self._add_event(
-                conn,
-                "candidate_promoted",
-                candidate_id=candidate_id,
-                memory_id=memory_id,
-                dream_run_id=dream_run_id,
-                occurred_at=now,
-                data={
-                    "origin": origin,
-                    "promotion_lane": promotion_lane,
-                    "candidate_content": candidate["content"],
-                    "memory_content": memory_content,
-                    "model_confidence": float(candidate["model_confidence"]),
-                    "evidence_days": int(candidate["evidence_days"]),
-                    "recall_count": int(candidate["recall_count"]),
-                    "unique_query_count": int(candidate["unique_query_count"]),
-                },
+                conn, "memory_created", candidate_id=candidate_id, memory_id=memory_id,
+                dream_run_id=dream_run_id, occurred_at=now,
+                data={"content": memory_content, "kind": candidate["kind"], "origin": origin},
             )
-
-            if existing:
-                self._add_event(
-                    conn,
-                    "candidate_absorbed",
-                    candidate_id=candidate_id,
-                    memory_id=memory_id,
-                    dream_run_id=dream_run_id,
-                    occurred_at=now,
-                    data={"reason": "identical_content", "origin": origin},
-                )
-            if candidate["subject_id"]:
-                conn.execute(
-                    "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
-                    "assignment_status,method,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
-                    "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET updated_at=excluded.updated_at",
-                    (
-                        str(uuid.uuid4()), candidate["subject_id"], "memory", memory_id,
-                        1.0, "confirmed", "candidate_promotion", now, now,
-                    ),
-                )
-            row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-        return self._memory_from_row(row)
+        conn.execute(
+            "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=?,"
+            "promoted_memory_id=? WHERE id=?", (now, origin, memory_id, candidate_id),
+        )
+        conn.execute("UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory_id, candidate_id))
+        conn.execute(
+            "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
+            "SELECT call_id,'memory',? FROM model_call_records "
+            "WHERE record_type='candidate' AND record_id=?", (memory_id, candidate_id),
+        )
+        self._add_event(
+            conn, "candidate_promoted", candidate_id=candidate_id, memory_id=memory_id,
+            dream_run_id=dream_run_id, occurred_at=now,
+            data={"origin": origin, "promotion_lane": promotion_lane,
+                  "candidate_content": candidate["content"], "memory_content": memory_content,
+                  "model_confidence": float(candidate["model_confidence"]),
+                  "evidence_days": int(candidate["evidence_days"]),
+                  "recall_count": int(candidate["recall_count"]),
+                  "unique_query_count": int(candidate["unique_query_count"])},
+        )
+        if existing:
+            self._add_event(
+                conn, "candidate_absorbed", candidate_id=candidate_id, memory_id=memory_id,
+                dream_run_id=dream_run_id, occurred_at=now,
+                data={"reason": "identical_content", "origin": origin},
+            )
+        existing_project_scope = bool(conn.execute(
+            "SELECT 1 FROM subject_links sl JOIN subjects s ON s.id=sl.subject_id "
+            "WHERE sl.object_type='memory' AND sl.object_id=? AND s.subject_type='project' LIMIT 1",
+            (memory_id,),
+        ).fetchone())
+        links = conn.execute(
+            "SELECT sl.*,s.subject_type FROM subject_links sl JOIN subjects s ON s.id=sl.subject_id "
+            "WHERE sl.object_type='candidate' AND sl.object_id=?", (candidate_id,),
+        ).fetchall()
+        if not links and candidate["subject_id"]:
+            subject = conn.execute("SELECT subject_type FROM subjects WHERE id=?", (candidate["subject_id"],)).fetchone()
+            if subject:
+                links = [{"subject_id": candidate["subject_id"], "subject_type": subject["subject_type"],
+                          "confidence": 1.0, "assignment_status": (
+                              "confirmed" if candidate["source_type"] == "explicit_remember" else "automatic"
+                          ), "created_at": now}]
+        for link in links:
+            if existing and link["subject_type"] == "project" and not existing_project_scope:
+                continue
+            conn.execute(
+                "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+                "assignment_status,method,created_at,updated_at) VALUES(?,?, 'memory',?,?,?,?,?,?) "
+                "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET "
+                "confidence=max(confidence,excluded.confidence),updated_at=excluded.updated_at",
+                (str(uuid.uuid4()), link["subject_id"], memory_id, link["confidence"],
+                 link["assignment_status"], "candidate_promotion", link["created_at"], now),
+            )
+        return conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
 
     def reject_candidate(self, candidate_id: str) -> None:
         now = utc_now()
@@ -1982,6 +2239,7 @@ class MemoryDatabase:
         audit_run_id: str | None = None,
         subject_id: str | None = None,
         queue: str | None = None,
+        proposal: dict[str, Any] | None = None,
     ) -> ReviewItem:
         fingerprint = self.make_review_fingerprint(
             issue_type,
@@ -2011,8 +2269,8 @@ class MemoryDatabase:
                     id,issue_type,status,proposed_action,proposed_content,reason,confidence,
                     candidate_id,related_candidate_id,primary_memory_id,related_memory_id,
                     source,basis_hash,fingerprint,dream_run_id,audit_run_id,created_at,updated_at,
-                    subject_id,queue
-                ) VALUES(?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    subject_id,queue,proposal_json
+                ) VALUES(?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     review_id,
                     issue_type,
@@ -2033,6 +2291,7 @@ class MemoryDatabase:
                     now,
                     subject_id,
                     queue,
+                    json.dumps(proposal or {}, ensure_ascii=False),
                 ),
             )
             self._add_event(
@@ -2317,6 +2576,30 @@ class MemoryDatabase:
             row = conn.execute("SELECT * FROM memories WHERE id=?", (record_id,)).fetchone()
         return self._memory_from_row(row)
 
+    def refresh_temporal_statuses(self, *, now: str | None = None) -> int:
+        current = now or utc_now()
+        changed = 0
+        with self.transaction(immediate=True) as conn:
+            rows = conn.execute(
+                "SELECT id,valid_to FROM memories WHERE status='active' "
+                "AND temporal_status='current' AND valid_to IS NOT NULL "
+                "AND CASE WHEN length(valid_to)=10 THEN date(valid_to)<date(?) "
+                "ELSE datetime(valid_to)<datetime(?) END",
+                (current, current),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "UPDATE memories SET temporal_status='historical',"
+                    "temporal_reason=coalesce(temporal_reason,'Validity interval ended'),updated_at=? WHERE id=?",
+                    (current, row["id"]),
+                )
+                self._add_event(
+                    conn, "memory_temporal_changed", memory_id=row["id"], occurred_at=current,
+                    data={"temporal_status": "historical", "reason": "valid_to_elapsed"},
+                )
+                changed += 1
+        return changed
+
     def supersede_memory(self, new_memory_id: str, old_memory_id: str) -> MemoryRecord:
         if new_memory_id == old_memory_id:
             raise ValueError("A memory cannot supersede itself")
@@ -2391,62 +2674,11 @@ class MemoryDatabase:
                 memory_content = str(item.get("content", "")).strip()
                 if not memory_content:
                     raise ValueError("Deep create action has empty content")
-                existing = conn.execute(
-                    "SELECT * FROM memories WHERE content_hash=? AND status='active'",
-                    (content_hash(memory_content),),
-                ).fetchone()
-                if existing:
-                    memory_id = existing["id"]
-                else:
-                    memory_id = str(uuid.uuid4())
-                    conn.execute(
-                        """INSERT INTO memories(
-                            id,content,kind,status,origin,confidence,importance,sensitive,
-                            supersedes_id,content_hash,created_at,updated_at
-                        ) VALUES(?,?,?,'active','dream',?,?,?,NULL,?,?,?)""",
-                        (
-                            memory_id,
-                            memory_content,
-                            candidate["kind"],
-                            float(candidate["model_confidence"]),
-                            0.5,
-                            int(candidate["sensitive"]),
-                            content_hash(memory_content),
-                            now,
-                            now,
-                        ),
-                    )
-                    self._add_event(
-                        conn,
-                        "memory_created",
-                        candidate_id=candidate_id,
-                        memory_id=memory_id,
-                        dream_run_id=dream_run_id,
-                        occurred_at=now,
-                        data={"content": memory_content, "kind": candidate["kind"], "origin": "dream"},
-                    )
-                conn.execute(
-                    "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin='dream',"
-                    "promoted_memory_id=? WHERE id=?",
-                    (now, memory_id, candidate_id),
+                memory = self._promote_candidate_in_tx(
+                    conn, candidate, memory_content=memory_content, origin="dream",
+                    promotion_lane="different_dates", dream_run_id=dream_run_id, now=now,
                 )
-                conn.execute(
-                    "UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory_id, candidate_id)
-                )
-                self._add_event(
-                    conn,
-                    "candidate_promoted",
-                    candidate_id=candidate_id,
-                    memory_id=memory_id,
-                    dream_run_id=dream_run_id,
-                    occurred_at=now,
-                    data={
-                        "origin": "dream",
-                        "promotion_lane": "different_dates",
-                        "candidate_content": candidate["content"],
-                        "memory_content": memory_content,
-                    },
-                )
+                memory_id = str(memory["id"])
                 promoted.append(memory_id)
 
             for item in reviews:
@@ -2515,55 +2747,51 @@ class MemoryDatabase:
         privacy: bool = False,
         timezone_name: str = "system",
     ) -> dict[str, int]:
-        with self.transaction(immediate=True) as conn:
-            candidate = conn.execute(
-                "SELECT id,content FROM candidates WHERE id=?", (candidate_id,)
-            ).fetchone()
+        with self.connect() as scan:
+            candidate = scan.execute("SELECT id,content FROM candidates WHERE id=?", (candidate_id,)).fetchone()
             if not candidate:
                 raise KeyError(candidate_id)
-            raw_ids = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT DISTINCT raw_turn_id FROM evidence WHERE candidate_id=? "
-                    "AND raw_turn_id IS NOT NULL",
-                    (candidate_id,),
-                )
-            ]
+            raw_ids = [row[0] for row in scan.execute(
+                "SELECT DISTINCT raw_turn_id FROM evidence WHERE candidate_id=? AND raw_turn_id IS NOT NULL",
+                (candidate_id,),
+            )]
             affected_candidate_ids: list[str] = []
             if privacy and raw_ids:
                 placeholders = ",".join("?" for _ in raw_ids)
-                affected_candidate_ids = [
-                    row[0]
-                    for row in conn.execute(
-                        f"SELECT DISTINCT candidate_id FROM evidence WHERE raw_turn_id IN ({placeholders}) "
-                        "AND candidate_id IS NOT NULL AND candidate_id<>?",
-                        [*raw_ids, candidate_id],
-                    )
-                ]
+                affected_candidate_ids = [row[0] for row in scan.execute(
+                    f"SELECT DISTINCT candidate_id FROM evidence WHERE raw_turn_id IN ({placeholders}) "
+                    "AND candidate_id IS NOT NULL AND candidate_id<>?", [*raw_ids, candidate_id],
+                )]
             dream_run_ids: set[str] = set()
+            call_ids: set[str] = set()
+            references = [("candidate", candidate_id), *[("raw_turn", raw_id) for raw_id in raw_ids]]
             if privacy:
-                references = [("candidate", candidate_id)]
-                references.extend(("raw_turn", raw_id) for raw_id in raw_ids)
                 for record_type, record_id in references:
-                    dream_run_ids.update(
-                        row[0]
-                        for row in conn.execute(
-                            "SELECT DISTINCT mc.dream_run_id FROM model_calls mc "
-                            "JOIN model_call_records mcr ON mcr.call_id=mc.id "
-                            "WHERE mcr.record_type=? AND mcr.record_id=? "
-                            "AND mc.dream_run_id IS NOT NULL",
-                            (record_type, record_id),
-                        )
-                    )
-                for call in conn.execute(
-                    "SELECT dream_run_id,request_json,response_json FROM model_calls "
-                    "WHERE dream_run_id IS NOT NULL"
+                    linked = scan.execute(
+                        "SELECT DISTINCT mc.id,mc.dream_run_id FROM model_calls mc "
+                        "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                        "WHERE mcr.record_type=? AND mcr.record_id=?", (record_type, record_id),
+                    ).fetchall()
+                    call_ids.update(row["id"] for row in linked)
+                    dream_run_ids.update(row["dream_run_id"] for row in linked if row["dream_run_id"])
+                for call in scan.execute(
+                    "SELECT id,dream_run_id,request_json,response_json FROM model_calls WHERE dream_run_id IS NOT NULL"
                 ):
                     stored = f"{call['request_json']}\n{call['response_json'] or ''}"
                     if candidate["content"] in stored:
+                        call_ids.add(call["id"])
                         dream_run_ids.add(call["dream_run_id"])
+        with self.transaction(immediate=True) as conn:
+            if not conn.execute("SELECT 1 FROM candidates WHERE id=?", (candidate_id,)).fetchone():
+                raise KeyError(candidate_id)
+            if privacy:
                 for run_id in dream_run_ids:
                     conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
+                for record_type, record_id in references:
+                    conn.execute(
+                        "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
+                        (record_type, record_id),
+                    )
             conn.execute(
                 "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
                 (candidate_id,),
@@ -2605,6 +2833,11 @@ class MemoryDatabase:
                 "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
                 ("purge-candidate" if privacy else "cleanup-candidate", candidate_id, utc_now()),
             )
+            for call_id in call_ids:
+                conn.execute(
+                    "DELETE FROM model_calls WHERE id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM model_call_records WHERE call_id=?)", (call_id, call_id),
+                )
         return {
             "candidates": 1,
             "raw_turns": len(raw_ids) if privacy else 0,
@@ -2665,71 +2898,71 @@ class MemoryDatabase:
         expired_cutoff = (current - timedelta(days=candidate_expired_days)).isoformat()
         rejected_cutoff = (current - timedelta(days=rejected_candidate_days)).isoformat()
         current_iso = current.isoformat(timespec="seconds")
-        with self.transaction(immediate=True) as conn:
-            expiring_ids = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT id FROM candidates WHERE status='pending' "
-                    "AND coalesce(last_activity_at,last_seen_at) < ?",
-                    (inactive_cutoff,),
-                )
+        batch_size = 200
+        with self.connect() as conn:
+            expiring_ids = [row[0] for row in conn.execute(
+                "SELECT id FROM candidates WHERE status='pending' AND coalesce(last_activity_at,last_seen_at) < ?",
+                (inactive_cutoff,),
+            )]
+        reason = f"{candidate_inactive_days} 天无活动自动过期"
+        expired = 0
+        for start in range(0, len(expiring_ids), batch_size):
+            with self.transaction(immediate=True) as conn:
+                for candidate_id in expiring_ids[start : start + batch_size]:
+                    changed = conn.execute(
+                        "UPDATE candidates SET status='expired',expired_at=?,rem_reason=coalesce(rem_reason,?) "
+                        "WHERE id=? AND status='pending'", (current_iso, reason, candidate_id),
+                    ).rowcount
+                    if changed:
+                        expired += 1
+                        self._add_event(conn, "candidate_expired", candidate_id=candidate_id,
+                                        occurred_at=current_iso, data={"reason": reason, "source": "retention"})
+        with self.connect() as conn:
+            purge_ids = [row[0] for row in conn.execute(
+                "SELECT id FROM candidates WHERE "
+                "(status='expired' AND expired_at IS NOT NULL AND expired_at < ?) OR "
+                "(status='rejected' AND rejected_at IS NOT NULL AND rejected_at < ?)",
+                (expired_cutoff, rejected_cutoff),
+            )]
+        for start in range(0, len(purge_ids), batch_size):
+            with self.transaction(immediate=True) as conn:
+                for candidate_id in purge_ids[start : start + batch_size]:
+                    conn.execute("DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,))
+                    conn.execute("DELETE FROM recall_events WHERE record_id=? AND source='candidate'", (candidate_id,))
+                    conn.execute("DELETE FROM embeddings WHERE record_id=? AND source='candidate'", (candidate_id,))
+                    conn.execute("DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (candidate_id,))
+                    conn.execute("DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?", (candidate_id,))
+                    conn.execute("DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?", (candidate_id,))
+                    conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+
+        def delete_batched(table: str, column: str, cutoff: str) -> int:
+            total = 0
+            while True:
+                with self.transaction(immediate=True) as conn:
+                    changed = conn.execute(
+                        f"DELETE FROM {table} WHERE rowid IN "
+                        f"(SELECT rowid FROM {table} WHERE {column} < ? LIMIT {batch_size})",
+                        (cutoff,),
+                    ).rowcount
+                total += changed
+                if changed < batch_size:
+                    return total
+
+        raw = delete_batched("raw_turns", "observed_at", raw_cutoff)
+        calls = delete_batched("model_calls", "created_at", model_cutoff)
+        traces = delete_batched("recall_events", "created_at", model_cutoff)
+        admission_logs = delete_batched("admission_decisions", "created_at", model_cutoff)
+        with self.connect() as conn:
+            evidence_days = [
+                (self._count_evidence_days(conn, row[0], timezone_name), row[0])
+                for row in conn.execute("SELECT id FROM candidates")
             ]
-            for candidate_id in expiring_ids:
-                reason = f"{candidate_inactive_days} 天无活动自动过期"
-                conn.execute(
-                    "UPDATE candidates SET status='expired',expired_at=?,rem_reason=coalesce(rem_reason,?) "
-                    "WHERE id=? AND status='pending'",
-                    (current_iso, reason, candidate_id),
-                )
-                self._add_event(
-                    conn,
-                    "candidate_expired",
-                    candidate_id=candidate_id,
-                    occurred_at=current_iso,
-                    data={"reason": reason, "source": "retention"},
-                )
-            expired = len(expiring_ids)
-            purge_ids = [
-                row[0]
-                for row in conn.execute(
-                    "SELECT id FROM candidates WHERE "
-                    "(status='expired' AND expired_at IS NOT NULL AND expired_at < ?) OR "
-                    "(status='rejected' AND rejected_at IS NOT NULL AND rejected_at < ?)",
-                    (expired_cutoff, rejected_cutoff),
-                )
-            ]
-            for candidate_id in purge_ids:
-                conn.execute(
-                    "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
-                )
-                conn.execute(
-                    "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
-                    (candidate_id,),
-                )
-                conn.execute(
-                    "DELETE FROM embeddings WHERE record_id=? AND source='candidate'", (candidate_id,)
-                )
-                conn.execute(
-                    "DELETE FROM search_fts WHERE record_id=? AND source='candidate'", (candidate_id,)
-                )
-                conn.execute(
-                    "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
-                    (candidate_id,),
-                )
-                conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
-            raw = conn.execute("DELETE FROM raw_turns WHERE observed_at < ?", (raw_cutoff,)).rowcount
-            remaining_ids = [row[0] for row in conn.execute("SELECT id FROM candidates")]
-            for candidate_id in remaining_ids:
-                days = self._count_evidence_days(conn, candidate_id, timezone_name)
-                conn.execute(
+        for start in range(0, len(evidence_days), batch_size):
+            with self.transaction(immediate=True) as conn:
+                conn.executemany(
                     "UPDATE candidates SET evidence_days=? WHERE id=?",
-                    (days, candidate_id),
+                    evidence_days[start : start + batch_size],
                 )
-            calls = conn.execute("DELETE FROM model_calls WHERE created_at < ?", (model_cutoff,)).rowcount
-            traces = conn.execute("DELETE FROM recall_events WHERE created_at < ?", (model_cutoff,)).rowcount
-            admission_logs = conn.execute(
-                "DELETE FROM admission_decisions WHERE created_at < ?", (model_cutoff,)
-            ).rowcount
         return {
             "raw_turns": raw,
             "model_calls": calls,
@@ -2758,7 +2991,7 @@ class MemoryDatabase:
             conn.execute("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))
 
     def backup(self, target: Path) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
+        secure_directory(target.parent)
         source = self.connect()
         destination = sqlite3.connect(target)
         try:
@@ -2766,6 +2999,7 @@ class MemoryDatabase:
         finally:
             destination.close()
             source.close()
+        secure_file(target)
 
     def maintain(self, *, vacuum: bool = False) -> dict[str, Any]:
         conn = self.connect()
@@ -2857,6 +3091,7 @@ class MemoryDatabase:
             resolution=row["resolution"],
             subject_id=row["subject_id"],
             queue=row["queue"] or "decision",
+            proposal=json.loads(row["proposal_json"] or "{}"),
         )
 
     def _audit_run_from_row(self, row: sqlite3.Row) -> AuditRun:

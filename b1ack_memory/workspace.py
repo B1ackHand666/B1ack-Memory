@@ -11,8 +11,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import MemoryDatabase, content_hash, utc_now
+from .db import MemoryDatabase, content_hash, eligible_memory_predicate, utc_now
 from .llm import LlmError, OpenAICompatibleClient
+from .security import permission_report, secure_directory, secure_file
 
 SUBJECT_TYPES = {"project", "person", "organization", "tool", "topic"}
 SUBJECT_STATUSES = {"active", "paused", "archived"}
@@ -35,6 +36,14 @@ and durable facts. Historical and suggested items are context only and must not 
 
 def _normal(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
+
+
+def _alias_in_query(alias: str, query: str) -> bool:
+    if not alias:
+        return False
+    if re.search(r"[\u3400-\u9fff\uf900-\ufaff]", alias):
+        return alias == query if len(alias) == 1 else alias in query
+    return bool(re.search(rf"(?<![\w-]){re.escape(alias)}(?![\w-])", query, re.UNICODE))
 
 
 def _slug(value: str) -> str:
@@ -182,18 +191,69 @@ class WorkspaceManager:
             source = conn.execute("SELECT * FROM subjects WHERE id=?", (source_id,)).fetchone()
             if not canonical or not source:
                 raise KeyError(source_id if not source else canonical_id)
+            if canonical["subject_type"] != source["subject_type"]:
+                raise ValueError("Only subjects of the same type can be merged")
             for alias in conn.execute("SELECT alias,alias_type FROM subject_aliases WHERE subject_id=?", (source_id,)):
                 self._insert_alias(conn, canonical_id, alias["alias"], alias["alias_type"], now)
-            conn.execute("UPDATE work_items SET subject_id=?,updated_at=? WHERE subject_id=?", (canonical_id, now, source_id))
-            if conn.execute(
-                "SELECT 1 FROM summary_versions WHERE subject_id=? AND status='current'", (canonical_id,)
-            ).fetchone():
-                conn.execute(
-                    "UPDATE summary_versions SET status='superseded' WHERE subject_id=? AND status='current'",
-                    (source_id,),
+            for item in conn.execute("SELECT * FROM work_items WHERE subject_id=?", (source_id,)).fetchall():
+                duplicate = None
+                if item["status"] in {"suggested", "active"}:
+                    duplicate = conn.execute(
+                        "SELECT id FROM work_items WHERE subject_id=? AND content_hash=? "
+                        "AND status IN ('suggested','active') LIMIT 1",
+                        (canonical_id, item["content_hash"]),
+                    ).fetchone()
+                if duplicate:
+                    conn.execute(
+                        "INSERT INTO work_item_revisions(work_item_id,snapshot_json,changed_at,change_reason) "
+                        "VALUES(?,?,?,'subject_merge_duplicate')",
+                        (item["id"], json.dumps(dict(item), ensure_ascii=False), now),
+                    )
+                    conn.execute(
+                        "UPDATE work_items SET subject_id=?,status='archived',updated_at=? WHERE id=?",
+                        (canonical_id, now, item["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE work_items SET subject_id=?,updated_at=? WHERE id=?",
+                        (canonical_id, now, item["id"]),
+                    )
+            scopes = [
+                row[0] for row in conn.execute(
+                    "SELECT DISTINCT scope FROM summary_versions WHERE subject_id=?", (source_id,)
                 )
+            ]
+            for scope in scopes:
+                if conn.execute(
+                    "SELECT 1 FROM summary_versions WHERE subject_id=? AND scope=? AND status='current'",
+                    (canonical_id, scope),
+                ).fetchone():
+                    conn.execute(
+                        "UPDATE summary_versions SET status='superseded' WHERE subject_id=? "
+                        "AND scope=? AND status='current'", (source_id, scope),
+                    )
             conn.execute("UPDATE summary_versions SET subject_id=? WHERE subject_id=?", (canonical_id, source_id))
             conn.execute("UPDATE session_subject_affinity SET subject_id=?,updated_at=? WHERE subject_id=?", (canonical_id, now, source_id))
+            conn.execute("UPDATE candidates SET subject_id=? WHERE subject_id=?", (canonical_id, source_id))
+            conn.execute("UPDATE raw_turns SET subject_id=? WHERE subject_id=?", (canonical_id, source_id))
+            conn.execute("UPDATE memory_review_items SET subject_id=? WHERE subject_id=?", (canonical_id, source_id))
+            relations = conn.execute(
+                "SELECT * FROM subject_relations WHERE source_subject_id=? OR target_subject_id=?",
+                (source_id, source_id),
+            ).fetchall()
+            for relation in relations:
+                relation_source = canonical_id if relation["source_subject_id"] == source_id else relation["source_subject_id"]
+                relation_target = canonical_id if relation["target_subject_id"] == source_id else relation["target_subject_id"]
+                if relation_source != relation_target:
+                    conn.execute(
+                        "INSERT INTO subject_relations(id,source_subject_id,relation_type,target_subject_id,"
+                        "confidence,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(source_subject_id,relation_type,target_subject_id) DO UPDATE SET "
+                        "confidence=max(confidence,excluded.confidence),status='active',updated_at=excluded.updated_at",
+                        (str(uuid.uuid4()), relation_source, relation["relation_type"], relation_target,
+                         relation["confidence"], relation["status"], relation["created_at"], now),
+                    )
+                conn.execute("DELETE FROM subject_relations WHERE id=?", (relation["id"],))
             links = conn.execute("SELECT * FROM subject_links WHERE subject_id=?", (source_id,)).fetchall()
             for link in links:
                 conn.execute(
@@ -204,8 +264,26 @@ class WorkspaceManager:
                     (str(uuid.uuid4()), canonical_id, link["object_type"], link["object_id"], link["confidence"],
                      link["assignment_status"], "merge", link["created_at"], now),
                 )
+            conn.execute("DELETE FROM subject_links WHERE subject_id=?", (source_id,))
+            for job in conn.execute(
+                "SELECT * FROM projection_jobs WHERE target_id=?", (source_id,)
+            ).fetchall():
+                conn.execute(
+                    "INSERT OR IGNORE INTO projection_jobs(id,projection_type,target_id,revision,status,attempts,"
+                    "error,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (str(uuid.uuid4()), job["projection_type"], canonical_id, job["revision"], job["status"],
+                     job["attempts"], job["error"], job["created_at"], now),
+                )
+            conn.execute("DELETE FROM projection_jobs WHERE target_id=?", (source_id,))
             conn.execute("DELETE FROM subjects WHERE id=?", (source_id,))
             conn.execute("UPDATE subjects SET updated_at=? WHERE id=?", (now, canonical_id))
+            violations = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if violations:
+                raise RuntimeError(f"Subject merge left foreign-key violations: {len(violations)}")
+            conn.execute(
+                "INSERT INTO audit_events(action,record_id,created_at) VALUES('subject-merge',?,?)",
+                (f"{source_id}->{canonical_id}", now),
+            )
         self.queue_projection("all", "")
         return self.get_subject(canonical_id)
 
@@ -389,16 +467,7 @@ class WorkspaceManager:
                 ).fetchone()
                 if row:
                     return {"project": dict(row), "confidence": 1.0, "reason": "explicit_project_id", "ambiguous": False}
-            if workspace:
-                normalized = _normal(workspace)
-                row = conn.execute(
-                    "SELECT s.* FROM subject_aliases a JOIN subjects s ON s.id=a.subject_id "
-                    "WHERE a.alias_type='workspace' AND a.alias_normalized=? "
-                    "AND s.subject_type='project' AND s.status='active' LIMIT 1",
-                    (normalized,),
-                ).fetchone()
-                if row:
-                    return {"project": dict(row), "confidence": 0.98, "reason": "workspace_alias", "ambiguous": False}
+                raise KeyError(explicit_project_id)
             if session_id:
                 row = conn.execute(
                     "SELECT s.*,a.confidence,a.confirmed FROM session_subject_affinity a "
@@ -409,6 +478,18 @@ class WorkspaceManager:
                 if row and bool(row["confirmed"]):
                     project = {key: row[key] for key in row.keys() if key not in {"confidence", "confirmed"}}
                     return {"project": project, "confidence": max(0.97, float(row["confidence"])), "reason": "confirmed_session", "ambiguous": False}
+            if workspace:
+                normalized = _normal(workspace)
+                rows = conn.execute(
+                    "SELECT s.* FROM subject_aliases a JOIN subjects s ON s.id=a.subject_id "
+                    "WHERE a.alias_type='workspace' AND a.alias_normalized=? "
+                    "AND s.subject_type='project' AND s.status='active' ORDER BY s.id",
+                    (normalized,),
+                ).fetchall()
+                if len(rows) == 1:
+                    return {"project": dict(rows[0]), "confidence": 0.98, "reason": "workspace_alias", "ambiguous": False}
+                if len(rows) > 1:
+                    return {"project": None, "confidence": 0.98, "reason": "ambiguous_workspace_alias", "ambiguous": True}
             projects = conn.execute(
                 "SELECT s.*,a.alias,a.alias_normalized FROM subjects s "
                 "JOIN subject_aliases a ON a.subject_id=s.id "
@@ -416,10 +497,17 @@ class WorkspaceManager:
             ).fetchall()
         normalized_query = _normal(query)
         matches: dict[str, tuple[float, dict[str, Any]]] = {}
+        exact_matches: dict[str, dict[str, Any]] = {}
+        contained_matches: dict[str, dict[str, Any]] = {}
         for row in projects:
             alias = str(row["alias_normalized"])
-            if alias and alias in normalized_query:
+            project = {key: row[key] for key in row.keys() if key not in {"alias", "alias_normalized"}}
+            if alias and alias == normalized_query:
+                score = 0.99
+                exact_matches[str(row["id"])] = project
+            elif _alias_in_query(alias, normalized_query):
                 score = 0.95 if alias == _normal(str(row["name"])) else 0.93
+                contained_matches[str(row["id"])] = project
             elif alias:
                 # Fuzzy matches never cross the automatic-assignment threshold.
                 # They exist only to create a user-visible organization suggestion.
@@ -431,18 +519,26 @@ class WorkspaceManager:
                     if compact_alias and len(compact_query) >= len(compact_alias)
                     else [compact_query]
                 )
+                minimum = 2 if re.search(r"[\u3400-\u9fff\uf900-\ufaff]", alias) else 3
                 similarity = max(
                     (SequenceMatcher(None, compact_alias, window).ratio() for window in windows),
                     default=0.0,
-                )
+                ) if len(compact_alias) >= minimum else 0.0
                 score = 0.70 + min(0.19, (similarity - 0.70) * 0.64) if similarity >= 0.70 else 0.0
             else:
                 score = 0.0
             if score:
-                project = {key: row[key] for key in row.keys() if key not in {"alias", "alias_normalized"}}
                 previous = matches.get(str(row["id"]))
                 if not previous or score > previous[0]:
                     matches[str(row["id"])] = (score, project)
+        if len(exact_matches) == 1:
+            return {"project": next(iter(exact_matches.values())), "confidence": 0.99,
+                    "reason": "exact_query_alias", "ambiguous": False}
+        if len(exact_matches) > 1 or len(contained_matches) > 1:
+            return {"project": None, "confidence": 0.95, "reason": "ambiguous_aliases", "ambiguous": True}
+        if len(contained_matches) == 1:
+            return {"project": next(iter(contained_matches.values())), "confidence": 0.95,
+                    "reason": "query_alias", "ambiguous": False}
         ranked = sorted(matches.values(), key=lambda item: item[0], reverse=True)
         if not ranked:
             return {"project": None, "confidence": 0.0, "reason": "no_project_match", "ambiguous": False}
@@ -582,6 +678,8 @@ class WorkspaceManager:
             return result
 
     def update_work_item(self, item_id: str, values: dict[str, Any], *, reason: str = "manual_edit") -> dict[str, Any]:
+        if not isinstance(values, dict):
+            raise ValueError("Work item update must be an object")
         now = utc_now()
         with self.db.transaction(immediate=True) as conn:
             old = conn.execute("SELECT * FROM work_items WHERE id=?", (item_id,)).fetchone()
@@ -598,14 +696,38 @@ class WorkspaceManager:
             confirmed = bool(values.get("confirmed", old["confirmed"]))
             if not content or item_type not in WORK_ITEM_TYPES or status not in WORK_ITEM_STATUSES:
                 raise ValueError("Invalid work item update")
-            if confirmed and not old["evidence_quote"] and reason != "manual_confirm":
+            if confirmed and not old["evidence_quote"] and reason not in {"manual_confirm", "manual_restore"}:
                 raise ValueError("Automatic confirmation requires user evidence")
-            resolved_at = now if status == "resolved" else old["resolved_at"]
+            transitions = {
+                "suggested": {"active", "archived", "expired"},
+                "active": {"resolved", "archived", "expired"},
+                "resolved": {"active"},
+                "archived": {"active"},
+                "expired": {"active"},
+            }
+            if status != old["status"] and status not in transitions.get(str(old["status"]), set()):
+                raise ValueError(f"Unsupported work item transition: {old['status']} -> {status}")
+            if subject_id:
+                subject = conn.execute(
+                    "SELECT subject_type,status FROM subjects WHERE id=?", (subject_id,)
+                ).fetchone()
+                if not subject or subject["subject_type"] != "project" or subject["status"] == "archived":
+                    raise KeyError(subject_id)
+            if status == "active" and reason in {"manual_confirm", "manual_restore"}:
+                confirmed = True
+            resolved_at = now if status == "resolved" else (None if status == "active" else old["resolved_at"])
+            expires_at = old["expires_at"]
+            if item_type != old["item_type"] or reason in {"manual_confirm", "manual_restore"}:
+                days = WORK_ITEM_TTL_DAYS[item_type]
+                expires_at = (
+                    (datetime.now(UTC) + timedelta(days=days)).isoformat(timespec="seconds")
+                    if days else None
+                )
             conn.execute(
                 "UPDATE work_items SET content=?,content_hash=?,item_type=?,status=?,confirmed=?,"
-                "subject_id=?,resolved_at=?,updated_at=? WHERE id=?",
+                "subject_id=?,resolved_at=?,expires_at=?,updated_at=? WHERE id=?",
                 (content, content_hash(content), item_type, status, int(confirmed), subject_id,
-                 resolved_at, now, item_id),
+                 resolved_at, expires_at, now, item_id),
             )
             conn.execute(
                 "DELETE FROM subject_links WHERE object_type='work_item' AND object_id=? "
@@ -630,7 +752,7 @@ class WorkspaceManager:
             "confirm": {"status": "active", "confirmed": True},
             "resolve": {"status": "resolved"},
             "archive": {"status": "archived"},
-            "restore": {"status": "active"},
+            "restore": {"status": "active", "confirmed": True},
         }
         if action not in mapping:
             raise ValueError("Unsupported work item action")
@@ -665,7 +787,22 @@ class WorkspaceManager:
 
     def current_summary(self, scope: str, subject_id: str | None = None) -> dict[str, Any] | None:
         rows = self.list_summaries(scope, subject_id)
-        return next((item for item in rows if item["status"] == "current"), None)
+        current = next((item for item in rows if item["status"] == "current"), None)
+        if not current:
+            return None
+        sources = self._summary_sources(scope, subject_id)
+        revision, newest = self._source_revision(sources)
+        cited = set(current["source_ids"])
+        known = {str(source["id"]) for source in sources}
+        current["stale"] = bool(
+            current.get("source_revision") != revision or not cited.issubset(known)
+        )
+        current["stale_reason"] = (
+            "summary_sources_changed" if current["stale"] else None
+        )
+        current["current_source_revision"] = revision
+        current["current_newest_source_updated_at"] = newest
+        return current
 
     def regenerate_summary(self, scope: str, subject_id: str | None = None) -> dict[str, Any]:
         if scope not in {"profile", "project", "topic"}:
@@ -704,9 +841,11 @@ class WorkspaceManager:
                     raise LlmError("Summary rewrite rejected by the 20% source-loss guard")
             if previous["mode"] == "manual_override":
                 raise ValueError("Summary has a manual override; resume automatic mode first")
+        source_revision, newest_source = self._source_revision(sources)
         version_id = self._store_summary(
             scope, subject_id, summary, sorted(cited),
             str(result.parsed.get("change_reason", "Automatic grounded refresh")), "automatic",
+            source_revision=source_revision, newest_source_updated_at=newest_source,
         )
         self.queue_projection("subject" if subject_id else "profile", subject_id or "")
         return next(item for item in self.list_summaries(scope, subject_id) if item["id"] == version_id)
@@ -717,7 +856,12 @@ class WorkspaceManager:
             raise ValueError("Summary content is empty")
         previous = self.current_summary(scope, subject_id)
         source_ids = previous["source_ids"] if previous else []
-        version_id = self._store_summary(scope, subject_id, content, source_ids, "Manual override", "manual_override")
+        sources = self._summary_sources(scope, subject_id)
+        source_revision, newest_source = self._source_revision(sources)
+        version_id = self._store_summary(
+            scope, subject_id, content, source_ids, "Manual override", "manual_override",
+            source_revision=source_revision, newest_source_updated_at=newest_source,
+        )
         self.queue_projection("subject" if subject_id else "profile", subject_id or "")
         return next(item for item in self.list_summaries(scope, subject_id) if item["id"] == version_id)
 
@@ -726,8 +870,13 @@ class WorkspaceManager:
         target = next((item for item in versions if item["id"] == version_id), None)
         if not target:
             raise KeyError(version_id)
-        new_id = self._store_summary(scope, subject_id, target["content"], target["source_ids"],
-                                     f"Rollback to {version_id}", "rollback")
+        sources = self._summary_sources(scope, subject_id)
+        source_revision, newest_source = self._source_revision(sources)
+        new_id = self._store_summary(
+            scope, subject_id, target["content"], target["source_ids"],
+            f"Rollback to {version_id}", "manual_override",
+            source_revision=source_revision, newest_source_updated_at=newest_source,
+        )
         self.queue_projection("subject" if subject_id else "profile", subject_id or "")
         return next(item for item in self.list_summaries(scope, subject_id) if item["id"] == new_id)
 
@@ -776,10 +925,10 @@ class WorkspaceManager:
         return job_id
 
     def rebuild_projections(self) -> dict[str, Any]:
-        self.vault.mkdir(parents=True, exist_ok=True)
-        (self.vault / "projects").mkdir(exist_ok=True)
-        (self.vault / "topics").mkdir(exist_ok=True)
-        self.indexes.mkdir(parents=True, exist_ok=True)
+        secure_directory(self.vault)
+        secure_directory(self.vault / "projects")
+        secure_directory(self.vault / "topics")
+        secure_directory(self.indexes)
         files: dict[str, str] = {}
         profile = self._render_profile()
         files["profile.md"] = profile
@@ -836,12 +985,20 @@ class WorkspaceManager:
                         errors.append(f"projection mismatch: {relative}")
             except (OSError, json.JSONDecodeError, TypeError) as error:
                 errors.append(f"invalid vault manifest: {error}")
+        permissions = [
+            permission_report(self.root, directory=True),
+            permission_report(self.db.path),
+            permission_report(self.vault, directory=True),
+            permission_report(self.indexes, directory=True),
+            permission_report(self.root / "backups", directory=True),
+        ]
         return {
             "ok": integrity == "ok" and not errors and pending == 0,
             "database_integrity": integrity,
             "projection_pending": pending,
             "vault_files_checked": checked,
             "errors": errors,
+            "permissions": permissions,
             "vault_path": str(self.vault),
             "indexes_path": str(self.indexes),
         }
@@ -874,32 +1031,40 @@ class WorkspaceManager:
 
     def _summary_sources(self, scope: str, subject_id: str | None) -> list[dict[str, Any]]:
         with self.db.connect() as conn:
+            predicate, predicate_args = eligible_memory_predicate("m")
+            now = utc_now()
             if subject_id:
                 work = conn.execute(
                     "SELECT id,item_type AS kind,content,status,confirmed,updated_at FROM work_items "
-                    "WHERE subject_id=? AND status IN ('active','suggested') ORDER BY updated_at DESC LIMIT 60",
-                    (subject_id,),
+                    "WHERE subject_id=? AND status='active' AND confirmed=1 AND item_type<>'proposal' "
+                    "AND (expires_at IS NULL OR datetime(expires_at)>datetime(?)) "
+                    "ORDER BY updated_at DESC LIMIT 60",
+                    (subject_id, now),
                 ).fetchall()
                 memories = conn.execute(
                     "SELECT m.id,m.kind,m.content,m.temporal_status AS status,1 AS confirmed,m.updated_at "
                     "FROM subject_links sl JOIN memories m ON m.id=sl.object_id "
-                    "WHERE sl.subject_id=? AND sl.object_type='memory' AND m.status='active' "
-                    "ORDER BY m.updated_at DESC LIMIT 60", (subject_id,)
+                    "WHERE sl.subject_id=? AND sl.object_type='memory' "
+                    "AND sl.assignment_status IN ('confirmed','automatic') "
+                    f"AND {predicate} ORDER BY m.updated_at DESC LIMIT 60",
+                    [subject_id, *predicate_args],
                 ).fetchall()
             else:
                 work = []
                 memories = conn.execute(
                     "SELECT m.id,m.kind,m.content,m.temporal_status AS status,1 AS confirmed,m.updated_at "
-                    "FROM memories m WHERE m.status='active' AND m.temporal_status='current' "
+                    f"FROM memories m WHERE {predicate} "
                     "AND NOT EXISTS(SELECT 1 FROM subject_links sl WHERE sl.object_type='memory' AND sl.object_id=m.id) "
-                    "ORDER BY m.updated_at DESC LIMIT 80"
+                    "ORDER BY m.updated_at DESC LIMIT 80",
+                    predicate_args,
                 ).fetchall()
         return [dict(row) | {"source_type": "work_item"} for row in work] + [
             dict(row) | {"source_type": "memory"} for row in memories
         ]
 
     def _store_summary(
-        self, scope: str, subject_id: str | None, content: str, source_ids: list[str], reason: str, mode: str
+        self, scope: str, subject_id: str | None, content: str, source_ids: list[str], reason: str, mode: str,
+        *, source_revision: str = "", newest_source_updated_at: str | None = None,
     ) -> str:
         version_id = str(uuid.uuid4())
         with self.db.transaction(immediate=True) as conn:
@@ -908,21 +1073,31 @@ class WorkspaceManager:
                 "AND coalesce(subject_id,'')=coalesce(?, '') AND status='current'", (scope, subject_id)
             )
             conn.execute(
-                "INSERT INTO summary_versions(id,scope,subject_id,content,source_ids_json,change_reason,mode,status,created_at) "
-                "VALUES(?,?,?,?,?,?,?,'current',?)",
-                (version_id, scope, subject_id, content, json.dumps(source_ids), reason, mode, utc_now()),
+                "INSERT INTO summary_versions(id,scope,subject_id,content,source_ids_json,change_reason,mode,status,"
+                "source_revision,newest_source_updated_at,created_at) VALUES(?,?,?,?,?,?,?,'current',?,?,?)",
+                (version_id, scope, subject_id, content, json.dumps(source_ids), reason, mode,
+                 source_revision, newest_source_updated_at, utc_now()),
             )
         return version_id
+
+    @staticmethod
+    def _source_revision(sources: list[dict[str, Any]]) -> tuple[str, str | None]:
+        ordered = sorted(
+            (str(item["id"]), str(item.get("updated_at", "")), content_hash(str(item["content"])))
+            for item in sources
+        )
+        newest = max((item[1] for item in ordered), default=None)
+        return content_hash(json.dumps(ordered, ensure_ascii=False)), newest
 
     def _render_profile(self) -> str:
         summary = self.current_summary("profile")
         memories = self._summary_sources("profile", None)
         lines = ["# B1ack Memory Profile", "", "> Generated from memory.db. Edit through the WebUI.", ""]
-        if summary:
-            lines.extend(["## Summary", "", summary["content"], ""])
+        if summary and not summary.get("stale"):
+            lines.extend(["## Summary", "", self._safe_markdown(summary["content"]), ""])
         if memories:
             lines.extend(["## Durable memories", ""])
-            lines.extend(f"- {item['content']} <!-- b1ack:id={item['id']} -->" for item in memories)
+            lines.extend(f"- {self._safe_markdown(item['content'])} <!-- b1ack:id={item['id']} -->" for item in memories)
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
@@ -931,32 +1106,41 @@ class WorkspaceManager:
         summary = self.current_summary(scope, subject["id"])
         work = self.list_work_items(subject_id=subject["id"], limit=500)
         with self.db.connect() as conn:
+            valid_sql, valid_params = eligible_memory_predicate("m")
             memories = conn.execute(
                 "SELECT m.* FROM subject_links sl JOIN memories m ON m.id=sl.object_id "
-                "WHERE sl.subject_id=? AND sl.object_type='memory' ORDER BY m.updated_at DESC",
-                (subject["id"],),
+                f"WHERE sl.subject_id=? AND sl.object_type='memory' AND {valid_sql} ORDER BY m.updated_at DESC",
+                (subject["id"], *valid_params),
             ).fetchall()
         lines = [f"# {subject['name']}", "", f"> {subject['subject_type']} · {subject['status']} · generated from memory.db", ""]
         if subject.get("description"):
-            lines.extend([subject["description"], ""])
-        if summary:
-            lines.extend(["## Summary", "", summary["content"], ""])
+            lines.extend([self._safe_markdown(subject["description"]), ""])
+        if summary and not summary.get("stale"):
+            lines.extend(["## Summary", "", self._safe_markdown(summary["content"]), ""])
         for item_type, label in (("current_state", "Current state"), ("decision", "Decisions"),
                                  ("open_question", "Open questions"), ("proposal", "Proposals"),
                                  ("milestone", "Milestones")):
             items = [item for item in work if item["item_type"] == item_type and item["status"] in {"active", "suggested"}]
             if items:
                 lines.extend([f"## {label}", ""])
-                lines.extend(f"- {item['content']} <!-- b1ack:work={item['id']} -->" for item in items)
+                lines.extend(f"- {self._safe_markdown(item['content'])} <!-- b1ack:work={item['id']} -->" for item in items)
                 lines.append("")
         if memories:
             lines.extend(["## Durable memories", ""])
-            lines.extend(f"- {item['content']} <!-- b1ack:id={item['id']} -->" for item in memories)
+            lines.extend(f"- {self._safe_markdown(item['content'])} <!-- b1ack:id={item['id']} -->" for item in memories)
             lines.append("")
         return "\n".join(lines).rstrip() + "\n"
 
     @staticmethod
+    def _safe_markdown(value: Any) -> str:
+        text = "".join(char for char in str(value) if char in "\n\t" or ord(char) >= 32)
+        return text.replace("<!--", "&lt;!--").replace("-->", "--&gt;")
+
+    @staticmethod
     def _atomic_text(path: Path, content: str) -> None:
+        secure_directory(path.parent)
         temp = path.with_name(f".{path.name}.tmp")
         temp.write_text(content, encoding="utf-8")
+        secure_file(temp)
         os.replace(temp, path)
+        secure_file(path)

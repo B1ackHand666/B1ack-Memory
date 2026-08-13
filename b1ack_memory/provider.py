@@ -31,6 +31,8 @@ class B1ackMemoryProvider(MemoryProvider):
             return False
 
     def initialize(self, session_id: str, **kwargs: Any) -> None:
+        if not isinstance(session_id, str):
+            raise ValueError("session_id must be a string")
         self.session_id = session_id
         self.agent_context = str(kwargs.get("agent_context", "primary"))
         self.project_id = str(kwargs.get("project_id", "") or "")
@@ -100,16 +102,30 @@ class B1ackMemoryProvider(MemoryProvider):
 
     def handle_tool_call(self, tool_name: str, args: dict[str, Any], **kwargs: Any) -> str:
         del kwargs
+        if not isinstance(args, dict):
+            raise ValueError("Tool arguments must be an object")
         if tool_name == "b1ack_memory_search":
+            query = args.get("query")
+            limit = args.get("limit", 5)
+            project = args.get("project_id")
+            if not isinstance(query, str) or not isinstance(limit, int) or isinstance(limit, bool):
+                raise ValueError("query must be a string and limit must be an integer")
+            if project is not None and not isinstance(project, str):
+                raise ValueError("project_id must be a string")
             hits = self.service.search(
-                str(args.get("query", "")), limit=int(args.get("limit", 5)), injected=False,
-                project_id=str(args.get("project_id", "") or "") or None,
+                query, limit=limit, injected=False, project_id=project or None,
             )
             return json.dumps({"results": [hit.to_dict() for hit in hits]}, ensure_ascii=False)
         if tool_name == "b1ack_memory_remember":
+            content = args.get("content")
+            kind = args.get("kind", "fact")
+            project = args.get("project_id", self.project_id or None)
+            if not isinstance(content, str) or not isinstance(kind, str):
+                raise ValueError("content and kind must be strings")
+            if project is not None and not isinstance(project, str):
+                raise ValueError("project_id must be a string")
             result = self.service.remember(
-                str(args.get("content", "")), kind=str(args.get("kind", "fact")),
-                project_id=str(args.get("project_id", "") or self.project_id or "") or None,
+                content, kind=kind, project_id=project or None,
             )
             return json.dumps(result, ensure_ascii=False)
         raise NotImplementedError(tool_name)

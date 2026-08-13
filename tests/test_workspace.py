@@ -225,7 +225,7 @@ class WorkspaceTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "manual override"):
             self.service.regenerate_summary("project", project["id"])
         rolled = self.service.rollback_summary("project", project["id"], first["id"])
-        self.assertEqual(rolled["mode"], "rollback")
+        self.assertEqual(rolled["mode"], "manual_override")
         self.service.workspace.client_factory = lambda: SummaryClient(unknown=True)
         with self.assertRaises(LlmError):
             self.service.regenerate_summary("project", project["id"])
@@ -259,7 +259,8 @@ class WorkspaceWebTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.service = MemoryService(Path(self.temp.name))
         self.client = TestClient(create_app(self.service))
-        self.headers = {"X-B1ack-Memory-Token": self.client.get("/api/bootstrap").json()["token"]}
+        self.headers = {"Authorization": f"Bearer {self.service.mutation_token}"}
+        self.client.headers.update(self.headers)
 
     def tearDown(self) -> None:
         self.client.close()

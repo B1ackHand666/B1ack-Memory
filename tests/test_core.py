@@ -919,14 +919,17 @@ class CoreTests(unittest.TestCase):
         migrated = MemoryDatabase(path)
         for candidate_id, memory_id in linked.values():
             self.assertEqual(migrated.get_candidate(candidate_id).promoted_memory_id, memory_id)
-        self.assertIsNone(migrated.get_candidate(orphan.id))
-        self.assertIsNone(migrated.get_candidate(ambiguous.id))
+        for candidate_id in (orphan.id, ambiguous.id):
+            legacy = migrated.get_candidate(candidate_id)
+            self.assertIsNotNone(legacy)
+            self.assertEqual(legacy.status, "pending")
+            self.assertEqual(legacy.admission_state, "legacy_review")
         with migrated.connect() as conn:
             self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM audit_events "
-                    "WHERE action='migration-cleanup-orphan-promoted'"
+                    "WHERE action='migration-review-unlinked-promoted'"
                 ).fetchone()[0],
                 2,
             )
@@ -979,7 +982,7 @@ class SecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SecretStore(Path(directory) / "secrets.json")
             store.save({"llm_api_key": "abcdef123456"})
-            self.assertEqual(store.masked_status("llm_api_key")["masked"], "••••3456")
+            self.assertEqual(store.masked_status("llm_api_key"), {"configured": True})
 
 
 class ClientTests(unittest.TestCase):

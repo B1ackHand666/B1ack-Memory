@@ -6,7 +6,7 @@ from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
 from typing import Any
 
-from .db import MemoryDatabase, content_hash, utc_now
+from .db import MemoryDatabase, content_hash, eligible_memory_predicate, utc_now
 from .llm import LlmError, OpenAICompatibleClient
 from .models import MemoryRecord, ReviewItem
 from .retrieval import RetrievalEngine
@@ -69,9 +69,14 @@ class MemoryGovernance:
         kind: str,
         origin: str,
         sensitive: bool,
+        project_id: str | None = None,
     ) -> dict[str, Any]:
         exact = self.db.active_memory_by_content(content)
         if exact:
+            if project_id:
+                self.db.link_subject_record(
+                    project_id, "memory", exact.id, method="explicit_remember"
+                )
             return {"status": "remembered", "memory": exact.to_dict(), "idempotent": True}
         related = self._related(content, include_candidates=True, limit=12)
         if not sensitive and not related:
@@ -81,6 +86,7 @@ class MemoryGovernance:
                 origin=origin,
                 confidence=1.0,
                 sensitive=False,
+                subject_id=project_id,
             )
             return {"status": "remembered", "memory": memory.to_dict()}
 
@@ -94,6 +100,7 @@ class MemoryGovernance:
             admission_state="review_required",
             source_type="explicit_remember",
             admission_reason="用户明确要求记住；因敏感或存在相关长期记忆转入审核",
+            subject_id=project_id,
         )
         self.db.add_admission_decision(
             disposition="admit",
@@ -109,6 +116,25 @@ class MemoryGovernance:
             "confidence": 1.0,
             "target_memory_id": None,
         }
+        target_hit = next(
+            (hit for hit in related if hit.id == decision.get("target_memory_id")), None
+        )
+        if decision.get("action") == "duplicate" and target_hit and target_hit.source == "candidate":
+            canonical = self.db.merge_candidates(target_hit.id, candidate.id)
+            review = self._create_integration_review(
+                decision,
+                content=canonical.content,
+                candidate_id=canonical.id,
+                related=related,
+                source=origin,
+                metadata={"project_id": project_id, "kind": kind, "absorbed_candidate": candidate.id},
+            )
+            return {
+                "status": "review_required",
+                "candidate": canonical.to_dict(),
+                "review": review.to_dict(),
+                "idempotent": True,
+            }
         review = self._create_integration_review(
             decision,
             content=content,
@@ -116,6 +142,7 @@ class MemoryGovernance:
             related=related,
             source=origin,
             issue_override="sensitive" if sensitive and not related else None,
+            metadata={"project_id": project_id, "kind": kind},
         )
         return {
             "status": "review_required",
@@ -169,11 +196,31 @@ class MemoryGovernance:
         )
         return {"status": "review_required", "review": review.to_dict()}
 
-    def update_memory(self, record_id: str, *, content: str, kind: str) -> dict[str, Any]:
+    def update_memory(
+        self,
+        record_id: str,
+        *,
+        content: str,
+        kind: str,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        temporal_status: str | None = None,
+        temporal_reason: str | None = None,
+        project_id: str | None = None,
+    ) -> dict[str, Any]:
         current = self.db.get_memory(record_id)
         if not current:
             raise KeyError(record_id)
-        if current.content == content.strip() and current.kind == kind:
+        unchanged = (
+            current.content == content.strip() and current.kind == kind
+            and (valid_from is None or current.valid_from == valid_from)
+            and (valid_to is None or current.valid_to == valid_to)
+            and (temporal_status is None or current.temporal_status == temporal_status)
+            and (temporal_reason is None or current.temporal_reason == temporal_reason)
+        )
+        if unchanged:
+            if project_id:
+                self.db.link_subject_record(project_id, "memory", record_id, method="memory_edit")
             return {"status": "remembered", "memory": current.to_dict(), "idempotent": True}
         related = self._related(
             content,
@@ -182,7 +229,11 @@ class MemoryGovernance:
             limit=12,
         )
         if not related:
-            memory = self.db.update_memory(record_id, content=content, kind=kind)
+            memory = self.db.update_memory(
+                record_id, content=content, kind=kind, valid_from=valid_from,
+                valid_to=valid_to, temporal_status=temporal_status,
+                temporal_reason=temporal_reason, subject_id=project_id,
+            )
             return {"status": "remembered", "memory": memory.to_dict()}
         decision = self._classify(content, related)
         review = self._create_integration_review(
@@ -191,7 +242,9 @@ class MemoryGovernance:
             primary_memory_id=record_id,
             related=related,
             source="memory_edit",
-            metadata={"kind": kind},
+            metadata={"kind": kind, "valid_from": valid_from, "valid_to": valid_to,
+                      "temporal_status": temporal_status, "temporal_reason": temporal_reason,
+                      "project_id": project_id},
         )
         return {"status": "review_required", "review": review.to_dict()}
 
@@ -316,6 +369,7 @@ class MemoryGovernance:
             ),
             source=source,
             basis_hash=basis,
+            proposal=metadata,
         )
 
     def run_audit(
@@ -329,7 +383,12 @@ class MemoryGovernance:
         try:
             if scope in {"full", "legacy"}:
                 issues += self._queue_legacy_candidates(run.id)
-            memories = self.db.list_memories(status="active", limit=100_000)
+            valid_sql, valid_params = eligible_memory_predicate("m")
+            with self.db.connect() as conn:
+                memories = [self.db._memory_from_row(row) for row in conn.execute(
+                    f"SELECT m.* FROM memories m WHERE {valid_sql} ORDER BY m.updated_at DESC LIMIT 100000",
+                    valid_params,
+                ).fetchall()]
             if memory_ids is not None:
                 selected = set(memory_ids)
                 memories = [item for item in memories if item.id in selected]
@@ -462,8 +521,20 @@ class MemoryGovernance:
         candidate = self.db.get_candidate(review.candidate_id) if review.candidate_id else None
         memory = self.db.get_memory(review.primary_memory_id) if review.primary_memory_id else None
         target_id = canonical_id or review.related_memory_id
+        proposal = review.proposal or {}
         result: dict[str, Any] = {"status": "resolved", "action": action}
         if action == "keep_both":
+            if candidate:
+                written = self.db.promote_candidate(
+                    candidate.id,
+                    edited_content=(content or review.proposed_content or candidate.content),
+                    origin="review",
+                    promotion_lane="manual_keep_both",
+                    review_id=review_id,
+                    review_resolution="keep_both",
+                )
+                result["memory"] = written.to_dict()
+                return result
             self.db.close_review_item(review_id, resolution="keep_both", dismissed=True)
             return result
         if action in {"reject", "expire"}:
@@ -498,7 +569,11 @@ class MemoryGovernance:
                     edited_content=target.content,
                     origin="review",
                     promotion_lane="manual_merge",
+                    review_id=review_id,
+                    review_resolution=action,
                 )
+                result["memory"] = merged.to_dict()
+                return result
             elif memory:
                 merged = self.db.merge_memories(target.id, memory.id)
             else:
@@ -514,17 +589,33 @@ class MemoryGovernance:
                     edited_content=proposed,
                     origin="review",
                     promotion_lane="manual_review",
+                    review_id=review_id if action != "supersede" else None,
+                    review_resolution=action if action != "supersede" else None,
                 )
+                result["memory"] = written.to_dict()
+                if action != "supersede":
+                    return result
             elif memory and action == "edit_execute":
                 written = self.db.update_memory(
-                    memory.id, content=proposed, kind=kind or memory.kind
+                    memory.id,
+                    content=proposed,
+                    kind=kind or str(proposal.get("kind") or memory.kind),
+                    valid_from=proposal.get("valid_from"),
+                    valid_to=proposal.get("valid_to"),
+                    temporal_status=proposal.get("temporal_status"),
+                    temporal_reason=proposal.get("temporal_reason"),
+                    subject_id=proposal.get("project_id"),
                 )
             elif memory:
                 written = self.db.add_memory(
-                    proposed, kind=kind or memory.kind, origin="review"
+                    proposed, kind=kind or memory.kind, origin="review",
+                    subject_id=proposal.get("project_id"),
                 )
             else:
-                written = self.db.add_memory(proposed, kind=kind or "fact", origin="review")
+                written = self.db.add_memory(
+                    proposed, kind=kind or str(proposal.get("kind") or "fact"), origin="review",
+                    subject_id=proposal.get("project_id"),
+                )
             if action == "supersede":
                 if not target_id:
                     raise ValueError("canonical_id or related memory is required")

@@ -3,8 +3,9 @@ from __future__ import annotations
 import hmac
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
-from fastapi import APIRouter, Body, Depends, FastAPI, Header, HTTPException, Request
+from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 
 from .llm import LlmError
@@ -13,11 +14,18 @@ from .service import MemoryService
 
 STATIC = Path(__file__).with_name("static")
 LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+SESSION_COOKIE = "b1ack_memory_session"
 
 
 def _local_only(request: Request) -> None:
-    host = request.client.host if request.client else ""
-    if host not in LOCAL_HOSTS:
+    client_host = request.client.host if request.client else ""
+    raw_host = request.headers.get("host", "")
+    try:
+        header_host = urlsplit(f"//{raw_host}").hostname or ""
+    except ValueError:
+        header_host = ""
+    test_request = client_host == "testclient" and header_host == "testserver"
+    if not test_request and (client_host not in LOCAL_HOSTS or header_host not in LOCAL_HOSTS):
         raise HTTPException(status_code=403, detail="B1ack Memory WebUI is local-only")
 
 
@@ -31,24 +39,56 @@ async def _friendly_errors():
 
 
 def create_router(
-    service: MemoryService | None = None, *, local_only: bool = True
+    service: MemoryService | None = None, *, auth_mode: str = "standalone"
 ) -> APIRouter:
+    if auth_mode not in {"standalone", "dashboard"}:
+        raise ValueError("Unsupported WebUI auth mode")
     memory = service or get_service(start_background=True)
-    dependencies = [Depends(_friendly_errors)]
-    if local_only:
-        dependencies.insert(0, Depends(_local_only))
+    public_ui_suffixes = ("/ui/", "/ui/app.js", "/ui/style.css")
+
+    def bearer_ok(request: Request) -> bool:
+        authorization = request.headers.get("authorization", "")
+        scheme, _, value = authorization.partition(" ")
+        return scheme.casefold() == "bearer" and hmac.compare_digest(value, memory.mutation_token)
+
+    def access_guard(request: Request) -> None:
+        if auth_mode == "dashboard":
+            return
+        _local_only(request)
+        if request.url.path.endswith(public_ui_suffixes):
+            return
+        cookie = request.cookies.get(SESSION_COOKIE, "")
+        if not bearer_ok(request) and not hmac.compare_digest(cookie, memory.mutation_token):
+            raise HTTPException(status_code=401, detail="WebUI session or Bearer token required")
+
+    dependencies = [Depends(access_guard), Depends(_friendly_errors)]
     router = APIRouter(dependencies=dependencies)
 
-    def mutation_token(x_b1ack_memory_token: str = Header(default="")) -> None:
-        if not hmac.compare_digest(x_b1ack_memory_token, memory.mutation_token):
-            raise HTTPException(status_code=403, detail="Invalid mutation token")
+    def mutation_access(request: Request) -> None:
+        if auth_mode == "dashboard" or bearer_ok(request):
+            return
+        origin = request.headers.get("origin", "")
+        if not origin:
+            raise HTTPException(status_code=403, detail="Same-origin mutation required")
+        try:
+            origin_parts = urlsplit(origin)
+            request_host = urlsplit(f"//{request.headers.get('host', '')}")
+        except ValueError as error:
+            raise HTTPException(status_code=403, detail="Invalid request origin") from error
+        if origin_parts.hostname != request_host.hostname or origin_parts.port != request_host.port:
+            raise HTTPException(status_code=403, detail="Cross-origin mutation rejected")
 
     def mutate() -> list[Any]:
-        return [Depends(mutation_token)]
+        return [Depends(mutation_access)]
 
     @router.get("/ui/", response_class=HTMLResponse)
-    def ui() -> str:
-        return (STATIC / "index.html").read_text(encoding="utf-8")
+    def ui() -> HTMLResponse:
+        response = HTMLResponse((STATIC / "index.html").read_text(encoding="utf-8"))
+        if auth_mode == "standalone":
+            response.set_cookie(
+                SESSION_COOKIE, memory.mutation_token, httponly=True, samesite="strict", path="/"
+            )
+        return response
 
     @router.get("/ui/app.js")
     def javascript() -> FileResponse:
@@ -69,7 +109,7 @@ def create_router(
 
     @router.get("/bootstrap")
     def bootstrap() -> dict[str, Any]:
-        return {"token": memory.mutation_token, "status": memory.status()}
+        return {"status": memory.status(), "auth_mode": auth_mode}
 
     @router.get("/status")
     def status() -> dict[str, Any]:
@@ -153,6 +193,10 @@ def create_router(
     @router.get("/maintenance/storage")
     def storage_health() -> dict[str, Any]:
         return memory.workspace.storage_health()
+
+    @router.get("/maintenance/ingestion-issues")
+    def ingestion_issues(limit: int = 100) -> list[dict[str, Any]]:
+        return memory.ingestion_issues(limit)
 
     @router.get("/candidates")
     def candidates(
@@ -244,7 +288,7 @@ def create_router(
 
     @router.post("/projects/{project_id}/session", dependencies=mutate())
     def set_session_project(project_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        return memory.set_session_project(str(body.get("session_id", "")), project_id)
+        return memory.set_session_project(body.get("session_id"), project_id)
 
     @router.post("/subjects", dependencies=mutate())
     def create_subject(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -252,7 +296,10 @@ def create_router(
 
     @router.post("/subjects/{subject_id}/merge", dependencies=mutate())
     def merge_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        return memory.merge_subjects(subject_id, str(body.get("source_id", "")))
+        source_id = body.get("source_id")
+        if not isinstance(source_id, str):
+            raise ValueError("source_id must be a string")
+        return memory.merge_subjects(subject_id, source_id)
 
     @router.patch("/subjects/{subject_id}", dependencies=mutate())
     def update_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
@@ -290,8 +337,11 @@ def create_router(
 
     @router.patch("/summaries/{scope}/{subject_id}", dependencies=mutate())
     def override_summary(scope: str, subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        content = body.get("content")
+        if not isinstance(content, str):
+            raise ValueError("content must be a string")
         return memory.override_summary(
-            scope, None if subject_id == "global" else subject_id, str(body.get("content", ""))
+            scope, None if subject_id == "global" else subject_id, content
         )
 
     @router.post("/summaries/{scope}/{subject_id}/rollback", dependencies=mutate())
@@ -401,6 +451,10 @@ def create_router(
     def validate_storage() -> dict[str, Any]:
         return memory.workspace.storage_health()
 
+    @router.post("/maintenance/ingestion-issues/{turn_id}/retry", dependencies=mutate())
+    def retry_ingestion(turn_id: str) -> dict[str, Any]:
+        return memory.retry_ingestion(turn_id)
+
     @router.post("/maintenance/rebuild-projections", dependencies=mutate())
     def rebuild_projections() -> dict[str, Any]:
         return memory.workspace.rebuild_projections()
@@ -414,5 +468,5 @@ def create_router(
 
 def create_app(service: MemoryService | None = None) -> FastAPI:
     app = FastAPI(title="B1ack Memory", docs_url=None, redoc_url=None)
-    app.include_router(create_router(service), prefix="/api")
+    app.include_router(create_router(service, auth_mode="standalone"), prefix="/api")
     return app
