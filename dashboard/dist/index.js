@@ -24,9 +24,15 @@
     },
   };
 
+  function dashboardRoutePrefix() {
+    const route = window.location.pathname.replace(/\/+$/, "");
+    const lastSlash = route.lastIndexOf("/");
+    return lastSlash > 0 ? route.slice(0, lastSlash) : "";
+  }
+
   function B1ackMemoryPage() {
     return React.createElement("iframe", {
-      src: API + "/ui/",
+      src: dashboardRoutePrefix() + API + "/ui/",
       title: "B1ack Memory",
       style: {
         border: 0,
