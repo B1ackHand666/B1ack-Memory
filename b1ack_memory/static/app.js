@@ -1,489 +1,172 @@
 const base = location.pathname.replace(/\/ui\/?$/, "");
-const dashboardBridge =
-  window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
-
-let token = "";
+const bridge = window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
+const $ = (selector) => document.querySelector(selector);
+const $$ = (selector) => [...document.querySelectorAll(selector)];
 let settings = {};
-let editing = null;
-let memoriesById = new Map();
-let candidateStatus = "pending";
-let analyticsRange = "30d";
+let statusData = {};
+let libraryTab = "memories";
+let reviewTab = "decision";
+let systemTab = "dream";
+let currentProject = null;
 let noticeTimer = null;
 
-const pageDescriptions = {
-  overview: "记忆健康、处理队列和近期活动",
-  evolution: "用趋势和时间线看见记忆如何形成、晋升与修订",
-  memories: "查看、修订、回收或永久删除长期记忆",
-  candidates: "审核短期候选、证据、REM 判断和晋升进度",
-  dream: "检查 Light、REM、Deep 的运行结果与模型调用",
-  traces: "查看哪些记忆曾被检索，以及是否实际注入回答",
-  settings: "配置时区、兼容模型、密钥、调度和召回参数",
-  maintenance: "创建与恢复备份，执行清理和索引重建",
+const workspaceMeta = {
+  overview: ["概览", "只看真正需要处理的事项与系统健康"],
+  library: ["记忆库", "长期事实、项目工作记忆、实体与历史版本"],
+  projects: ["项目", "围绕项目摘要、当前状态、决定与开放问题工作"],
+  reviews: ["审核", "高风险决定与日常整理建议分流处理"],
+  system: ["系统", "Dream、召回、模型、存储和高级设置"],
 };
+const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+const when = (value) => { if (!value) return "—"; const d = typeof value === "number" ? new Date(value) : new Date(String(value).replace(" ", "T")); return Number.isNaN(d.valueOf()) ? esc(value) : d.toLocaleString("zh-CN", {hour12:false}); };
+const badge = (text, tone="") => `<span class="badge ${tone}">${esc(text)}</span>`;
+const empty = (text) => `<div class="empty">${esc(text)}</div>`;
 
-const eventLabels = {
-  candidate_created: "创建候选",
-  evidence_added: "增加证据",
-  rem_reviewed: "REM 审查",
-  candidate_merged: "合并同义候选",
-  candidate_expired: "候选过期",
-  candidate_restored: "恢复候选",
-  candidate_rejected: "拒绝候选",
-  candidate_promoted: "晋升为长期记忆",
-  memory_created: "创建长期记忆",
-  memory_updated: "修订长期记忆",
-  memory_trashed: "移入回收站",
-  memory_restored: "恢复长期记忆",
-  memory_superseded: "长期记忆被替代",
-};
-
-const laneLabels = {
-  different_dates: "不同日期证据",
-  demonstrated_utility: "实际作用",
-  both: "双通道",
-  manual: "人工晋升",
-  unknown: "历史未知",
-};
-
-const $ = (selector) => document.querySelector(selector);
-
-function escapeHtml(value) {
-  return String(value ?? "").replace(
-    /[&<>"']/g,
-    (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[character],
-  );
-}
-
-function localTime(value) {
-  if (!value) return "—";
-  const date = typeof value === "number" ? new Date(value) : new Date(String(value).replace(" ", "T"));
-  return Number.isNaN(date.valueOf()) ? escapeHtml(value) : date.toLocaleString("zh-CN", { hour12: false });
-}
-
-function emptyState(message) {
-  return `<div class="empty">${escapeHtml(message)}</div>`;
-}
-
-async function api(path, options = {}) {
-  const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
-  if (options.method && options.method !== "GET") headers["X-B1ack-Memory-Token"] = token;
-  if (dashboardBridge) return dashboardBridge.request(path, { ...options, headers });
-  const response = await fetch(base + path, { ...options, headers });
+async function api(path, options={}) {
+  const headers = {"Content-Type":"application/json", ...(options.headers || {})};
+  if (bridge) return bridge.request(path, {...options, headers});
+  const response = await fetch(base + path, {...options, headers});
   if (!response.ok) {
-    let detail;
-    try { detail = (await response.json()).detail; } catch { detail = await response.text(); }
-    throw new Error(detail || response.statusText);
+    let detail = response.statusText;
+    try { detail = (await response.json()).detail || detail; } catch {}
+    throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
   }
-  const type = response.headers.get("content-type") || "";
-  return type.includes("json") ? response.json() : response.text();
+  return (response.headers.get("content-type") || "").includes("json") ? response.json() : response.text();
 }
-
-function showNotice(message, error = false) {
-  const notice = $("#notice");
-  clearTimeout(noticeTimer);
-  notice.textContent = message;
-  notice.className = error ? "error" : "";
-  notice.style.display = "block";
-  noticeTimer = setTimeout(() => { notice.style.display = "none"; }, 3600);
+function notice(message, isError=false) {
+  const node = $("#notice"); clearTimeout(noticeTimer); node.textContent = message; node.className = isError ? "error" : ""; node.style.display = "block";
+  noticeTimer = setTimeout(() => node.style.display = "none", 4200);
 }
-
-function countUp(element, target) {
-  if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
-    element.textContent = target;
-    return;
-  }
-  const started = performance.now();
-  const duration = 420;
-  const tick = (now) => {
-    const progress = Math.min(1, (now - started) / duration);
-    const eased = 1 - Math.pow(1 - progress, 3);
-    element.textContent = Math.round(target * eased);
-    if (progress < 1) requestAnimationFrame(tick);
-  };
-  requestAnimationFrame(tick);
-}
-
-function staggerCards(container) {
-  container.querySelectorAll(".card").forEach((card, index) => card.style.setProperty("--i", Math.min(index, 12)));
-}
-
-async function loadAll() {
-  try {
-    const bootstrap = await api("/bootstrap");
-    token = bootstrap.token;
-    renderStatus(bootstrap.status);
-    await Promise.all([
-      loadSettings(), loadMemories(), loadCandidates(), loadDreams(), loadModelCalls(),
-      loadRecallTraces(), loadBackups(), loadEvolution(),
-    ]);
-  } catch (error) {
-    showNotice(error.message, true);
-  }
-}
-
-function renderStatus(status) {
-  const counts = status.counts;
-  const metrics = [
-    ["长期有效", counts.active_memories, "durable"],
-    ["待审核", counts.pending_candidates, "candidate"],
-    ["已过期", counts.expired_candidates, "expired"],
-    ["已拒绝", counts.rejected_candidates, "rejected"],
-    ["待处理会话", counts.pending_turns, "turns"],
-    ["回收站", counts.trashed_memories, "trash"],
-  ];
-  $("#metrics").innerHTML = metrics.map(([label, value, note]) =>
-    `<div class="metric"><span>${label}</span><b data-count="${value}">0</b><small>${note}</small></div>`).join("");
-  $("#metrics").querySelectorAll("[data-count]").forEach((item) => countUp(item, Number(item.dataset.count)));
-  $("#candidate-pending-count").textContent = counts.pending_candidates;
-  $("#candidate-expired-count").textContent = counts.expired_candidates;
-  $("#candidate-rejected-count").textContent = counts.rejected_candidates;
-  const tz = status.general?.timezone || "system";
-  $("#health").innerHTML = `
-    <p>数据库 <b>${escapeHtml(status.database.integrity)}</b> <span class="badge success">${(status.database.bytes / 1024).toFixed(1)} KB</span></p>
-    <p>Dream 模型 <b>${escapeHtml(status.llm.model || "未配置")}</b> <span class="badge">Key ${status.llm.configured ? "已配置" : "未配置"}</span></p>
-    <p>记忆时区 <b>${escapeHtml(tz)}</b></p>
-    <p>下次 Dream <b>${localTime(status.next_dream)}</b></p>
-    <p class="meta">数据目录 ${escapeHtml(status.data_root)}</p>`;
-}
-
-async function loadSettings() {
-  settings = await api("/settings");
-  for (const section of ["general", "llm", "embedding", "dream", "recall", "retention"]) {
-    const form = $(`#${section}-form`);
-    if (!form) continue;
-    for (const [key, value] of Object.entries(settings[section] || {})) {
-      const input = form.elements[key];
-      if (!input) continue;
-      if (input.type === "checkbox") input.checked = Boolean(value);
-      else input.value = value ?? "";
-    }
-  }
-  $("#llm-key").textContent = `Key：${settings.secrets.llm_api_key.masked || "未配置"}`;
-  $("#embedding-key").textContent = `Key：${settings.secrets.embedding_api_key.masked || "未配置"}`;
-  const detected = Intl.DateTimeFormat().resolvedOptions().timeZone || "system";
-  $("#detected-timezone").textContent = `浏览器检测：${detected}`;
-  $("#adopt-timezone").dataset.timezone = detected;
-}
-
-async function loadMemories() {
-  const status = $("#memory-status").value;
-  const rows = await api(`/memories?status=${encodeURIComponent(status)}`);
-  memoriesById = new Map(rows.map((item) => [item.id, item]));
-  const query = $("#memory-search").value.toLowerCase();
-  const visible = rows.filter((item) => item.content.toLowerCase().includes(query));
-  const list = $("#memory-list");
-  list.innerHTML = visible.map((item) => {
-    const lineage = `<button class="ghost" data-action="lineage-memory" data-id="${item.id}">查看演化</button>`;
-    const actions = status === "active"
-      ? `${lineage}<button class="ghost" data-action="edit-memory" data-id="${item.id}">编辑</button><button class="danger" data-action="trash-memory" data-id="${item.id}">回收</button>`
-      : `${lineage}<button data-action="restore-memory" data-id="${item.id}">恢复</button><button class="danger" data-action="purge-memory" data-id="${item.id}">永久删除</button>`;
-    const source = item.origin_label || item.origin;
-    const linked = item.lineage ? `<span class="badge success">有候选来源</span>` : "";
-    return `<div class="card"><div class="card-content"><p class="memory-copy">${escapeHtml(item.content)}</p><div class="meta"><span class="badge">${escapeHtml(item.kind)}</span> <span class="badge">${escapeHtml(source)}</span> ${linked} · 更新于 ${localTime(item.updated_at)} · ${escapeHtml(item.id)}</div></div><div class="actions">${actions}</div></div>`;
-  }).join("") || emptyState(query ? "没有匹配的长期记忆" : "当前分区没有长期记忆");
-  staggerCards(list);
-}
-
-function candidateStatusName(status) {
-  return ({ pending: "待审核", promoted: "已晋升", expired: "已过期", rejected: "已拒绝" })[status] || status;
-}
-
-async function loadCandidates() {
-  const rows = await api(`/candidates?status=${encodeURIComponent(candidateStatus)}`);
-  document.querySelectorAll("[data-candidate-status]").forEach((button) => button.classList.toggle("active", button.dataset.candidateStatus === candidateStatus));
-  const bulk = $("#purge-candidate-status");
-  bulk.hidden = candidateStatus === "pending" || rows.length === 0;
-  const list = $("#candidate-list");
-  list.innerHTML = rows.map((item) => {
-    const progress = item.promotion_progress;
-    const evidenceDates = item.evidence_dates?.length ? item.evidence_dates.join("、") : "暂无日期";
-    let lifecycle = "";
-    if (candidateStatus === "pending") lifecycle = `无活动过期：${localTime(item.lifecycle.expires_at)}`;
-    else lifecycle = `自动清理：${localTime(item.lifecycle.purge_at)}`;
-    const progressHtml = candidateStatus === "pending" ? `<div class="promotion-progress">
-      <span class="${progress.confidence_met ? "met" : ""}">置信度 ${Number(item.model_confidence).toFixed(2)}</span>
-      <span class="${progress.rem_approved ? "met" : ""}">REM ${escapeHtml(item.rem_status)}</span>
-      <span class="${progress.repeat_evidence.met ? "met" : ""}">不同日期证据 ${progress.repeat_evidence.current}/2</span>
-      <span class="${progress.utility.met ? "met" : ""}">实际作用 ${progress.utility.recalls}/2 次 · ${progress.utility.queries}/2 类查询</span>
-    </div>` : "";
-    const rem = item.rem_reason ? `<div class="candidate-reason">REM 判断：${escapeHtml(item.rem_reason)}</div>` : "";
-    const conflict = item.conflict_reason ? `<div class="conflict">冲突：${escapeHtml(item.conflict_reason)}</div>` : "";
-    let actions = `<button class="ghost" data-action="lineage-candidate" data-id="${item.id}">查看演化</button>`;
-    if (candidateStatus === "pending") actions += `<button data-action="promote-candidate" data-id="${item.id}">人工晋升</button><button class="danger" data-action="reject-candidate" data-id="${item.id}">拒绝</button><button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`;
-    else if (["expired", "rejected"].includes(candidateStatus)) actions += `<button data-action="restore-candidate" data-id="${item.id}">恢复</button><button class="danger" data-action="purge-candidate" data-id="${item.id}">永久删除</button>`;
-    const linked = item.linked_memory ? `<div class="candidate-reason">长期记忆：${escapeHtml(item.linked_memory.content)}</div>` : "";
-    const details = escapeHtml(JSON.stringify({ score: item.score_components, evidence_dates: item.evidence_dates, evidence: item.evidence }, null, 2));
-    return `<div class="card"><div class="card-content"><p class="candidate-copy">${escapeHtml(item.content)}</p><div class="meta"><span class="badge ${candidateStatus === "promoted" ? "success" : ""}">${candidateStatusName(candidateStatus)}</span> <span class="badge">${escapeHtml(item.kind)}</span> · 评分 ${Number(item.score).toFixed(2)} · 最后活动 ${localTime(item.last_activity_at)} · ${lifecycle}</div>${progressHtml}${rem}${conflict}${linked}<details><summary>证据日期 ${item.evidence_days}/2 · ${escapeHtml(evidenceDates)}</summary><pre>${details}</pre></details></div><div class="actions">${actions}</div></div>`;
-  }).join("") || emptyState(`当前没有${candidateStatusName(candidateStatus)}候选`);
-  staggerCards(list);
-}
-
-async function loadDreams() {
-  const rows = await api("/dream-runs");
-  const list = $("#dream-list");
-  list.innerHTML = rows.map((item) => `<div class="card"><div class="card-content"><p><b>${escapeHtml(item.status)}</b> · ${localTime(item.started_at)}</p><div class="meta">输入 ${item.input_count} · 新增 ${item.candidate_count} · 合并 ${item.merged_count} · 过滤 ${item.filtered_count} · 过期 ${item.expired_count} · 晋升 ${item.promoted_count} · Token ${item.input_tokens}/${item.output_tokens}</div>${item.error ? `<pre>${escapeHtml(item.error)}</pre>` : ""}</div><span class="badge">${escapeHtml(item.id.slice(0, 8))}</span></div>`).join("") || emptyState("尚无 Dream 运行记录");
-  staggerCards(list);
-}
-
-async function loadModelCalls() {
-  const rows = await api("/model-calls");
-  $("#call-list").innerHTML = rows.map((item) => {
-    const detail = escapeHtml(JSON.stringify({ request: item.request_json, response: item.response_json, error: item.error }, null, 2));
-    return `<div class="card"><div class="card-content"><p><b>${escapeHtml(item.phase)}</b> · ${escapeHtml(item.model)} · ${localTime(item.created_at)}</p><div class="meta">Token ${item.input_tokens}/${item.output_tokens} · Dream ${escapeHtml(item.dream_run_id)}</div><details><summary>查看请求与响应</summary><pre>${detail}</pre></details></div></div>`;
-  }).join("") || emptyState("尚无模型调用记录");
-}
-
-async function loadRecallTraces() {
-  const rows = await api("/recall-traces");
-  if (!rows.length) {
-    $("#trace-list").innerHTML = emptyState("尚无召回轨迹");
-    return;
-  }
-  const body = rows.map((item) => `<tr><td>${localTime(item.created_at)}</td><td>${escapeHtml(item.query_text)}</td><td>${escapeHtml(item.source)}</td><td>${escapeHtml(item.record_id)}</td><td>${item.keyword_rank ?? "—"} / ${Number(item.final_score).toFixed(3)}</td><td><span class="badge ${item.injected ? "success" : ""}">${item.injected ? "已注入" : "仅检索"}</span></td></tr>`).join("");
-  $("#trace-list").innerHTML = `<table><thead><tr><th>时间</th><th>查询</th><th>来源</th><th>记录</th><th>关键词排名 / 分数</th><th>作用</th></tr></thead><tbody>${body}</tbody></table>`;
-}
-
-async function loadBackups() {
-  const rows = await api("/backups");
-  $("#backup-list").innerHTML = rows.map((item) => `<div class="card"><div><p>${escapeHtml(item.name)}</p><div class="meta">${(item.bytes / 1024).toFixed(1)} KB · ${localTime(item.modified * 1000)}</div></div><button class="danger" data-action="restore-backup" data-name="${escapeHtml(item.name)}">恢复此备份</button></div>`).join("") || emptyState("尚无数据库备份");
-}
-
-function renderDailyChart(rows) {
-  const metrics = [
-    ["candidates", "新增候选", "#f0f0ee"], ["merged", "合并", "#b6b6b1"],
-    ["promoted", "晋升", "#80aa8d"], ["expired", "过期", "#696966"],
-    ["rejected", "拒绝", "#bd7478"], ["edited", "编辑", "#92928d"],
-  ];
-  $("#daily-legend").innerHTML = metrics.map(([, label, color]) => `<span><i style="background:${color}"></i>${label}</span>`).join("");
-  if (!rows.length) return emptyState("所选范围内还没有记忆变化");
-  const width = 960, height = 285, top = 14, bottom = 34, left = 32, right = 10;
-  const max = Math.max(1, ...rows.map((row) => metrics.reduce((sum, [key]) => sum + Number(row[key] || 0), 0)));
-  const innerWidth = width - left - right, innerHeight = height - top - bottom;
-  const step = innerWidth / rows.length, barWidth = Math.max(2, Math.min(18, step * .68));
-  const guides = [0, .5, 1].map((ratio) => {
-    const y = top + innerHeight * (1 - ratio);
-    return `<line class="grid-line" x1="${left}" y1="${y}" x2="${width-right}" y2="${y}"/><text x="2" y="${y+3}">${Math.round(max*ratio)}</text>`;
-  }).join("");
-  const labelEvery = Math.max(1, Math.ceil(rows.length / 8));
-  const bars = rows.map((row, index) => {
-    const x = left + index * step + (step - barWidth) / 2;
-    let y = top + innerHeight;
-    const segments = metrics.map(([key,, color], metricIndex) => {
-      const value = Number(row[key] || 0);
-      const segmentHeight = innerHeight * value / max;
-      y -= segmentHeight;
-      return value ? `<rect style="--i:${index + metricIndex}" x="${x.toFixed(2)}" y="${y.toFixed(2)}" width="${barWidth.toFixed(2)}" height="${Math.max(1, segmentHeight).toFixed(2)}" rx="2" fill="${color}"><title>${row.date} · ${metrics[metricIndex][1]} ${value}</title></rect>` : "";
-    }).join("");
-    const label = index % labelEvery === 0 || index === rows.length - 1 ? `<text text-anchor="middle" x="${(x+barWidth/2).toFixed(2)}" y="${height-10}">${escapeHtml(row.date.slice(5))}</text>` : "";
-    return segments + label;
-  }).join("");
-  return `<svg class="daily-svg" role="img" aria-label="每日记忆变化堆叠柱状图" viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">${guides}${bars}</svg>`;
-}
-
-function renderBars(items) {
-  const max = Math.max(1, ...items.map((item) => item.value));
-  if (!items.some((item) => item.value)) return emptyState("暂无数据");
-  return items.map((item) => `<div class="bar-row"><span>${escapeHtml(item.label)}</span><div class="bar-track"><i class="bar-value" style="--width:${(item.value/max*100).toFixed(1)}%;--shade:${item.color || "#efefed"}"></i></div><b>${item.value}</b></div>`).join("");
-}
-
-async function loadEvolution() {
-  const data = await api(`/analytics/memory-flow?range=${analyticsRange}`);
-  $("#analytics-timezone").textContent = `按 ${data.timezone} 统计`;
-  const totals = data.daily.reduce((sum, row) => {
-    for (const key of ["candidates", "merged", "promoted", "expired", "rejected", "edited", "recalls"]) sum[key] += Number(row[key] || 0);
-    return sum;
-  }, { candidates: 0, merged: 0, promoted: 0, expired: 0, rejected: 0, edited: 0, recalls: 0 });
-  $("#evolution-summary").innerHTML = [
-    ["新增候选", totals.candidates], ["合并去重", totals.merged], ["完成晋升", totals.promoted], ["实际注入", totals.recalls],
-  ].map(([label, value]) => `<div class="metric"><span>${label}</span><b data-count="${value}">0</b><small>${analyticsRange}</small></div>`).join("");
-  $("#evolution-summary").querySelectorAll("[data-count]").forEach((item) => countUp(item, Number(item.dataset.count)));
-  $("#daily-chart").innerHTML = renderDailyChart(data.daily);
-  $("#status-chart").innerHTML = renderBars([
-    { label: "待审核", value: data.status.pending || 0 },
-    { label: "长期有效", value: data.status.active_memories || 0, color: "#efefed" }, { label: "已过期", value: data.status.expired || 0, color: "#696966" },
-    { label: "已拒绝", value: data.status.rejected || 0, color: "#bd7478" },
-  ]);
-  $("#lane-chart").innerHTML = renderBars(Object.entries(data.promotion_lanes).map(([key, value], index) => ({ label: laneLabels[key] || key, value, color: ["#f0f0ee", "#b8b8b3", "#80aa8d", "#777773", "#545451"][index] })));
-  $("#recent-events").innerHTML = data.recent.map((item) => {
-    const id = item.candidate_id || item.memory_id;
-    const type = item.candidate_id ? "candidate" : "memory";
-    const origin = item.backfilled ? "历史回填" : item.dream_run_id ? "Dream" : "实时记录";
-    return `<button class="event-row" ${id ? `data-action="lineage-${type}" data-id="${escapeHtml(id)}"` : "disabled"}><time>${escapeHtml(item.occurred_at.slice(0, 10))}</time><span>${escapeHtml(eventLabels[item.event_type] || item.event_type)}</span><small>${origin} →</small></button>`;
-  }).join("") || emptyState("所选范围内还没有变化记录");
-}
-
-async function mutate(path, body = {}, method = "POST", { reload = true } = {}) {
-  const result = await api(path, { method, body: JSON.stringify(body) });
-  showNotice("操作已完成");
+async function mutate(path, body={}, method="POST", reload=true) {
+  const result = await api(path, {method, body:JSON.stringify(body)});
   if (reload) await loadAll();
   return result;
 }
-
-function openEditor(memory = null) {
-  editing = memory;
-  $("#edit-content").value = memory?.content || "";
-  $("#edit-kind").value = memory?.kind || "fact";
-  $("#editor-title").textContent = memory ? "编辑长期记忆" : "新增长期记忆";
-  $("#editor").showModal();
+function nav(workspace, tab) {
+  $$("[data-workspace]").forEach(b => b.classList.toggle("active", b.dataset.workspace === workspace));
+  $$(".workspace").forEach(p => p.classList.toggle("active", p.id === workspace));
+  const [title, subtitle] = workspaceMeta[workspace]; $("#page-title").textContent = title; $("#page-subtitle").textContent = subtitle;
+  if (workspace === "system" && tab) showSystem(tab);
+  if (workspace === "library" && tab) showLibrary(tab);
 }
+function showSystem(tab) { systemTab = tab; $$('[data-system-tab]').forEach(b=>b.classList.toggle('active',b.dataset.systemTab===tab)); $$('.system-pane').forEach(p=>p.classList.toggle('active',p.id===`system-${tab}`)); }
+function showLibrary(tab) { libraryTab = tab; $$('[data-library-tab]').forEach(b=>b.classList.toggle('active',b.dataset.libraryTab===tab)); $("#library-filter").innerHTML = tab === "memories" ? '<option value="active">当前</option><option value="trashed">回收站</option><option value="superseded">历史</option><option value="all">全部</option>' : tab === "work" ? '<option value="current">进行中</option><option value="suggested">待确认</option><option value="archived">归档</option><option value="all">全部</option>' : '<option value="active">活跃</option><option value="paused">暂停</option><option value="archived">归档</option><option value="all">全部</option>'; loadLibrary().catch(fail); }
+function fail(error) { console.error(error); notice(error.message || String(error), true); }
 
-function confirmAction(message, title = "确认危险操作", buttonText = "确认") {
-  return new Promise((resolve) => {
-    const dialog = $("#confirm-dialog");
-    $("#confirm-title").textContent = title;
-    $("#confirm-message").textContent = message;
-    $("#confirm-submit").textContent = buttonText;
-    const close = () => { dialog.removeEventListener("close", close); resolve(dialog.returnValue === "confirm"); };
-    dialog.addEventListener("close", close);
-    dialog.showModal();
-  });
-}
-
-function eventDescription(event) {
-  const data = event.data || {};
-  if (event.event_type === "candidate_promoted") return `通道：${laneLabels[data.promotion_lane] || data.promotion_lane || "未知"}${data.candidate_content && data.memory_content && data.candidate_content !== data.memory_content ? " · Deep 已整理候选原文" : ""}`;
-  if (event.event_type === "rem_reviewed") return data.reason || `结果：${data.decision || "未知"}`;
-  if (event.event_type === "evidence_added") return data.excerpt || "候选获得新的真实会话证据";
-  if (event.event_type === "candidate_merged") return data.reason || "同义候选的证据已合并";
-  if (event.event_type === "memory_updated") return data.previous_content && data.content ? `${data.previous_content} → ${data.content}` : "内容或类型已修订";
-  return data.reason || data.content || "状态已记录";
-}
-
-async function openLineage(type, id) {
-  const data = await api(`/lineage/${type}/${encodeURIComponent(id)}`);
-  const candidate = data.candidate;
-  const memory = data.memory;
-  $("#lineage-title").textContent = memory ? "长期记忆演化" : "候选记忆演化";
-  $("#lineage-subtitle").textContent = `时区 ${data.timezone} · 注入 ${data.recall_summary.injected} 次`;
-  const comparison = candidate || memory ? `<div class="lineage-compare">
-    <div class="lineage-node"><span>候选原文</span><p>${escapeHtml(candidate?.content || "没有候选来源（人工或 Hermes 直接写入）")}</p></div>
-    <div class="lineage-arrow">→</div>
-    <div class="lineage-node"><span>长期记忆</span><p>${escapeHtml(memory?.content || "尚未晋升")}</p></div>
-  </div>` : "";
-  const evidence = data.evidence.length ? `<div class="lineage-head"><span class="eyebrow">EVIDENCE</span><p>${data.evidence.map((item) => `${escapeHtml(item.local_date)} · ${escapeHtml(item.excerpt || "已关联会话")}`).join("<br>")}</p></div>` : "";
-  const timeline = data.events.map((event) => `<div class="timeline-item ${event.backfilled ? "backfilled" : ""}"><i class="timeline-dot"></i><div><time>${escapeHtml(event.occurred_at)} · ${event.backfilled ? "历史回填" : event.dream_run_id ? `Dream ${escapeHtml(event.dream_run_id.slice(0, 8))}` : "实时记录"}</time><h3>${escapeHtml(eventLabels[event.event_type] || event.event_type)}</h3><p>${escapeHtml(eventDescription(event))}</p></div></div>`).join("");
-  const revisions = data.revisions.length ? `<details><summary>查看 ${data.revisions.length} 条旧版本</summary><pre>${escapeHtml(JSON.stringify(data.revisions, null, 2))}</pre></details>` : "";
-  $("#lineage-content").innerHTML = `${comparison}${evidence}<div class="timeline ${data.events.some((item) => item.backfilled) ? "backfilled" : ""}">${timeline || emptyState("暂无可还原的历史事件")}</div>${revisions}`;
-  $("#lineage-dialog").showModal();
-}
-
-function setDreaming(active) {
-  const overlay = $("#dream-overlay");
-  overlay.classList.toggle("active", active);
-  overlay.setAttribute("aria-hidden", active ? "false" : "true");
-}
-
-async function handleAction(button) {
-  const action = button.dataset.action;
-  const id = button.dataset.id;
-  if (action === "edit-memory") openEditor(memoriesById.get(id));
-  else if (action === "lineage-memory") await openLineage("memory", id);
-  else if (action === "lineage-candidate") await openLineage("candidate", id);
-  else if (action === "trash-memory") await mutate(`/memories/${id}/trash`);
-  else if (action === "restore-memory") await mutate(`/memories/${id}/restore`);
-  else if (action === "purge-memory") {
-    if (await confirmAction("这会清除该记忆、关联候选、证据、会话、Dream 日志、演化事件和旧备份，无法撤销。", "永久删除长期记忆", "永久删除")) await mutate(`/memories/${id}`, {}, "DELETE");
-  } else if (action === "promote-candidate") await mutate(`/candidates/${id}/promote`);
-  else if (action === "reject-candidate") await mutate(`/candidates/${id}/reject`);
-  else if (action === "restore-candidate") await mutate(`/candidates/${id}/restore`);
-  else if (action === "purge-candidate") {
-    if (await confirmAction("这会清除候选、关联证据、召回、索引、演化事件和旧备份，无法撤销。", "永久删除候选记忆", "永久删除")) await mutate(`/candidates/${id}`, {}, "DELETE");
-  } else if (action === "restore-backup") {
-    if (await confirmAction("系统会先保存当前状态，再恢复所选备份。当前数据库内容将被替换。", "恢复数据库备份", "恢复备份")) await mutate(`/backups/${encodeURIComponent(button.dataset.name)}/restore`);
-  }
-}
-
-function navigate(page) {
-  document.querySelectorAll("nav button,.page").forEach((item) => item.classList.remove("active"));
-  const nav = document.querySelector(`nav button[data-page="${page}"]`);
-  nav?.classList.add("active");
-  $(`#${page}`).classList.add("active");
-  $("#title").textContent = (nav?.textContent.trim() || "记忆演化").replace(/^\d+\s*/, "");
-  $("#subtitle").textContent = pageDescriptions[page];
-  window.scrollTo({ top: 0, behavior: "smooth" });
-}
-
-document.addEventListener("click", async (event) => {
-  const button = event.target.closest("button");
-  if (!button || button.disabled) return;
+async function loadAll() {
   try {
-    if (button.dataset.page) navigate(button.dataset.page);
-    else if (button.dataset.range) {
-      analyticsRange = button.dataset.range;
-      document.querySelectorAll("[data-range]").forEach((item) => item.classList.toggle("active", item === button));
-      await loadEvolution();
-    } else if (button.dataset.candidateStatus) {
-      candidateStatus = button.dataset.candidateStatus;
-      await loadCandidates();
-    } else if (button.dataset.action) await handleAction(button);
-    else if (button.id === "refresh") await loadAll();
-    else if (["run-dream", "dry-dream"].includes(button.id)) {
-      setDreaming(true);
-      try { await mutate("/dream/run", { dry_run: button.id === "dry-dream" }); } finally { setDreaming(false); }
-    } else if (button.id === "create-backup") await mutate("/backup");
-    else if (button.id === "rebuild") await mutate("/rebuild");
-    else if (button.id === "rebuild-vector") await mutate("/rebuild", { embeddings: true });
-    else if (button.id === "vacuum") {
-      if (await confirmAction("将按保留策略清理数据并压缩 SQLite 数据库。建议先确认已有近期备份。", "清理并压缩数据库", "开始维护")) await mutate("/maintenance", { vacuum: true, cleanup: true });
-    } else if (button.dataset.test) await mutate("/model/test", { kind: button.dataset.test });
-    else if (button.id === "add-memory") openEditor();
-    else if (button.id === "adopt-timezone") $("#general-form").elements.timezone.value = button.dataset.timezone;
-    else if (button.id === "purge-candidate-status") {
-      const label = candidateStatusName(candidateStatus);
-      if (await confirmAction(`将永久删除全部${label}候选及其关联内容、演化记录和旧备份，无法撤销。`, `清空${label}分区`, "全部删除")) await mutate("/candidates/purge", { status: candidateStatus });
-    }
-  } catch (error) { showNotice(error.message, true); }
-});
-
-$("#editor").addEventListener("close", async () => {
-  if ($("#editor").returnValue !== "save") return;
-  const body = { content: $("#edit-content").value, kind: $("#edit-kind").value };
-  try {
-    if (editing) await mutate(`/memories/${editing.id}`, body, "PATCH");
-    else await mutate("/memories", body);
-  } catch (error) { showNotice(error.message, true); }
-});
-
-for (const section of ["general", "llm", "embedding", "dream", "recall", "retention"]) {
-  const form = $(`#${section}-form`);
-  if (!form) continue;
-  form.addEventListener("submit", async (event) => {
-    event.preventDefault();
-    const body = {};
-    for (const input of form.elements) {
-      if (!input.name || input.name === "api_key") continue;
-      if (input.type === "checkbox") body[input.name] = input.checked;
-      else if (input.type === "number") body[input.name] = Number(input.value);
-      else body[input.name] = input.value;
-    }
-    try {
-      await api(`/settings/${section}`, { method: "POST", body: JSON.stringify(body) });
-      const secretInput = form.elements.api_key;
-      if (secretInput?.value) {
-        const secretName = section === "llm" ? "llm_api_key" : "embedding_api_key";
-        await api(`/secrets/${secretName}`, { method: "POST", body: JSON.stringify({ value: secretInput.value }) });
-        secretInput.value = "";
-      }
-      showNotice("设置已保存");
-      await loadAll();
-    } catch (error) { showNotice(error.message, true); }
-  });
+    const bootstrap = await api("/bootstrap"); statusData = bootstrap.status;
+    await Promise.all([loadOverview(), loadSettings(), loadLibrary(), loadProjects(), loadReviews(), loadDreams(), loadTraces(), loadCalls(), loadStorage(), loadIngestionIssues(), loadBackups()]);
+  } catch (error) { fail(error); }
 }
 
-$("#memory-search").addEventListener("input", loadMemories);
-$("#memory-status").addEventListener("change", loadMemories);
-$("#export").addEventListener("click", async (event) => {
-  if (!dashboardBridge) { event.currentTarget.href = `${base}/export`; return; }
-  event.preventDefault();
-  try {
-    const content = await dashboardBridge.exportText();
-    const url = URL.createObjectURL(new Blob([content], { type: "application/x-ndjson;charset=utf-8" }));
-    const download = document.createElement("a");
-    download.href = url;
-    download.download = "b1ack-memory.jsonl";
-    download.click();
-    URL.revokeObjectURL(url);
-  } catch (error) { showNotice(error.message, true); }
-});
+async function loadOverview() {
+  const s = statusData; const c = s.counts || {};
+  const metrics = [["长期记忆",c.active_memories,"durable"],["活跃项目",c.active_projects,"projects"],["工作项",c.active_work_items,"working"],["开放审核",c.open_reviews,"reviews"],["存储健康",s.storage?.ok?1:0,s.storage?.ok?"healthy":"attention"],["最近备份",(await api('/backups')).length,"archives"]];
+  $("#metrics").innerHTML = metrics.map(([label,value,note])=>`<div class="metric"><span>${label}</span><b>${value ?? 0}</b><small>${note}</small></div>`).join("");
+  const attention=[]; if(c.open_reviews) attention.push(`${c.open_reviews} 项审核需要处理`); if(c.suggested_work_items) attention.push(`${c.suggested_work_items} 条工作记忆待确认归属`); if(s.audit_due) attention.push("全池审计已到期"); if(!s.storage?.ok) attention.push("存储投影需要维护");
+  const box=$("#needs-attention"); box.hidden=!attention.length; box.innerHTML=attention.length?`<h2>需要处理</h2><ul>${attention.map(x=>`<li>${esc(x)}</li>`).join('')}</ul>`:"";
+  $("#health").innerHTML = [["数据库",s.database?.integrity],["vault 投影",s.storage?.ok?"正常":`${s.storage?.projection_pending||0} 个任务`],["Dream 模型",s.llm?.configured?`${s.llm.model} · 已配置`:"未配置"],["下一次 Dream",when(s.next_dream)]].map(([a,b])=>`<div class="health-row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join("");
+  const runs=await api('/dream-runs?limit=5'); $("#recent-activity").innerHTML=runs.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">Dream · ${esc(r.status)}</div><div class="list-meta">${when(r.started_at)} · admit ${r.admitted_count||0} · work ${r.work_item_count||0} · review ${r.review_count||0}</div></div>${badge(r.error?'blocked':'complete',r.error?'danger':'good')}</div>`).join('')||empty('还没有 Dream 记录');
+}
 
+async function loadLibrary() {
+  const query=($("#library-search")?.value||"").toLowerCase(); const filter=$("#library-filter")?.value||"active"; let rows=[];
+  if(libraryTab==='memories'||libraryTab==='history') {
+    const statuses=libraryTab==='history'?['superseded','trashed']:(filter==='all'?['active','superseded','trashed']:[filter]);
+    rows=(await Promise.all(statuses.map(s=>api(`/memories?status=${s}`)))).flat();
+  } else if(libraryTab==='work') {
+    if(filter==='current') rows=[...(await api('/work-items?status=active')),...(await api('/work-items?status=suggested'))]; else if(filter==='all') rows=await api('/work-items'); else rows=await api(`/work-items?status=${filter}`);
+  } else { rows=await api(`/subjects${filter==='all'?'':`?status=${filter}`}`); }
+  rows=rows.filter(r=>JSON.stringify(r).toLowerCase().includes(query));
+  $("#library-list").innerHTML=rows.map(r=>{
+    if(libraryTab==='memories'||libraryTab==='history') return `<div class="list-row" data-open="memory" data-id="${r.id}"><div class="list-main"><div class="list-title">${esc(r.content)}</div><div class="list-meta">${badge(r.kind)} ${badge(r.temporal_status,r.temporal_status==='current'?'good':'warn')} ${r.subjects?.map(s=>badge(s.name)).join('')||''} · ${when(r.updated_at)}</div></div>${r.open_review_count?badge(`${r.open_review_count} 审核`,'danger'):''}</div>`;
+    if(libraryTab==='work') return `<div class="list-row" data-open="work" data-id="${r.id}"><div class="list-main"><div class="list-title">${esc(r.content)}</div><div class="list-meta">${badge(r.item_type)} ${badge(r.status,r.status==='active'?'good':r.status==='suggested'?'warn':'')} ${r.subject_name?badge(r.subject_name):''} · ${when(r.updated_at)}</div></div>${r.confirmed?badge('用户确认','good'):badge('未确认','warn')}</div>`;
+    return `<div class="list-row" data-open="subject" data-id="${r.id}"><div class="list-main"><div class="list-title">${esc(r.name)}</div><div class="list-meta">${badge(r.subject_type)} ${badge(r.status,r.status==='active'?'good':'warn')} · ${r.link_count||0} 个关联 · ${r.work_item_count||0} 个工作项</div></div><span>›</span></div>`;
+  }).join('')||empty('当前筛选没有条目');
+}
+
+async function loadProjects() {
+  const projects=await api('/projects'); const q=($("#project-search")?.value||'').toLowerCase(); const visible=projects.filter(p=>p.name.toLowerCase().includes(q));
+  $("#project-list").innerHTML=visible.map(p=>`<button data-project="${p.id}" class="${p.id===currentProject?'active':''}">${esc(p.name)}<small>${esc(p.status)} · ${p.work_item_count||0} 工作项</small></button>`).join('')||empty('还没有项目');
+  if(currentProject && projects.some(p=>p.id===currentProject)) await renderProject(currentProject); else if(visible.length && !currentProject){currentProject=visible[0].id;await renderProject(currentProject);}
+}
+async function renderProject(id) {
+  currentProject=id; $$('[data-project]').forEach(b=>b.classList.toggle('active',b.dataset.project===id)); const p=await api(`/projects/${id}`); const summary=p.summary;
+  const grouped={decision:[],current_state:[],open_question:[],milestone:[],proposal:[]}; (p.work_items||[]).forEach(w=>(grouped[w.item_type]||grouped.proposal).push(w));
+  const chips=(items)=>items.filter(i=>i.status==='active').map(i=>`<div class="work-chip" data-open="work" data-id="${i.id}">${esc(i.content)}</div>`).join('')||'<div class="muted">暂无</div>';
+  $("#project-workbench").innerHTML=`<div class="project-hero"><div><span class="eyebrow">${esc(p.status.toUpperCase())}</span><h2>${esc(p.name)}</h2><p class="muted">${esc(p.description||'未填写项目说明')}</p></div><div class="row"><button class="quiet small" data-context="${p.id}">上下文预览</button><button class="quiet small" data-summary="${p.id}">重建摘要</button><a class="button quiet small" href="${base}/projects/${p.id}/export" target="_blank">导出</a><button class="quiet small" data-edit-project="${p.id}">设置</button></div></div><article class="panel"><div class="panel-head"><div><span>SUMMARY</span><h2>项目摘要</h2></div>${summary?badge(summary.mode==='manual_override'?'手工锁定':'自动','good'):badge('未生成','warn')}</div><p class="muted">${summary?esc(summary.content):'尚无可追溯摘要；召回会回退到原子记忆和工作项。'}</p></article><div class="work-columns"><div class="work-column"><h3>当前状态</h3>${chips(grouped.current_state)}</div><div class="work-column"><h3>已确认决定</h3>${chips(grouped.decision)}</div><div class="work-column"><h3>开放问题</h3>${chips(grouped.open_question)}</div></div><details class="panel details"><summary>提案、里程碑与历史工作项</summary>${[...grouped.proposal,...grouped.milestone,...p.work_items.filter(w=>!['active'].includes(w.status))].map(w=>`<div class="work-chip" data-open="work" data-id="${w.id}">${badge(w.item_type)} ${badge(w.status)} ${esc(w.content)}</div>`).join('')||empty('暂无')}</details>`;
+}
+
+async function loadReviews() {
+  const [decisions,suggestions]=await Promise.all([api('/reviews?status=open&queue=decision'),api('/reviews?status=open&queue=suggestion')]); $("#decision-count").textContent=decisions.length; $("#suggestion-count").textContent=suggestions.length;
+  const rows=reviewTab==='resolved'?await api('/reviews?status=resolved'):reviewTab==='suggestion'?suggestions:decisions;
+  $$('[data-review-tab]').forEach(b=>b.classList.toggle('active',b.dataset.reviewTab===reviewTab));
+  $("#review-list").innerHTML=rows.map(r=>`<div class="list-row" data-open="review" data-id="${r.id}"><div class="list-main"><div class="list-title">${esc(r.proposed_content||r.reason)}</div><div class="list-meta">${badge(r.issue_type,r.queue==='decision'?'danger':'warn')} ${badge(r.proposed_action)} · ${Math.round((r.confidence||0)*100)}% · ${when(r.created_at)}</div></div><span>›</span></div>`).join('')||empty(reviewTab==='decision'?'没有需要决定的高风险事项':'当前队列为空');
+}
+
+async function loadDreams(){const rows=await api('/dream-runs?limit=80');$("#dream-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${when(r.started_at)} · ${esc(r.status)}</div><div class="list-meta">输入 ${r.input_count||0} · admit ${r.admitted_count||0} · observe ${r.observed_count||0} · discard ${r.discarded_count||0} · 工作项 ${r.work_item_count||0} · 归属 ${r.assignment_count||0} · 摘要 ${r.summary_count||0} · 投影 ${r.projection_count||0}</div>${r.error?`<div class="list-meta">${esc(r.error)}</div>`:''}</div>${badge(r.blocked_count?`${r.blocked_count} 阻塞`:'完成',r.blocked_count?'danger':'good')}</div>`).join('')||empty('暂无 Dream 日志');}
+async function loadTraces(){const rows=await api('/recall-traces?limit=200');$("#trace-list").innerHTML=`<table><thead><tr><th>时间</th><th>查询</th><th>来源</th><th>项目</th><th>注入</th><th>分数</th></tr></thead><tbody>${rows.map(r=>`<tr><td>${when(r.created_at)}</td><td>${esc(r.query_text)}</td><td>${esc(r.source)}</td><td>${r.project_id?`${esc(r.project_reason||'')} · ${Math.round((r.project_confidence||0)*100)}%`:'未识别'}</td><td>${r.injected?'是':'否'}</td><td>${Number(r.final_score||0).toFixed(3)}</td></tr>`).join('')}</tbody></table>`;}
+async function loadCalls(){const rows=await api('/model-calls?limit=40');$("#call-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.phase)} · ${esc(r.model)}</div><div class="list-meta">${when(r.created_at)} · input ${r.input_tokens||0} · output ${r.output_tokens||0}</div></div>${r.error?badge('失败','danger'):badge('成功','good')}</div>`).join('')||empty('暂无模型调用');}
+async function loadStorage(){const s=await api('/maintenance/storage');const permissions=(s.permissions||[]).map(p=>[p.path.split(/[\\/]/).pop()||p.path,p.managed_by==='windows_acl'?'Windows ACL':(p.safe?`安全 ${p.mode}`:`需修复 ${p.mode}`)]);$("#storage-health").innerHTML=[["SQLite integrity",s.database_integrity],["待处理投影",s.projection_pending],["已校验 vault 文件",s.vault_files_checked],["状态",s.ok?'正常':(s.errors||[]).join('；')],...permissions].map(([a,b])=>`<div class="health-row"><span>${esc(a)}</span><b>${esc(b)}</b></div>`).join('');}
+async function loadIngestionIssues(){const rows=await api('/maintenance/ingestion-issues');$("#ingestion-issues").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.session_id||'未知会话')} · ${esc(r.ingest_status)}</div><div class="list-meta">${when(r.observed_at)} · 尝试 ${r.ingest_attempts} 次 · 游标 ${r.ingest_cursor}/${r.content_length}<br>${esc(r.last_ingest_error||'')}</div></div><button class="quiet small" data-retry-ingestion="${r.id}">重新处理</button></div>`).join('')||empty('没有隔离或待重试条目');}
+async function loadBackups(){const rows=await api('/backups');$("#backup-list").innerHTML=rows.map(r=>`<div class="list-row"><div class="list-main"><div class="list-title">${esc(r.name)}</div><div class="list-meta">${(r.bytes/1024/1024).toFixed(2)} MB · ${when(r.modified*1000)}</div></div><button class="quiet small" data-preview-backup="${esc(r.name)}">恢复预演</button></div>`).join('')||empty('还没有备份');}
+
+async function loadSettings(){settings=await api('/settings');for(const section of ['general','llm','embedding','dream','recall','retention']){const form=$(`#${section}-form`);if(!form)continue;for(const [key,value] of Object.entries(settings[section]||{})){const input=form.elements[key];if(!input)continue;if(input.type==='checkbox')input.checked=Boolean(value);else input.value=value??'';}}$("#llm-key").textContent=`Key：${settings.secrets.llm_api_key.configured?'已配置':'未配置'}`;$("#embedding-key").textContent=`Key：${settings.secrets.embedding_api_key.configured?'已配置':'未配置'}`;$("#detected-timezone").textContent=`浏览器时区：${Intl.DateTimeFormat().resolvedOptions().timeZone||'system'}`;}
+
+function openDrawer(html){$("#drawer-content").innerHTML=html;$("#drawer").classList.add('open');$("#drawer").setAttribute('aria-hidden','false');$("#drawer-scrim").hidden=false;}
+function closeDrawer(){$("#drawer").classList.remove('open');$("#drawer").setAttribute('aria-hidden','true');$("#drawer-scrim").hidden=true;}
+async function detail(type,id){
+  if(type==='memory'){const rows=(await Promise.all(['active','superseded','trashed'].map(s=>api(`/memories?status=${s}`)))).flat();const m=rows.find(x=>x.id===id);if(!m)return;openDrawer(`<span class="eyebrow">LONG-TERM MEMORY</span><h2>${esc(m.content)}</h2><div class="list-meta">${badge(m.kind)} ${badge(m.status)} ${badge(m.temporal_status)}</div><div class="detail-section"><h3>有效时间</h3><p>${esc(m.valid_from||'未指定')} → ${esc(m.valid_to||'当前')}</p><p class="muted">${esc(m.temporal_reason||'无变更原因')}</p></div><div class="detail-section"><h3>项目与实体</h3><p>${m.subjects?.map(s=>badge(s.name)).join(' ')||'全局记忆'}</p></div><div class="detail-section"><h3>来源与版本</h3><p>来源：${esc(m.origin_label||m.origin)} · 修订 ${m.revision_count||0} · ${when(m.updated_at)}</p></div><div class="detail-section row">${m.status==='active'?`<button data-edit-memory="${m.id}">编辑</button><button class="danger" data-trash-memory="${m.id}">移入回收站</button>`:m.status==='trashed'?`<button data-restore-memory="${m.id}">恢复</button><button class="danger" data-purge-memory="${m.id}">永久删除</button>`:`<button data-restore-memory="${m.id}">恢复为当前</button>`}</div>`);}
+  if(type==='work'){const w=(await api('/work-items')).find(x=>x.id===id);if(!w)return;openDrawer(`<span class="eyebrow">WORKING MEMORY</span><h2>${esc(w.content)}</h2><div class="list-meta">${badge(w.item_type)} ${badge(w.status)} ${w.subject_name?badge(w.subject_name):badge('未归属','warn')}</div><div class="detail-section"><h3>用户证据</h3><div class="quote">${esc(w.evidence_quote||'没有可验证用户原话')}</div><p class="muted">确认状态：${w.confirmed?'已确认':'未确认'} · 到期：${when(w.expires_at)}</p></div><div class="detail-section"><h3>版本</h3><p>${w.revisions?.length||0} 次可追溯修改</p></div><div class="detail-section row">${w.status==='suggested'?`<button data-work-action="confirm" data-id="${w.id}">确认</button>`:''}${['active','suggested'].includes(w.status)?`<button class="quiet" data-work-action="resolve" data-id="${w.id}">解决</button><button class="quiet" data-work-action="archive" data-id="${w.id}">归档</button>`:''}<button class="quiet" data-work-action="promote" data-id="${w.id}">转长期候选</button></div>`);}
+  if(type==='subject'){const s=await api(`/subjects/${id}`);openDrawer(`<span class="eyebrow">${esc(s.subject_type.toUpperCase())}</span><h2>${esc(s.name)}</h2><div class="list-meta">${badge(s.status)} ${(s.aliases||[]).map(a=>badge(a)).join('')}</div><div class="detail-section"><h3>说明</h3><p class="muted">${esc(s.description||'暂无说明')}</p></div><div class="detail-section"><h3>关系与影响</h3><p>${s.links?.length||0} 个对象关联 · ${s.relations?.length||0} 条实体关系</p></div><div class="detail-section row"><button data-edit-subject="${s.id}">编辑</button><button class="quiet" data-merge-subject="${s.id}">合并</button><button class="quiet" data-split-subject="${s.id}">拆分</button><button class="quiet" data-relate-subject="${s.id}">添加关系</button>${s.subject_type==='project'?`<button class="quiet" data-context="${s.id}">上下文预览</button>`:''}</div>`);}
+  if(type==='review'){const rows=[...(await api('/reviews?status=open')),...(await api('/reviews?status=resolved')),...(await api('/reviews?status=dismissed'))];const r=rows.find(x=>x.id===id);if(!r)return;const current=r.primary_memory||r.related_memory;openDrawer(`<span class="eyebrow">REVIEW · ${esc(r.queue.toUpperCase())}</span><h2>${esc(r.issue_type)}</h2><p class="muted">${esc(r.reason)}</p><div class="detail-section"><h3>建议与影响</h3><div class="diff"><div class="old"><b>现有</b><p>${esc(current?.content||'无相关长期记忆')}</p></div><div class="new"><b>建议</b><p>${esc(r.proposed_content||r.proposed_action)}</p></div></div></div>${r.candidate?.evidence?.length?`<div class="detail-section"><h3>用户证据</h3>${r.candidate.evidence.map(e=>`<div class="quote">${esc(e.excerpt)}</div>`).join('')}</div>`:''}${r.status==='open'?`<div class="detail-section row"><button data-resolve-review="${r.id}" data-action="${esc(reviewAction(r))}">${esc(reviewLabel(r))}</button><button class="quiet" data-dismiss-review="${r.id}">保留现状</button></div>`:''}`);}
+}
+function reviewAction(r){if(r.issue_type==='project_assignment')return'confirm_assignment';if(r.issue_type==='stale_work_item')return'archive_work_item';if(r.issue_type==='summary_refresh')return'refresh_summary';return r.proposed_action==='defer'?'keep':r.proposed_action;}
+function reviewLabel(r){return({confirm_assignment:'确认归属',archive_work_item:'归档工作项',refresh_summary:'刷新摘要',merge:'合并',supersede:'替代',create:'新建长期记忆',trash:'回收',keep:'保留'})[reviewAction(r)]||'执行建议';}
+
+function formDialog(title,fields,onSave,eyebrow='EDIT'){const d=$("#form-dialog");$("#form-title").textContent=title;$("#form-eyebrow").textContent=eyebrow;$("#form-fields").innerHTML=fields;d.returnValue='';d.showModal();d.onclose=async()=>{if(d.returnValue!=='save')return;try{await onSave(new FormData($("#dynamic-form")));closeDrawer();await loadAll();}catch(e){fail(e);}};}
+function confirmDialog(title,message,confirmText=''){return new Promise(resolve=>{const d=$("#confirm-dialog");$("#confirm-title").textContent=title;$("#confirm-message").textContent=message;$("#confirm-text-wrap").hidden=!confirmText;$("#confirm-text").value='';d.showModal();d.onclose=()=>resolve(d.returnValue==='confirm'&&(!confirmText||$("#confirm-text").value===confirmText));});}
+async function contextPreview(projectId,query=''){const p=await api(`/projects/${projectId}/context-preview?query=${encodeURIComponent(query)}`);openDrawer(`<span class="eyebrow">CONTEXT PREVIEW</span><h2>${esc(p.project_detection.project?.name||'仅全局记忆')}</h2><p class="muted">置信度 ${Math.round((p.project_detection.confidence||0)*100)}% · ${esc(p.project_detection.reason)} · ${p.budget.used_chars}/${p.budget.max_chars} 字符</p><div class="detail-section"><label>模拟当前查询<input id="preview-query" value="${esc(query)}" placeholder="输入一条查询后刷新预览"></label><button class="quiet small" data-refresh-context="${esc(projectId)}">刷新预览</button></div><div class="detail-section"><h3>将注入</h3>${p.items.map(i=>`<div class="quote">${esc(i.rendered)}</div>`).join('')||empty('没有内容')}</div><div class="detail-section"><h3>已排除</h3>${p.excluded.map(i=>`<p>${esc(i.id)} · ${esc(i.reason)}</p>`).join('')||'<p class="muted">无</p>'}</div>`);}
+
+document.addEventListener('click',async event=>{const b=event.target.closest('button,[data-open]');if(!b)return;try{
+  if(b.dataset.workspace) return nav(b.dataset.workspace);
+  if(b.dataset.go) return nav(b.dataset.go,b.dataset.tab);
+  if(b.dataset.libraryTab) return showLibrary(b.dataset.libraryTab);
+  if(b.dataset.systemTab) return showSystem(b.dataset.systemTab);
+  if(b.dataset.reviewTab){reviewTab=b.dataset.reviewTab;return loadReviews();}
+  if(b.dataset.open) return detail(b.dataset.open,b.dataset.id);
+  if(b.dataset.project){currentProject=b.dataset.project;return renderProject(currentProject);}
+  if(b.dataset.context) return contextPreview(b.dataset.context);
+  if(b.dataset.refreshContext) return contextPreview(b.dataset.refreshContext,$("#preview-query")?.value||'');
+  if(b.id==='refresh') return loadAll();
+  if(b.id==='global-search'){nav('library');$("#library-search").focus();return;}
+  if(b.id==='add-project') return formDialog('新建项目','<label>名称<input name="name" required></label><label>说明<textarea name="description"></textarea></label><label>别名（逗号分隔）<input name="aliases"></label><label>工作目录（逗号分隔）<input name="workspace_aliases"></label>',f=>mutate('/projects',{name:f.get('name'),description:f.get('description'),aliases:String(f.get('aliases')).split(',').filter(Boolean),workspace_aliases:String(f.get('workspace_aliases')).split(',').filter(Boolean)},'POST',false),'PROJECT');
+  if(b.id==='library-create'){if(libraryTab==='memories')return formDialog('新增长期记忆','<label>类型<select name="kind"><option>fact</option><option>preference</option><option>decision</option><option>project</option><option>procedure</option></select></label><label>内容<textarea name="content" rows="6" required></textarea></label>',f=>mutate('/memories',{kind:f.get('kind'),content:f.get('content')},'POST',false),'LONG-TERM MEMORY');if(libraryTab==='subjects')return formDialog('新建主题或实体','<label>类型<select name="subject_type"><option>topic</option><option>person</option><option>organization</option><option>tool</option></select></label><label>名称<input name="name" required></label><label>说明<textarea name="description"></textarea></label>',f=>mutate('/subjects',Object.fromEntries(f),'POST',false),'SUBJECT');notice('工作记忆由 Dream observe 或项目工作台产生');return;}
+  if(b.dataset.editMemory){const all=(await api('/memories?status=active'));const m=all.find(x=>x.id===b.dataset.editMemory);return formDialog('编辑长期记忆',`<label>类型<input name="kind" value="${esc(m.kind)}"></label><label>内容<textarea name="content" rows="6">${esc(m.content)}</textarea></label><div class="form-pair"><label>有效开始<input name="valid_from" value="${esc(m.valid_from||'')}"></label><label>有效结束<input name="valid_to" value="${esc(m.valid_to||'')}"></label></div><label>时间状态<select name="temporal_status"><option ${m.temporal_status==='current'?'selected':''}>current</option><option ${m.temporal_status==='historical'?'selected':''}>historical</option><option ${m.temporal_status==='disputed'?'selected':''}>disputed</option></select></label><label>变更原因<textarea name="temporal_reason">${esc(m.temporal_reason||'')}</textarea></label>`,f=>mutate(`/memories/${m.id}`,Object.fromEntries(f),'PATCH',false),'VERSIONED MEMORY');}
+  if(b.dataset.trashMemory){if(await confirmDialog('移入回收站','该操作可恢复，项目上下文将立即停止使用这条记忆。'))await mutate(`/memories/${b.dataset.trashMemory}/trash`);return;}
+  if(b.dataset.restoreMemory){const r=await mutate(`/memories/${b.dataset.restoreMemory}/restore`);if(r.status==='review_required')notice('恢复发现重复或冲突，已进入审核');return;}
+  if(b.dataset.purgeMemory){if(await confirmDialog('永久删除','将先创建隐私清理后的整包备份，并清理证据、召回、索引、实体关联及派生摘要。','永久删除'))await mutate(`/memories/${b.dataset.purgeMemory}`,{},'DELETE');return;}
+  if(b.dataset.workAction){if(b.dataset.workAction==='confirm'){const projects=await api('/projects?status=active');const item=(await api('/work-items')).find(x=>x.id===b.dataset.id);const options=projects.map(p=>`<option value="${p.id}" ${p.id===item?.subject_id?'selected':''}>${esc(p.name)}</option>`).join('');return formDialog('确认工作记忆',`<label>项目<select name="subject_id" required><option value="">请选择项目</option>${options}</select></label><p class="quote">${esc(item?.evidence_quote||'没有用户原话；请先核对证据')}</p>`,f=>mutate(`/work-items/${b.dataset.id}/confirm`,{subject_id:f.get('subject_id')},'POST',false),'GROUNDING');}const r=await mutate(`/work-items/${b.dataset.id}/${b.dataset.workAction}`,{});if(r.status==='review_required')notice('长期化需要审核');return;}
+  if(b.dataset.editSubject){const s=await api(`/subjects/${b.dataset.editSubject}`);return formDialog('编辑主题或项目',`<label>名称<input name="name" value="${esc(s.name)}"></label><label>说明<textarea name="description">${esc(s.description||'')}</textarea></label><label>状态<select name="status"><option ${s.status==='active'?'selected':''}>active</option><option ${s.status==='paused'?'selected':''}>paused</option><option ${s.status==='archived'?'selected':''}>archived</option></select></label><label>别名（逗号分隔）<input name="aliases" value="${esc((s.aliases||[]).join(','))}"></label>`,f=>mutate(`/subjects/${s.id}`,{name:f.get('name'),description:f.get('description'),status:f.get('status'),aliases:String(f.get('aliases')).split(',').filter(Boolean)},'PATCH',false),'SUBJECT');}
+  if(b.dataset.mergeSubject){const subjects=(await api('/subjects')).filter(s=>s.id!==b.dataset.mergeSubject);return formDialog('合并到当前实体',`<p class="muted">所选实体的别名、工作项、摘要版本和对象关联将转移到当前 canonical；来源实体会被删除，演化内容保留。</p><label>要吸收的实体<select name="source_id" required><option value="">请选择</option>${subjects.map(s=>`<option value="${s.id}">${esc(s.name)} · ${s.link_count||0} 关联</option>`).join('')}</select></label>`,f=>mutate(`/subjects/${b.dataset.mergeSubject}/merge`,{source_id:f.get('source_id')},'POST',false),'IMPACT PREVIEW');}
+  if(b.dataset.splitSubject){return formDialog('拆分实体',`<p class="muted">创建新实体并移动指定对象；未列出的内容留在原实体，操作后可再次纠正归属。</p><label>新实体名称<input name="name" required></label><label>移动的对象 ID（逗号分隔）<textarea name="object_ids"></textarea></label><label>移动的工作项 ID（逗号分隔）<textarea name="work_item_ids"></textarea></label>`,f=>mutate(`/subjects/${b.dataset.splitSubject}/split`,{name:f.get('name'),object_ids:String(f.get('object_ids')).split(',').map(x=>x.trim()).filter(Boolean),work_item_ids:String(f.get('work_item_ids')).split(',').map(x=>x.trim()).filter(Boolean)},'POST',false),'IMPACT PREVIEW');}
+  if(b.dataset.relateSubject){const subjects=(await api('/subjects')).filter(s=>s.id!==b.dataset.relateSubject);return formDialog('添加实体关系',`<label>目标实体<select name="target_subject_id" required>${subjects.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join('')}</select></label><label>关系类型<input name="relation_type" value="related" required></label>`,f=>mutate(`/subjects/${b.dataset.relateSubject}/relations`,Object.fromEntries(f),'POST',false),'RELATION');}
+  if(b.dataset.editProject){return detail('subject',b.dataset.editProject);}
+  if(b.dataset.summary){await mutate(`/summaries/project/${b.dataset.summary}/regenerate`);return;}
+  if(b.dataset.resolveReview){const action=b.dataset.action;if(['create','edit_execute','supersede'].includes(action)){return formDialog('执行审核建议','<label>执行内容<textarea name="content" rows="6" required></textarea></label><p class="muted">执行后会保留审核决策与记忆版本链。</p>',f=>mutate(`/reviews/${b.dataset.resolveReview}/resolve`,{action,content:f.get('content')},'POST',false),'REVIEW EXECUTION');}await mutate(`/reviews/${b.dataset.resolveReview}/resolve`,{action});return;}
+  if(b.dataset.dismissReview){if(await confirmDialog('保留现状','相同内容指纹未变化时，后续审计不会重复提示。'))await mutate(`/reviews/${b.dataset.dismissReview}/dismiss`);return;}
+  if(b.id==='run-audit'){await mutate('/reviews/scan',{scope:'full'});return;}
+  if(b.id==='run-dream'||b.id==='dry-dream'){$("#dream-overlay").hidden=false;try{await mutate('/dream/run',{dry_run:b.id==='dry-dream'});}finally{$("#dream-overlay").hidden=true;}return;}
+  if(b.dataset.test){const r=await mutate('/model/test',{kind:b.dataset.test},'POST',false);notice(r.ok?'连接成功':'连接失败');return;}
+  if(b.id==='validate-storage'){const r=await mutate('/maintenance/validate',{},'POST',false);notice(r.ok?'存储校验通过':r.errors.join('；'),!r.ok);await loadStorage();return;}
+  if(b.dataset.retryIngestion){await mutate(`/maintenance/ingestion-issues/${b.dataset.retryIngestion}/retry`);await loadIngestionIssues();return;}
+  if(b.id==='rebuild-projections'){await mutate('/maintenance/rebuild-projections');return;}
+  if(b.id==='rebuild-index'){await mutate('/rebuild',{embeddings:false});return;}
+  if(b.id==='create-backup'){await mutate('/backup');return;}
+  if(b.dataset.previewBackup){const p=await mutate(`/backups/${encodeURIComponent(b.dataset.previewBackup)}/preview-restore`,{},'POST',false);const d=$("#preview-dialog");d.dataset.backup=b.dataset.previewBackup;$("#preview-title").textContent='恢复预演';$("#preview-content").innerHTML=`<div class="health-list">${Object.entries(p).filter(([,v])=>typeof v!=='object').map(([k,v])=>`<div class="health-row"><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div><pre>${esc(JSON.stringify(p.delta||p.counts||{},null,2))}</pre>`;d.showModal();return;}
+}catch(error){fail(error);}});
+
+for(const section of ['general','llm','embedding','dream','recall','retention']){$(`#${section}-form`)?.addEventListener('submit',async e=>{e.preventDefault();try{const form=e.currentTarget;const body={};for(const [key,value] of new FormData(form).entries()){const input=form.elements[key];body[key]=input.type==='number'?Number(value):value;}form.querySelectorAll('input[type=checkbox]').forEach(i=>body[i.name]=i.checked);const key=body.api_key;delete body.api_key;await mutate(`/settings/${section}`,body,'POST',false);if(key)await mutate(`/secrets/${section==='llm'?'llm_api_key':'embedding_api_key'}`,{value:key},'POST',false);notice('设置已保存');await loadSettings();}catch(error){fail(error);}});}
+$("#library-search").addEventListener('input',()=>loadLibrary().catch(fail));$("#library-filter").addEventListener('change',()=>loadLibrary().catch(fail));$("#project-search").addEventListener('input',()=>loadProjects().catch(fail));$(".drawer-close").addEventListener('click',closeDrawer);$("#drawer-scrim").addEventListener('click',closeDrawer);$("#export").addEventListener('click',e=>{e.currentTarget.href=base+'/export';});$("#preview-confirm").addEventListener('click',async e=>{e.preventDefault();const d=$("#preview-dialog");if(!await confirmDialog('确认恢复','将先自动备份当前状态，再以备份数据库为准恢复并重建 vault 与索引。'))return;d.close();await mutate(`/backups/${encodeURIComponent(d.dataset.backup)}/restore`);});
 loadAll();

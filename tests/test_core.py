@@ -22,23 +22,41 @@ class FakeClient:
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "extract durable" in system:
-            turn_id = json.loads(user)["turns"][0]["id"]
+        payload = json.loads(user)
+        if "strict admission gate" in system:
+            turn = payload["turns"][0]
             parsed = {
-                "candidates": [
+                "decisions": [
                     {
+                        "disposition": "admit",
                         "content": "用户偏好简洁的中文回答",
                         "kind": "preference",
                         "confidence": 0.94,
                         "sensitive": False,
-                        "source_turn_id": turn_id,
+                        "source_turn_id": turn["id"],
+                        "evidence_quote": turn["user"],
+                        "explanation": "用户明确表达稳定偏好",
                     }
                 ]
             }
-        elif "review personal-memory" in system:
-            parsed = {"summary": "一项偏好", "themes": ["表达风格"], "conflicts": []}
+        elif "Review every supplied" in system:
+            parsed = {
+                "summary": "一项偏好",
+                "reviews": [
+                    {
+                        "candidate_id": item["id"],
+                        "decision": "deferred",
+                        "explanation": "等待跨日证据",
+                    }
+                    for item in payload["candidates"]
+                ],
+            }
+        elif "conservative integration gate" in system:
+            parsed = {"integrations": []}
+        elif "Audit active personal memories" in system:
+            parsed = {"issues": []}
         else:
-            parsed = {"memories": []}
+            parsed = {"action": "defer", "explanation": "test", "confidence": 0}
         return LlmResult(parsed=parsed, raw={"ok": True}, input_tokens=10, output_tokens=5)
 
 
@@ -46,16 +64,21 @@ class ConflictClient(FakeClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "review personal-memory" not in system:
+        if "Review every supplied" not in system:
             return super().chat_json(system=system, user=user)
         payload = json.loads(user)
+        target = next(
+            item
+            for item in payload["candidates"][0]["related_records"]
+            if item["source"] == "memory"
+        )
         parsed = {
             "summary": "发现偏好冲突",
-            "themes": ["表达风格"],
-            "conflicts": [
+            "reviews": [
                 {
                     "candidate_id": payload["candidates"][0]["id"],
-                    "memory_id": payload["existing_memories"][0]["id"],
+                    "decision": "conflict",
+                    "target_id": target["id"],
                     "explanation": "新旧偏好不一致",
                 }
             ],
@@ -67,22 +90,31 @@ class ApprovingClient(FakeClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "review personal-memory" in system:
+        if "Review every supplied" in system:
             payload = json.loads(user)
             parsed = {
                 "summary": "耐久信息已通过复核",
-                "themes": [],
-                "durable_candidate_ids": [item["id"] for item in payload["candidates"]],
-                "noise": [],
-                "duplicates": [],
-                "conflicts": [],
+                "reviews": [
+                    {
+                        "candidate_id": item["id"],
+                        "decision": "durable",
+                        "explanation": "稳定偏好",
+                    }
+                    for item in payload["candidates"]
+                ],
             }
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
-        if "compact qualified" in system:
+        if "conservative integration gate" in system:
             payload = json.loads(user)
             parsed = {
-                "memories": [
-                    {"candidate_id": item["id"], "content": item["content"]}
+                "integrations": [
+                    {
+                        "candidate_id": item["id"],
+                        "action": "create",
+                        "content": item["content"],
+                        "explanation": "全池无相关项",
+                        "confidence": 0.95,
+                    }
                     for item in payload["candidates"]
                 ]
             }
@@ -92,8 +124,8 @@ class ApprovingClient(FakeClient):
 
 class ExistingApprovingClient(ApprovingClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
-        if "extract durable" in system:
-            parsed = {"candidates": []}
+        if "strict admission gate" in system:
+            parsed = {"decisions": []}
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
         return super().chat_json(system=system, user=user)
 
@@ -102,16 +134,19 @@ class ManyCandidateClient(ExistingApprovingClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "extract durable" in system:
-            turn_id = json.loads(user)["turns"][0]["id"]
+        if "strict admission gate" in system:
+            turn = json.loads(user)["turns"][0]
             parsed = {
-                "candidates": [
+                "decisions": [
                     {
+                        "disposition": "admit",
                         "content": f"用户的稳定偏好编号 {index}",
                         "kind": "preference",
                         "confidence": 0.9,
                         "sensitive": False,
-                        "source_turn_id": turn_id,
+                        "source_turn_id": turn["id"],
+                        "evidence_quote": turn["user"],
+                        "explanation": "稳定偏好",
                     }
                     for index in range(12)
                 ]
@@ -124,22 +159,24 @@ class DuplicateReviewClient(ExistingApprovingClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "review personal-memory" in system:
+        if "Review every supplied" in system:
             payload = json.loads(user)
             candidates = payload["candidates"]
             parsed = {
                 "summary": "合并同义候选",
-                "themes": [],
-                "durable_candidate_ids": [candidates[0]["id"]],
-                "noise": [],
-                "duplicates": [
+                "reviews": [
+                    {
+                        "candidate_id": candidates[0]["id"],
+                        "decision": "durable",
+                        "explanation": "稳定偏好",
+                    },
                     {
                         "candidate_id": candidates[1]["id"],
-                        "canonical_candidate_id": candidates[0]["id"],
+                        "decision": "duplicate_candidate",
+                        "target_id": candidates[0]["id"],
                         "explanation": "表达不同但含义相同",
                     }
                 ],
-                "conflicts": [],
             }
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
         return super().chat_json(system=system, user=user)
@@ -149,15 +186,17 @@ class NoiseReviewClient(ExistingApprovingClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
         import json
 
-        if "review personal-memory" in system:
+        if "Review every supplied" in system:
             candidate_id = json.loads(user)["candidates"][0]["id"]
             parsed = {
                 "summary": "发现一次性噪声",
-                "themes": [],
-                "durable_candidate_ids": [],
-                "noise": [{"candidate_id": candidate_id, "explanation": "一次性任务进度"}],
-                "duplicates": [],
-                "conflicts": [],
+                "reviews": [
+                    {
+                        "candidate_id": candidate_id,
+                        "decision": "noise",
+                        "explanation": "一次性任务进度",
+                    }
+                ],
             }
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
         return super().chat_json(system=system, user=user)
@@ -168,13 +207,12 @@ class StructuredDuplicateClient(ExistingApprovingClient):
         import json
 
         payload = json.loads(user)
-        if "review personal-memory" in system:
+        if "Review every supplied" in system:
             candidates = payload["candidates"]
             canonical = next(item for item in candidates if "简洁" in item["content"])
             duplicate = next(item for item in candidates if item["id"] != canonical["id"])
             parsed = {
                 "summary": "确认两种中文措辞表达同一项稳定偏好",
-                "themes": ["表达风格"],
                 "reviews": [
                     {
                         "candidate_id": canonical["id"],
@@ -191,13 +229,16 @@ class StructuredDuplicateClient(ExistingApprovingClient):
                 ],
             }
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
-        if "compact qualified" in system:
+        if "conservative integration gate" in system:
             candidate = payload["candidates"][0]
             parsed = {
-                "memories": [
+                "integrations": [
                     {
                         "candidate_id": candidate["id"],
+                        "action": "create",
                         "content": "用户偏好简洁、清晰的中文回答。",
+                        "explanation": "新记忆",
+                        "confidence": 0.95,
                     }
                 ]
             }
@@ -207,10 +248,16 @@ class StructuredDuplicateClient(ExistingApprovingClient):
 
 class UnknownDeepCandidateClient(ApprovingClient):
     def chat_json(self, *, system: str, user: str) -> LlmResult:
-        if "compact qualified" in system:
+        if "conservative integration gate" in system:
             parsed = {
-                "memories": [
-                    {"candidate_id": "not-a-qualified-candidate", "content": "不能凭空创建"}
+                "integrations": [
+                    {
+                        "candidate_id": "not-a-qualified-candidate",
+                        "action": "create",
+                        "content": "不能凭空创建",
+                        "explanation": "invalid",
+                        "confidence": 1.0,
+                    }
                 ]
             }
             return LlmResult(parsed=parsed, raw=parsed, input_tokens=10, output_tokens=5)
@@ -281,7 +328,7 @@ class CoreTests(unittest.TestCase):
         self.service.capture_turn("s1", "PURGE_SENTINEL 用户文本", "已记录")
         DreamEngine(self.service.db, FakeClient()).run()
         candidate_id = self.service.list_candidates()[0]["id"]
-        memory_id = self.service.promote_candidate(candidate_id)["id"]
+        memory_id = self.service.promote_candidate(candidate_id)["memory"]["id"]
         old_backup = self.service.create_backup().name
         self.service.trash_memory(memory_id)
         self.assertEqual(
@@ -332,17 +379,10 @@ class CoreTests(unittest.TestCase):
         outcome = DreamEngine(self.service.db, ConflictClient()).run()
         self.assertEqual(outcome.status, "completed")
         candidate = self.service.list_candidates()[0]
-        self.assertEqual(candidate["conflict_memory_id"], existing_id)
-        self.assertEqual(candidate["conflict_reason"], "新旧偏好不一致")
-        self.assertEqual(candidate["rem_status"], "conflict")
-        lineage = self.service.candidate_lineage(candidate["id"])
-        self.assertTrue(
-            any(
-                item["event_type"] == "rem_reviewed"
-                and item["data"]["decision"] == "conflict"
-                for item in lineage["events"]
-            )
-        )
+        self.assertEqual(candidate["rem_status"], "deferred")
+        review = self.service.list_reviews()[0]
+        self.assertEqual(review["issue_type"], "conflict")
+        self.assertEqual(review["related_memory_id"], existing_id)
 
     def test_evidence_days_use_original_observation_date(self) -> None:
         first = self.service.db.add_raw_turn("s1", "u1", "a1", redacted=False)
@@ -469,12 +509,12 @@ class CoreTests(unittest.TestCase):
         self.service.save_settings("general", {"timezone": "Asia/Shanghai"})
         self.service.capture_turn("deep-guard-trigger", "继续", "好的")
         outcome = DreamEngine(self.service.db, UnknownDeepCandidateClient()).run()
-        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.status, "failed")
         self.assertEqual(outcome.promoted_count, 0)
         self.assertEqual(self.service.list_memories(), [])
         self.assertEqual(len(self.service.list_candidates()), 1)
 
-    def test_utility_lane_auto_promotes_after_two_distinct_injections(self) -> None:
+    def test_search_and_historical_injections_never_promote_candidates(self) -> None:
         candidate = self.service.db.upsert_candidate(
             "用户偏好黑咖啡",
             kind="preference",
@@ -488,8 +528,11 @@ class CoreTests(unittest.TestCase):
         self.service.search("用户喝什么咖啡", injected=True)
         self.service.capture_turn("trigger", "今天继续工作", "好的")
         outcome = DreamEngine(self.service.db, ExistingApprovingClient()).run()
-        self.assertEqual(outcome.promoted_count, 1)
-        self.assertEqual(self.service.list_memories()[0]["content"], candidate.content)
+        self.assertEqual(outcome.promoted_count, 0)
+        self.assertEqual(self.service.list_memories(), [])
+        refreshed = self.service.db.get_candidate(candidate.id)
+        self.assertEqual(refreshed.recall_count, 0)
+        self.assertEqual(refreshed.unique_query_count, 0)
 
     def test_rem_merges_semantic_duplicates_and_expires_noise(self) -> None:
         first = self.service.db.upsert_candidate(
@@ -510,7 +553,13 @@ class CoreTests(unittest.TestCase):
         )
         self.service.capture_turn("merge", "继续", "好的")
         outcome = DreamEngine(self.service.db, DuplicateReviewClient()).run()
-        self.assertEqual(outcome.merged_count, 1)
+        self.assertEqual(outcome.merged_count, 0)
+        pending = self.service.list_candidates()
+        self.assertEqual(len(pending), 2)
+        duplicate_review = next(
+            item for item in self.service.list_reviews() if item["issue_type"] == "duplicate_candidate"
+        )
+        self.service.resolve_review(duplicate_review["id"], action="merge")
         pending = self.service.list_candidates()
         self.assertEqual(len(pending), 1)
         canonical_id = pending[0]["id"]
@@ -552,8 +601,16 @@ class CoreTests(unittest.TestCase):
         self.service.db.mark_turns_ingested([first_turn, second_turn])
         self.service.capture_turn("trigger-cn", "继续", "好的")
         outcome = DreamEngine(self.service.db, StructuredDuplicateClient()).run()
-        self.assertEqual(outcome.merged_count, 1)
-        self.assertEqual(outcome.promoted_count, 1)
+        self.assertEqual(outcome.merged_count, 0)
+        self.assertEqual(outcome.promoted_count, 0)
+        duplicate_review = next(
+            item for item in self.service.list_reviews() if item["issue_type"] == "duplicate_candidate"
+        )
+        self.service.resolve_review(duplicate_review["id"], action="merge")
+        trigger = self.service.db.add_raw_turn("trigger-2", "继续", "好的", redacted=False)
+        self.service.db.mark_turns_ingested([trigger])
+        second = DreamEngine(self.service.db, ApprovingClient()).run()
+        self.assertEqual(second.promoted_count, 1)
         promoted = self.service.list_candidates(status="promoted")[0]
         self.assertEqual(promoted["id"], first.id)
         self.assertIsNotNone(promoted["promoted_memory_id"])
@@ -565,7 +622,7 @@ class CoreTests(unittest.TestCase):
         )
         self.assertEqual(promotion["data"]["promotion_lane"], "different_dates")
         self.assertEqual(promotion["data"]["candidate_content"], "用户偏好简洁的中文回答")
-        self.assertEqual(promotion["data"]["memory_content"], "用户偏好简洁、清晰的中文回答。")
+        self.assertEqual(promotion["data"]["memory_content"], "用户偏好简洁的中文回答")
         self.assertEqual(lineage["memory"]["origin"], "dream")
         self.assertTrue(any(item["event_type"] == "candidate_merged" for item in lineage["events"]))
         self.assertTrue(
@@ -657,7 +714,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["removed"]["candidates"], 1)
         self.assertIsNone(self.service.db.get_candidate(candidate_id))
         self.assertNotIn(old_backup, {item["name"] for item in self.service.list_backups()})
-        self.assertTrue(result["clean_backup"].endswith("-post-purge.db"))
+        self.assertTrue(result["clean_backup"].endswith("-post-purge.zip"))
         with self.service.db.connect() as conn:
             self.assertEqual(
                 conn.execute(
@@ -680,7 +737,7 @@ class CoreTests(unittest.TestCase):
             raw_turn_id=None,
             excerpt="first",
         )
-        memory_id = self.service.promote_candidate(first.id)["id"]
+        memory_id = self.service.promote_candidate(first.id)["memory"]["id"]
         duplicate = self.service.db.upsert_candidate(
             "同一事实的另一种候选表述",
             kind="fact",
@@ -690,9 +747,9 @@ class CoreTests(unittest.TestCase):
             excerpt="duplicate",
         )
         self.service.promote_candidate(duplicate.id, "同一长期事实")
-        self.assertIsNone(self.service.db.get_candidate(duplicate.id))
+        self.assertEqual(self.service.db.get_candidate(duplicate.id).promoted_memory_id, memory_id)
         self.assertEqual(self.service.db.get_candidate(first.id).promoted_memory_id, memory_id)
-        self.assertEqual(len(self.service.list_candidates(status="promoted")), 1)
+        self.assertEqual(len(self.service.list_candidates(status="promoted")), 2)
 
     def test_schema_v2_candidate_migrates_without_immediate_deletion(self) -> None:
         from b1ack_memory.db import MemoryDatabase
@@ -749,7 +806,7 @@ class CoreTests(unittest.TestCase):
             conn.close()
         migrated = MemoryDatabase(path)
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
             first_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
             backfilled = conn.execute(
                 "SELECT data_json,backfilled FROM memory_events "
@@ -862,14 +919,17 @@ class CoreTests(unittest.TestCase):
         migrated = MemoryDatabase(path)
         for candidate_id, memory_id in linked.values():
             self.assertEqual(migrated.get_candidate(candidate_id).promoted_memory_id, memory_id)
-        self.assertIsNone(migrated.get_candidate(orphan.id))
-        self.assertIsNone(migrated.get_candidate(ambiguous.id))
+        for candidate_id in (orphan.id, ambiguous.id):
+            legacy = migrated.get_candidate(candidate_id)
+            self.assertIsNotNone(legacy)
+            self.assertEqual(legacy.status, "pending")
+            self.assertEqual(legacy.admission_state, "legacy_review")
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 5)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM audit_events "
-                    "WHERE action='migration-cleanup-orphan-promoted'"
+                    "WHERE action='migration-review-unlinked-promoted'"
                 ).fetchone()[0],
                 2,
             )
@@ -922,15 +982,16 @@ class SecurityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = SecretStore(Path(directory) / "secrets.json")
             store.save({"llm_api_key": "abcdef123456"})
-            self.assertEqual(store.masked_status("llm_api_key")["masked"], "••••3456")
+            self.assertEqual(store.masked_status("llm_api_key"), {"configured": True})
 
 
 class ClientTests(unittest.TestCase):
     def test_dream_prompts_bound_structured_output(self) -> None:
-        self.assertIn("at most 8 candidates", LIGHT_SYSTEM)
-        self.assertIn("under 240 characters", LIGHT_SYSTEM)
-        self.assertIn("durable_candidate_ids", REM_SYSTEM)
-        self.assertIn("duplicates", REM_SYSTEM)
+        self.assertIn("at most 8 objects", LIGHT_SYSTEM)
+        self.assertIn("evidence_quote", LIGHT_SYSTEM)
+        self.assertIn("admit|observe|discard", LIGHT_SYSTEM)
+        self.assertIn("exactly one review", REM_SYSTEM)
+        self.assertIn("duplicate_candidate", REM_SYSTEM)
 
     def test_http_client_sends_cloudflare_compatible_identity(self) -> None:
         client = OpenAICompatibleClient(

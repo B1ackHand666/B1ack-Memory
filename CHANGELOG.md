@@ -4,6 +4,71 @@
 
 ## [未发布]
 
+## [0.5.0] - 2026-08-13
+
+### 新增
+
+- 数据库升级至 schema v7，加入 `subjects`、别名与关系、`work_items` 及修订、版本化 `summary_versions`、session 项目关联和可重试 `projection_jobs`。
+- Light 的 `observe` 进入有生命周期的项目工作记忆；决定、当前状态和开放问题仅在用户原话确认且项目可靠识别时注入，proposal、里程碑、待确认和过期项不注入。
+- 新增项目识别优先级、session 纠正、cwd/workspace 映射和有界 context pack；召回轨迹记录项目置信度、识别来源、排除原因与字符预算。
+- 新增 current / historical / disputed 时间化长期记忆、有效区间和替代链；默认召回只使用当前且处于有效区间的事实。
+- 新增带 source IDs、来源损失保护、手工锁定和一键回滚的项目/主题摘要；摘要不可用时自动回退到原子记忆与工作项。
+- 新增可重建 `vault/` 与 `indexes/`，以及包含 manifest、schema 版本和 SHA-256 的 ZIP 整包备份、校验和恢复预演。
+- 新增项目、主题、工作项、摘要、上下文预览、存储校验、投影重建与备份恢复预演 API。
+
+### 变更
+
+- WebUI 固定为“概览、记忆库、项目、审核、系统”五个一级工作区，使用紧凑列表、二级标签和统一右侧详情抽屉承载版本、证据和低频操作。
+- 审核默认拆分为“需要决定”和“整理建议”；项目归属、过期工作项与摘要建议不再挤占冲突、替代和敏感内容队列。
+- Provider 的搜索、明确记住与 prefetch 增加可选 `project_id`，兼容旧调用；模糊项目不会产生跨项目工作记忆注入。
+- SQLite `memory.db` 继续作为唯一可写事实源；没有引入 ORM、外部数据库、Node 构建链或新的常驻服务。
+
+### 迁移与安全
+
+- v6 → v7 前自动创建 `pre-schema-v7` 在线数据库备份；现有长期记忆保持全局 current，不自动归属或重写。
+- 最近 30 天仍有证据的旧 observe 日志转换为 suggested 工作项，必须确认项目和状态后才能参与注入。
+- 永久删除同步清理新增实体关联、投影任务与包含被删来源 ID 的派生摘要；删除前后备份继续执行隐私清理规则。
+- 恢复先验证归档哈希、SQLite integrity 和 schema，再展示数据量差异；执行前创建当前状态备份，恢复后以数据库重建 vault 和索引。
+- 统一数据库层“当前有效记忆”谓词，FTS、项目上下文、摘要、投影和审计共同遵守 status、时间状态及有效区间；`valid_to` 日期在当天结束前仍有效。
+- 修复记忆/候选晋升的项目链接、证据和事件事务一致性；subject 合并会迁移全部引用、关系、摘要和投影任务，并在提交前执行外键检查。
+- 临时 schema v7 数据库会通过列检测补齐审核 proposal、摘要来源 revision 和 raw turn ingestion 状态，不要求降级或手工重建。
+- 独立 WebUI 改为 HttpOnly SameSite=Strict 会话与终端 Bearer 双通道，所有数据读取均需鉴权，写入另校验同源 Origin；Dashboard 明确复用 Hermes 宿主鉴权。
+- POSIX 数据目录/文件分别收紧到 `0700`/`0600`；Windows 在系统页明确显示为 ACL 管理。恢复使用同目录 `.restore.tmp` 完整迁移校验、fsync 后原子替换。
+- raw turn 支持按字符预算在句子边界分片、游标续跑、失败退避及三次后隔离；系统页可查看并单条重新处理，避免失败 turn 每轮重复消耗模型。
+- LLM HTTP 错误不再保存上游响应正文；密钥检测覆盖 16 字符起的高熵 token，检测和脱敏共用同一规则，设置页只显示是否已配置。
+
+## [0.4.0] - 2026-08-13
+
+### 新增
+
+- 新增统一审核中心与 `GET /reviews`、`POST /reviews/scan`、`POST /reviews/{id}/resolve`、`POST /reviews/{id}/dismiss`；集中处理准入、重复、替代、冲突和长期池质量问题。
+- 数据库升级至 schema v6，新增 `admission_decisions`、`memory_review_items`、`memory_audit_runs`，Dream 运行增加 admit、observe、discard 和审核提案计数。
+- 新增写入后增量审计、每 7 天全池审计和 WebUI 手动全池扫描；既有长期记忆只生成建议，不自动改写、合并或回收。
+- 审核支持创建、合并到 canonical、替代旧记忆、保留两者、编辑后执行、拒绝/过期候选及保留/编辑/回收长期记忆；保留现状按内容指纹抑制重复提示。
+
+### 变更
+
+- Light 改为结构化 `admit / observe / discard` 严格准入。自动候选至少需要 `0.85` 置信度、合法类型、有效来源 turn，并引用可在脱敏用户消息中验证的原话；助手文本仅作不可信上下文。
+- 候选证据保存用户原话，不再把候选摘要当作证据。项目进度、迁移记录、完成操作、待落实方案和临时状态只观察，不创建候选。
+- 默认 prefetch 在检索层强制排除候选。显式搜索仍返回 `UNVERIFIED` 候选，但不再增加召回计数、更新活动时间或影响晋升。
+- 移除“实际作用”自动晋升通道。自动晋升固定要求两个不同本地日期的用户证据、最新且未失效的 REM durable 结论、无敏感/冲突/开放审核、通过 Deep 全池整合和每日额度。
+- REM 只审核未审核或证据变化后失效的严格候选，按最久未审排序；相关项来自完整 FTS 池，可选 embeddings 仅作补充。
+- Deep 固定输出 `create / duplicate / supersede / conflict / defer`。仅无相关项的 `create` 自动新增，其余动作生成审核提案；整批先校验后在单一事务中提交。
+- 明确记住、候选人工晋升、Hermes 写入、长期记忆编辑和回收站恢复统一经过全池整合关口；完全相同内容作为幂等例外。
+- 长期记忆合并保留 canonical 记录并将其他记录标记为 superseded；候选、证据和演化链显式保留。取消一条长期记忆只能关联一个已晋升候选的限制。
+- WebUI 候选页区分严格合格、待准入和整合待审，晋升进度改为用户原话、不同日期证据、REM、整合状态和阻塞原因；长期记忆显示开放审核数量。
+
+### 迁移与安全
+
+- v5 → v6 前自动创建 `pre-schema-v6` 在线备份。旧 pending 候选迁移为 `legacy_review`，停止自动晋升并由首次治理扫描生成建议；已有长期记忆状态和内容保持不变。
+- 候选或长期记忆永久删除同步清理新增的准入日志、审核项及关联隐私残留；旧托管备份清理和删除后干净备份规则保持不变。
+- 模型不可用、输出缺项、引用未知 ID 或校验失败时不写长期池；Deep 批次错误不会产生部分晋升。
+
+### 测试
+
+- 覆盖准入分类、伪造原话拒绝、候选预取隔离、显式搜索无晋升信号、REM 队列公平、跨日证据和每日额度。
+- 覆盖直接记住/人工晋升/编辑/恢复的统一整合、Deep 原子回滚、审核合并和指纹抑制、全池审计、v5 → v6 备份迁移及新增表隐私删除。
+
 ## [0.3.1] - 2026-08-09
 
 ### 变更
@@ -167,7 +232,9 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.3.1...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.0
+[0.4.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.4.0
 [0.3.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.1
 [0.3.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.0
 [0.2.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.2.0

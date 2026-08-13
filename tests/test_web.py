@@ -15,6 +15,8 @@ class WebTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.service = MemoryService(Path(self.temp.name))
         self.client = TestClient(create_app(self.service))
+        self.headers = {"Authorization": f"Bearer {self.service.mutation_token}"}
+        self.client.headers.update(self.headers)
 
     def tearDown(self) -> None:
         self.client.close()
@@ -26,30 +28,32 @@ class WebTests(unittest.TestCase):
         bundle = self.client.get("/api/ui-bundle")
         self.assertEqual(bundle.status_code, 200)
         self.assertIn("B1ack Memory", bundle.json()["html"])
-        self.assertIn("记忆演化", bundle.json()["html"])
+        self.assertIn("主题与实体", bundle.json()["html"])
+        self.assertIn("审核中心", bundle.json()["html"])
         self.assertNotIn('data-candidate-status="promoted"', bundle.json()["html"])
-        self.assertIn("LATEST 20", bundle.json()["html"])
-        self.assertIn("prefers-reduced-motion", bundle.json()["css"])
-        self.assertIn("dashboardBridge.request", bundle.json()["js"])
-        self.assertEqual(self.client.post("/api/memories", json={"content": "测试"}).status_code, 403)
-        token = self.client.get("/api/bootstrap").json()["token"]
+        self.assertIn("项目工作记忆", bundle.json()["html"])
+        self.assertIn("@media(max-width:700px)", bundle.json()["css"])
+        self.assertIn("bridge.request", bundle.json()["js"])
+        self.assertEqual(self.client.post(
+            "/api/memories", json={"content": "测试"}, headers={"Authorization": ""}
+        ).status_code, 403)
+        self.assertNotIn("token", self.client.get("/api/bootstrap", headers=self.headers).json())
         response = self.client.post(
             "/api/memories",
             json={"content": "用户喜欢白盒化记忆", "kind": "preference"},
-            headers={"X-B1ack-Memory-Token": token},
+            headers=self.headers,
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(self.client.get("/api/memories").json()), 1)
         invalid = self.client.post(
             "/api/settings/recall",
             json={"limit": 100},
-            headers={"X-B1ack-Memory-Token": token},
+            headers=self.headers,
         )
         self.assertEqual(invalid.status_code, 400)
 
     def test_operational_errors_are_safe_and_readable(self) -> None:
-        token = self.client.get("/api/bootstrap").json()["token"]
-        headers = {"X-B1ack-Memory-Token": token}
+        headers = self.headers
 
         model = self.client.post("/api/model/test", json={"kind": "llm"}, headers=headers)
         self.assertEqual(model.status_code, 400)
@@ -81,8 +85,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/memories").json()[0]["id"], created["id"])
 
     def test_candidate_status_restore_and_privacy_delete_api(self) -> None:
-        token = self.client.get("/api/bootstrap").json()["token"]
-        headers = {"X-B1ack-Memory-Token": token}
+        headers = self.headers
         candidate = self.service.db.upsert_candidate(
             "候选 API 测试",
             kind="fact",
@@ -108,8 +111,7 @@ class WebTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/candidates").json(), [])
 
     def test_candidate_retention_settings_are_exposed(self) -> None:
-        token = self.client.get("/api/bootstrap").json()["token"]
-        headers = {"X-B1ack-Memory-Token": token}
+        headers = self.headers
         settings = self.client.get("/api/settings").json()
         self.assertEqual(settings["dream"]["max_new_candidates"], 8)
         self.assertEqual(settings["retention"]["candidate_inactive_days"], 14)
@@ -121,9 +123,45 @@ class WebTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["candidate_inactive_days"], 21)
 
+    def test_review_center_scan_resolve_and_dismiss_api(self) -> None:
+        headers = self.headers
+        pending = self.client.post(
+            "/api/memories",
+            json={"content": "我的银行卡需要单独管理", "kind": "fact"},
+            headers=headers,
+        )
+        self.assertEqual(pending.json()["status"], "review_required")
+        reviews = self.client.get("/api/reviews?status=open").json()
+        self.assertEqual(reviews[0]["issue_type"], "sensitive")
+        resolved = self.client.post(
+            f"/api/reviews/{reviews[0]['id']}/resolve",
+            json={"action": "create"},
+            headers=headers,
+        )
+        self.assertEqual(resolved.status_code, 200)
+        self.assertEqual(resolved.json()["status"], "resolved")
+        self.assertEqual(len(self.client.get("/api/memories").json()), 1)
+
+        second = self.client.post(
+            "/api/memories",
+            json={"content": "我的身份证需要离线保管", "kind": "fact"},
+            headers=headers,
+        ).json()
+        review_id = second["review"]["id"]
+        dismissed = self.client.post(
+            f"/api/reviews/{review_id}/dismiss", headers=headers
+        )
+        self.assertEqual(dismissed.json()["status"], "dismissed")
+        self.assertTrue(self.client.get("/api/reviews?status=dismissed").json())
+
+        scan = self.client.post(
+            "/api/reviews/scan", json={"scope": "full"}, headers=headers
+        )
+        self.assertEqual(scan.status_code, 200)
+        self.assertEqual(scan.json()["status"], "failed")
+
     def test_timezone_settings_validate_and_recompute(self) -> None:
-        token = self.client.get("/api/bootstrap").json()["token"]
-        headers = {"X-B1ack-Memory-Token": token}
+        headers = self.headers
         response = self.client.post(
             "/api/settings/general", json={"timezone": "Asia/Shanghai"}, headers=headers
         )
@@ -139,8 +177,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("IANA timezone", invalid.json()["detail"])
 
     def test_analytics_lineage_and_promoted_candidate_api(self) -> None:
-        token = self.client.get("/api/bootstrap").json()["token"]
-        headers = {"X-B1ack-Memory-Token": token}
+        headers = self.headers
         candidate = self.service.db.upsert_candidate(
             "演化接口候选",
             kind="project",
@@ -154,7 +191,8 @@ class WebTests(unittest.TestCase):
         self.assertEqual(candidate_lineage.json()["candidate"]["id"], candidate.id)
         promoted = self.client.post(f"/api/candidates/{candidate.id}/promote", headers=headers)
         self.assertEqual(promoted.status_code, 200)
-        memory_id = promoted.json()["id"]
+        self.assertEqual(promoted.json()["status"], "promoted")
+        memory_id = promoted.json()["memory"]["id"]
         promoted_rows = self.client.get("/api/candidates?status=promoted").json()
         self.assertEqual(promoted_rows[0]["id"], candidate.id)
         self.assertEqual(promoted_rows[0]["promoted_memory_id"], memory_id)

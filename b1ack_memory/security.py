@@ -5,6 +5,7 @@ import os
 import re
 import stat
 from pathlib import Path
+from typing import Any
 
 _SECRET_PATTERNS = (
     re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
@@ -37,7 +38,7 @@ def _entropy(value: str) -> float:
 def contains_secret(text: str) -> bool:
     if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
         return True
-    return any(_entropy(token) >= 4.2 for token in re.findall(r"[A-Za-z0-9_+/=-]{32,}", text))
+    return any(_entropy(token) >= 3.5 for token in _opaque_tokens(text))
 
 
 def is_sensitive(text: str) -> bool:
@@ -50,11 +51,46 @@ def redact_secrets(text: str) -> tuple[str, bool]:
     for pattern in _SECRET_PATTERNS:
         redacted, count = pattern.subn("[REDACTED_SECRET]", redacted)
         changed = changed or count > 0
-    for token in set(re.findall(r"[A-Za-z0-9_+/=-]{32,}", redacted)):
-        if _entropy(token) >= 4.2:
+    for token in set(_opaque_tokens(redacted)):
+        if _entropy(token) >= 3.5:
             redacted = redacted.replace(token, "[REDACTED_SECRET]")
             changed = True
     return redacted, changed
+
+
+def _opaque_tokens(text: str) -> list[str]:
+    """Return bounded token candidates shared by detection and redaction."""
+    return re.findall(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{16,}(?![A-Za-z0-9_+/=-])", text)
+
+
+def secure_directory(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    if os.name != "nt":
+        path.chmod(0o700)
+
+
+def secure_file(path: Path) -> None:
+    if path.exists() and os.name != "nt":
+        path.chmod(0o600)
+
+
+def permission_report(path: Path, *, directory: bool | None = None) -> dict[str, Any]:
+    exists = path.exists()
+    if os.name == "nt":
+        return {
+            "path": str(path), "exists": exists, "managed_by": "windows_acl",
+            "safe": None, "mode": None,
+            "recommendation": "Use Windows ACLs to restrict this path to the current user.",
+        }
+    if not exists:
+        return {"path": str(path), "exists": False, "managed_by": "posix", "safe": True, "mode": None}
+    mode = stat.S_IMODE(path.stat().st_mode)
+    expected = 0o700 if (directory if directory is not None else path.is_dir()) else 0o600
+    return {
+        "path": str(path), "exists": True, "managed_by": "posix",
+        "safe": mode & 0o077 == 0, "mode": f"{mode:04o}", "expected": f"{expected:04o}",
+        "recommendation": None if mode & 0o077 == 0 else f"chmod {expected:04o} {path}",
+    }
 
 
 class SecretStore:
@@ -94,7 +130,7 @@ class SecretStore:
 
     def masked_status(self, name: str) -> dict[str, object]:
         value = self.load().get(name, "")
-        return {"configured": bool(value), "masked": f"••••{value[-4:]}" if value else ""}
+        return {"configured": bool(value)}
 
     def permissions_safe(self) -> bool:
         if not self.path.exists() or os.name == "nt":
