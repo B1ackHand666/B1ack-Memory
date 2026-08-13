@@ -135,6 +135,8 @@ class DistributionTests(unittest.TestCase):
             self.assertIn("SDK.authedFetch", source)
             self.assertIn('API + "/ui-bundle"', source)
             self.assertIn("srcDoc: documentHtml", source)
+            self.assertIn('"/dashboard-plugins/b1ack-memory/dist/app.js"', source)
+            self.assertNotIn("escapeInlineScript", source)
             self.assertNotIn('src: dashboardBasePath', source)
 
     def test_dashboard_api_can_be_loaded_as_a_standalone_module(self) -> None:
@@ -167,11 +169,16 @@ class DistributionTests(unittest.TestCase):
             package / "dashboard" / "manifest.json",
             package / "dashboard" / "plugin_api.py",
             package / "dashboard" / "dist" / "index.js",
+            package / "dashboard" / "dist" / "app.js",
             package / "static" / "index.html",
             package / "static" / "app.js",
             package / "static" / "style.css",
         ]
         self.assertTrue(all(path.is_file() for path in required), required)
+        self.assertEqual(
+            (package / "dashboard" / "dist" / "app.js").read_bytes(),
+            (package / "static" / "app.js").read_bytes(),
+        )
         manifest = json.loads((package / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
         self.assertEqual(manifest["name"], "b1ack-memory")
         self.assertEqual(manifest["version"], b1ack_memory.__version__)

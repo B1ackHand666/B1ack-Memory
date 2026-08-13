@@ -36,6 +36,7 @@ class WebTests(unittest.TestCase):
         self.assertIn("@media(max-width:700px)", bundle.json()["css"])
         self.assertIn("bridge.request", bundle.json()["js"])
         self.assertIn("Promise.allSettled", bundle.json()["js"])
+        self.assertIn('classList.remove("skeleton")', bundle.json()["js"])
         self.assertIn("部分数据未加载", bundle.json()["js"])
         self.assertEqual(self.client.post(
             "/api/memories", json={"content": "测试"}, headers={"Authorization": ""}

@@ -19,7 +19,7 @@
   </p>
 </div>
 
-> **v0.5.3：Dashboard 认证与诊断修复。** Dashboard 恢复通过 Hermes SDK 的认证资源链路加载页面；单个数据模块失败时，其余模块仍会显示，并保留可见的失败原因与重试操作。项目工作记忆、摘要和检索资产仍全部由 SQLite 派生并可重建。
+> **v0.5.4：Dashboard 运行时修复。** Dashboard 继续通过 Hermes SDK 认证桥接请求数据，但 WebUI 脚本改由 Dashboard 插件静态资源加载，避免部分 Hermes 环境在 `srcDoc` 内联脚本未执行时永久停留在骨架屏。项目工作记忆、摘要和检索资产仍全部由 SQLite 派生并可重建。
 
 ## v0.5.0 的五个工作区
 
