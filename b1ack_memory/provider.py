@@ -17,6 +17,8 @@ class B1ackMemoryProvider(MemoryProvider):
         self.service = service
         self.session_id = ""
         self.agent_context = "primary"
+        self.project_id = ""
+        self.workspace = ""
 
     @property
     def name(self) -> str:
@@ -31,6 +33,8 @@ class B1ackMemoryProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs: Any) -> None:
         self.session_id = session_id
         self.agent_context = str(kwargs.get("agent_context", "primary"))
+        self.project_id = str(kwargs.get("project_id", "") or "")
+        self.workspace = str(kwargs.get("workspace", kwargs.get("cwd", "")) or "")
         self.service.start_background()
 
     def system_prompt_block(self) -> str:
@@ -40,7 +44,12 @@ class B1ackMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return self.service.format_prefetch(query)
+        return self.service.format_prefetch(
+            query,
+            project_id=self.project_id or None,
+            session_id=session_id or self.session_id,
+            workspace=self.workspace or None,
+        )
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         del query, session_id
@@ -69,6 +78,7 @@ class B1ackMemoryProvider(MemoryProvider):
                     "properties": {
                         "query": {"type": "string"},
                         "limit": {"type": "integer", "minimum": 1, "maximum": 20},
+                        "project_id": {"type": "string"},
                     },
                     "required": ["query"],
                 },
@@ -81,6 +91,7 @@ class B1ackMemoryProvider(MemoryProvider):
                     "properties": {
                         "content": {"type": "string"},
                         "kind": {"type": "string", "enum": list(self._kinds())},
+                        "project_id": {"type": "string"},
                     },
                     "required": ["content"],
                 },
@@ -91,12 +102,14 @@ class B1ackMemoryProvider(MemoryProvider):
         del kwargs
         if tool_name == "b1ack_memory_search":
             hits = self.service.search(
-                str(args.get("query", "")), limit=int(args.get("limit", 5)), injected=False
+                str(args.get("query", "")), limit=int(args.get("limit", 5)), injected=False,
+                project_id=str(args.get("project_id", "") or "") or None,
             )
             return json.dumps({"results": [hit.to_dict() for hit in hits]}, ensure_ascii=False)
         if tool_name == "b1ack_memory_remember":
             result = self.service.remember(
-                str(args.get("content", "")), kind=str(args.get("kind", "fact"))
+                str(args.get("content", "")), kind=str(args.get("kind", "fact")),
+                project_id=str(args.get("project_id", "") or self.project_id or "") or None,
             )
             return json.dumps(result, ensure_ascii=False)
         raise NotImplementedError(tool_name)
@@ -130,15 +143,23 @@ class B1ackMemoryProvider(MemoryProvider):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        del target, metadata
+        del target
         if action in {"add", "replace"} and content.strip():
             try:
-                self.service.remember(content, origin="hermes-builtin")
+                self.service.remember(
+                    content,
+                    origin="hermes-builtin",
+                    project_id=str((metadata or {}).get("project_id", "") or self.project_id or "") or None,
+                )
             except ValueError:
                 pass
 
     def backup_paths(self) -> list[str]:
-        return [str(self.service.db.path), str(self.service.root / "MEMORY.md"), str(self.service.root / "DREAMS.md")]
+        paths = [str(self.service.db.path), str(self.service.root / "MEMORY.md"), str(self.service.root / "DREAMS.md")]
+        for extra in (self.service.root / "vault" / "manifest.json", self.service.root / "indexes" / "manifest.json"):
+            if extra.is_file():
+                paths.append(str(extra))
+        return paths
 
     def shutdown(self) -> None:
         # The plugin service is process-global so concurrent Hermes sessions share one store.

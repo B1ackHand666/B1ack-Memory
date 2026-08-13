@@ -1,3 +1,3 @@
 """Package version shared by runtime metadata and HTTP clients."""
 
-__version__ = "0.3.1"
+__version__ = "0.5.0"

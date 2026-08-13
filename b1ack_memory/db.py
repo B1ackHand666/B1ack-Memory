@@ -12,9 +12,9 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .models import CandidateRecord, MEMORY_KINDS, MemoryRecord
+from .models import AuditRun, CandidateRecord, MEMORY_KINDS, MemoryRecord, ReviewItem
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -57,8 +57,12 @@ class MemoryDatabase:
         self._local = threading.local()
         self.migrate()
 
-    def _backup_before_schema_v5(self) -> None:
-        """Create a safe online backup immediately before upgrading schema v4."""
+    def schema_version(self) -> int:
+        with self.connect() as conn:
+            return int(conn.execute("SELECT version FROM schema_meta").fetchone()[0])
+
+    def _backup_before_schema_upgrade(self) -> None:
+        """Create an online backup immediately before a supported schema upgrade."""
         if not self.path.is_file() or self.path.stat().st_size == 0:
             return
         try:
@@ -69,16 +73,18 @@ class MemoryDatabase:
                 if not table:
                     return
                 version = int(source.execute("SELECT version FROM schema_meta").fetchone()[0])
-                if version != 4:
+                if version not in {4, 5, 6}:
                     return
                 backup_dir = self.path.parent / "backups"
                 backup_dir.mkdir(exist_ok=True)
                 stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-                target = backup_dir / f"{stamp}-pre-schema-v5.db"
+                target = backup_dir / f"{stamp}-pre-schema-v{version + 1}.db"
                 with contextlib.closing(sqlite3.connect(target)) as destination:
                     source.backup(destination)
         except (OSError, sqlite3.Error, TypeError, ValueError) as error:
-            raise RuntimeError(f"Unable to create pre-schema-v5 backup: {error}") from error
+            raise RuntimeError(
+                f"Unable to create pre-schema upgrade backup: {error}"
+            ) from error
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -106,7 +112,7 @@ class MemoryDatabase:
             conn.close()
 
     def migrate(self) -> None:
-        self._backup_before_schema_v5()
+        self._backup_before_schema_upgrade()
         with self.transaction(immediate=True) as conn:
             conn.executescript(
                 """
@@ -126,6 +132,10 @@ class MemoryDatabase:
                     importance REAL NOT NULL DEFAULT 0.5,
                     sensitive INTEGER NOT NULL DEFAULT 0,
                     valid_until TEXT,
+                    valid_from TEXT,
+                    valid_to TEXT,
+                    temporal_status TEXT NOT NULL DEFAULT 'current',
+                    temporal_reason TEXT,
                     supersedes_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
                     content_hash TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -149,7 +159,8 @@ class MemoryDatabase:
                     assistant_content TEXT NOT NULL,
                     observed_at TEXT NOT NULL,
                     ingested_at TEXT,
-                    secret_redacted INTEGER NOT NULL DEFAULT 0
+                    secret_redacted INTEGER NOT NULL DEFAULT 0,
+                    subject_id TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS candidates (
@@ -178,7 +189,11 @@ class MemoryDatabase:
                     promoted_memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
                     rem_status TEXT NOT NULL DEFAULT 'unreviewed',
                     rem_reason TEXT,
-                    rem_reviewed_at TEXT
+                    rem_reviewed_at TEXT,
+                    admission_state TEXT NOT NULL DEFAULT 'admitted',
+                    source_type TEXT NOT NULL DEFAULT 'dream_user',
+                    admission_reason TEXT,
+                    subject_id TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_candidates_status ON candidates(status);
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_pending_hash
@@ -204,7 +219,10 @@ class MemoryDatabase:
                     vector_rank INTEGER,
                     final_score REAL NOT NULL,
                     injected INTEGER NOT NULL DEFAULT 0,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    project_id TEXT,
+                    project_confidence REAL,
+                    project_reason TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS embeddings (
@@ -230,6 +248,15 @@ class MemoryDatabase:
                     filtered_count INTEGER NOT NULL DEFAULT 0,
                     expired_count INTEGER NOT NULL DEFAULT 0,
                     promoted_count INTEGER NOT NULL DEFAULT 0,
+                    admitted_count INTEGER NOT NULL DEFAULT 0,
+                    observed_count INTEGER NOT NULL DEFAULT 0,
+                    discarded_count INTEGER NOT NULL DEFAULT 0,
+                    review_count INTEGER NOT NULL DEFAULT 0,
+                    work_item_count INTEGER NOT NULL DEFAULT 0,
+                    assignment_count INTEGER NOT NULL DEFAULT 0,
+                    summary_count INTEGER NOT NULL DEFAULT 0,
+                    projection_count INTEGER NOT NULL DEFAULT 0,
+                    blocked_count INTEGER NOT NULL DEFAULT 0,
                     model TEXT,
                     input_tokens INTEGER NOT NULL DEFAULT 0,
                     output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -276,6 +303,69 @@ class MemoryDatabase:
                 CREATE INDEX IF NOT EXISTS idx_memory_events_type_time
                     ON memory_events(event_type, occurred_at);
 
+                CREATE TABLE IF NOT EXISTS admission_decisions (
+                    id TEXT PRIMARY KEY,
+                    disposition TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    evidence_quote TEXT,
+                    reason TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    raw_turn_id TEXT REFERENCES raw_turns(id) ON DELETE SET NULL,
+                    candidate_id TEXT REFERENCES candidates(id) ON DELETE SET NULL,
+                    dream_run_id TEXT REFERENCES dream_runs(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_admission_decisions_created
+                    ON admission_decisions(created_at);
+                CREATE INDEX IF NOT EXISTS idx_admission_decisions_candidate
+                    ON admission_decisions(candidate_id);
+
+                CREATE TABLE IF NOT EXISTS memory_audit_runs (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    checked_count INTEGER NOT NULL DEFAULT 0,
+                    issue_count INTEGER NOT NULL DEFAULT 0,
+                    started_at TEXT NOT NULL,
+                    finished_at TEXT,
+                    error TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_audit_runs_scope_time
+                    ON memory_audit_runs(scope, started_at DESC);
+
+                CREATE TABLE IF NOT EXISTS memory_review_items (
+                    id TEXT PRIMARY KEY,
+                    issue_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    proposed_action TEXT NOT NULL,
+                    proposed_content TEXT,
+                    reason TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    candidate_id TEXT REFERENCES candidates(id) ON DELETE CASCADE,
+                    related_candidate_id TEXT REFERENCES candidates(id) ON DELETE CASCADE,
+                    primary_memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
+                    related_memory_id TEXT REFERENCES memories(id) ON DELETE CASCADE,
+                    source TEXT NOT NULL,
+                    basis_hash TEXT NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    dream_run_id TEXT REFERENCES dream_runs(id) ON DELETE SET NULL,
+                    audit_run_id TEXT REFERENCES memory_audit_runs(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    resolution TEXT,
+                    subject_id TEXT,
+                    queue TEXT NOT NULL DEFAULT 'decision'
+                );
+                CREATE INDEX IF NOT EXISTS idx_memory_review_items_status
+                    ON memory_review_items(status, created_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_memory_review_items_candidate
+                    ON memory_review_items(candidate_id, status);
+                CREATE INDEX IF NOT EXISTS idx_memory_review_items_memory
+                    ON memory_review_items(primary_memory_id, related_memory_id, status);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_review_items_fingerprint
+                    ON memory_review_items(fingerprint);
+
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -295,6 +385,130 @@ class MemoryDatabase:
                     expires_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS subjects (
+                    id TEXT PRIMARY KEY,
+                    subject_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    slug TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_subjects_type_status
+                    ON subjects(subject_type,status,updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS subject_aliases (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+                    alias TEXT NOT NULL,
+                    alias_normalized TEXT NOT NULL,
+                    alias_type TEXT NOT NULL DEFAULT 'name',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(subject_id,alias_normalized,alias_type)
+                );
+                CREATE INDEX IF NOT EXISTS idx_subject_alias_lookup
+                    ON subject_aliases(alias_normalized,alias_type);
+
+                CREATE TABLE IF NOT EXISTS subject_relations (
+                    id TEXT PRIMARY KEY,
+                    source_subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+                    relation_type TEXT NOT NULL,
+                    target_subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(source_subject_id,relation_type,target_subject_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS subject_links (
+                    id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+                    object_type TEXT NOT NULL,
+                    object_id TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    assignment_status TEXT NOT NULL DEFAULT 'confirmed',
+                    method TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(subject_id,object_type,object_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_subject_links_object
+                    ON subject_links(object_type,object_id,assignment_status);
+
+                CREATE TABLE IF NOT EXISTS work_items (
+                    id TEXT PRIMARY KEY,
+                    item_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    content_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'suggested',
+                    confirmed INTEGER NOT NULL DEFAULT 0,
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    subject_id TEXT REFERENCES subjects(id) ON DELETE SET NULL,
+                    raw_turn_id TEXT REFERENCES raw_turns(id) ON DELETE SET NULL,
+                    admission_decision_id TEXT REFERENCES admission_decisions(id) ON DELETE SET NULL,
+                    evidence_quote TEXT,
+                    source TEXT NOT NULL DEFAULT 'dream_observe',
+                    expires_at TEXT,
+                    resolved_at TEXT,
+                    promoted_memory_id TEXT REFERENCES memories(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_work_items_live_hash
+                    ON work_items(content_hash,coalesce(subject_id,''))
+                    WHERE status IN ('suggested','active');
+                CREATE INDEX IF NOT EXISTS idx_work_items_subject_status
+                    ON work_items(subject_id,status,item_type,updated_at DESC);
+
+                CREATE TABLE IF NOT EXISTS work_item_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    work_item_id TEXT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+                    snapshot_json TEXT NOT NULL,
+                    changed_at TEXT NOT NULL,
+                    change_reason TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS summary_versions (
+                    id TEXT PRIMARY KEY,
+                    scope TEXT NOT NULL,
+                    subject_id TEXT REFERENCES subjects(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    change_reason TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT 'automatic',
+                    status TEXT NOT NULL DEFAULT 'current',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_summary_versions_target
+                    ON summary_versions(scope,subject_id,status,created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS session_subject_affinity (
+                    session_id TEXT PRIMARY KEY,
+                    subject_id TEXT NOT NULL REFERENCES subjects(id) ON DELETE CASCADE,
+                    confidence REAL NOT NULL,
+                    confirmed INTEGER NOT NULL DEFAULT 0,
+                    method TEXT NOT NULL,
+                    workspace TEXT,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS projection_jobs (
+                    id TEXT PRIMARY KEY,
+                    projection_type TEXT NOT NULL,
+                    target_id TEXT,
+                    revision TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(projection_type,target_id,revision)
+                );
+                CREATE INDEX IF NOT EXISTS idx_projection_jobs_status
+                    ON projection_jobs(status,created_at);
+
                 CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
                     record_id UNINDEXED,
                     source UNINDEXED,
@@ -307,6 +521,39 @@ class MemoryDatabase:
             current = int(conn.execute("SELECT version FROM schema_meta").fetchone()[0])
             if current > SCHEMA_VERSION:
                 raise RuntimeError(f"Database schema {current} is newer than supported {SCHEMA_VERSION}")
+            memory_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(memories)").fetchall()
+            }
+            for column, definition in {
+                "valid_from": "TEXT",
+                "valid_to": "TEXT",
+                "temporal_status": "TEXT NOT NULL DEFAULT 'current'",
+                "temporal_reason": "TEXT",
+            }.items():
+                if column not in memory_columns:
+                    conn.execute(f"ALTER TABLE memories ADD COLUMN {column} {definition}")
+            conn.execute(
+                "UPDATE memories SET temporal_status='current' "
+                "WHERE temporal_status IS NULL OR temporal_status=''"
+            )
+            for table, migrations in {
+                "raw_turns": {"subject_id": "TEXT"},
+                "recall_events": {
+                    "project_id": "TEXT",
+                    "project_confidence": "REAL",
+                    "project_reason": "TEXT",
+                },
+                "memory_review_items": {
+                    "subject_id": "TEXT",
+                    "queue": "TEXT NOT NULL DEFAULT 'decision'",
+                },
+            }.items():
+                columns = {
+                    row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                for column, definition in migrations.items():
+                    if column not in columns:
+                        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
             candidate_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(candidates)").fetchall()
             }
@@ -323,6 +570,10 @@ class MemoryDatabase:
                 "rem_status": "TEXT NOT NULL DEFAULT 'unreviewed'",
                 "rem_reason": "TEXT",
                 "rem_reviewed_at": "TEXT",
+                "admission_state": "TEXT NOT NULL DEFAULT 'admitted'",
+                "source_type": "TEXT NOT NULL DEFAULT 'dream_user'",
+                "admission_reason": "TEXT",
+                "subject_id": "TEXT",
             }
             for column, definition in candidate_migrations.items():
                 if column not in candidate_columns:
@@ -334,7 +585,20 @@ class MemoryDatabase:
             dream_columns = {
                 row["name"] for row in conn.execute("PRAGMA table_info(dream_runs)").fetchall()
             }
-            for column in ("merged_count", "filtered_count", "expired_count"):
+            for column in (
+                "merged_count",
+                "filtered_count",
+                "expired_count",
+                "admitted_count",
+                "observed_count",
+                "discarded_count",
+                "review_count",
+                "work_item_count",
+                "assignment_count",
+                "summary_count",
+                "projection_count",
+                "blocked_count",
+            ):
                 if column not in dream_columns:
                     conn.execute(
                         f"ALTER TABLE dream_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
@@ -363,8 +627,55 @@ class MemoryDatabase:
                     )
             if current < 5:
                 self._migrate_promoted_memory_links(conn)
+            if current < 6:
+                conn.execute("DROP INDEX IF EXISTS idx_candidates_promoted_memory")
+                conn.execute(
+                    "UPDATE candidates SET admission_state='legacy_review',source_type='legacy',"
+                    "admission_reason=coalesce(admission_reason,'升级至 v0.4.0 后需重新准入') "
+                    "WHERE status='pending'"
+                )
+            if current < 7:
+                cutoff = (datetime.now(UTC) - timedelta(days=30)).isoformat(timespec="seconds")
+                legacy_observations = conn.execute(
+                    "SELECT ad.id,ad.content,ad.confidence,ad.raw_turn_id,ad.evidence_quote,"
+                    "ad.created_at FROM admission_decisions ad "
+                    "JOIN raw_turns rt ON rt.id=ad.raw_turn_id "
+                    "WHERE ad.disposition='observe' AND ad.created_at>=?",
+                    (cutoff,),
+                ).fetchall()
+                for observation in legacy_observations:
+                    work_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"b1ack:observe:{observation['id']}"))
+                    created = observation["created_at"]
+                    expires = (
+                        datetime.fromisoformat(created) + timedelta(days=14)
+                    ).isoformat(timespec="seconds")
+                    conn.execute(
+                        "INSERT OR IGNORE INTO work_items("
+                        "id,item_type,content,content_hash,status,confirmed,confidence,raw_turn_id,"
+                        "admission_decision_id,evidence_quote,source,expires_at,created_at,updated_at"
+                        ") VALUES(?, 'proposal', ?, ?, 'suggested', 0, ?, ?, ?, ?, 'migration_v7', ?, ?, ?)",
+                        (
+                            work_id,
+                            observation["content"],
+                            content_hash(observation["content"]),
+                            float(observation["confidence"]),
+                            observation["raw_turn_id"],
+                            observation["id"],
+                            observation["evidence_quote"],
+                            expires,
+                            created,
+                            created,
+                        ),
+                    )
+                revision = content_hash(f"schema-v7:{utc_now()}")
+                conn.execute(
+                    "INSERT OR IGNORE INTO projection_jobs("
+                    "id,projection_type,target_id,revision,status,created_at,updated_at"
+                    ") VALUES(?, 'all', '', ?, 'pending', ?, ?)",
+                    (str(uuid.uuid4()), revision, utc_now(), utc_now()),
+                )
             conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_candidates_promoted_memory "
+                "CREATE INDEX IF NOT EXISTS idx_candidates_promoted_memory "
                 "ON candidates(promoted_memory_id) WHERE promoted_memory_id IS NOT NULL"
             )
             conn.execute("UPDATE schema_meta SET version=?", (SCHEMA_VERSION,))
@@ -732,7 +1043,9 @@ class MemoryDatabase:
             )
             if supersedes_id:
                 conn.execute(
-                    "UPDATE memories SET status='superseded', updated_at=? WHERE id=?", (now, supersedes_id)
+                    "UPDATE memories SET status='superseded',temporal_status='historical',"
+                    "valid_to=coalesce(valid_to,?), updated_at=? WHERE id=?",
+                    (now, now, supersedes_id),
                 )
                 self._add_event(
                     conn,
@@ -801,8 +1114,10 @@ class MemoryDatabase:
             if not old:
                 raise KeyError(record_id)
             changed = conn.execute(
-                "UPDATE memories SET status=?, updated_at=? WHERE id=?",
-                (status, now, record_id),
+                "UPDATE memories SET status=?,temporal_status=CASE "
+                "WHEN ?='superseded' THEN 'historical' "
+                "WHEN ?='active' THEN 'current' ELSE temporal_status END, updated_at=? WHERE id=?",
+                (status, status, status, now, record_id),
             ).rowcount
             if not changed:
                 raise KeyError(record_id)
@@ -884,6 +1199,13 @@ class MemoryDatabase:
                 conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
             for candidate_id in candidate_ids:
                 conn.execute(
+                    "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?",
+                    (candidate_id,),
+                )
+                conn.execute(
+                    "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
+                )
+                conn.execute(
                     "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
                     (candidate_id,),
                 )
@@ -896,13 +1218,33 @@ class MemoryDatabase:
                     (candidate_id,),
                 )
                 conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+            conn.execute(
+                "DELETE FROM subject_links WHERE object_type='memory' AND object_id=?",
+                (record_id,),
+            )
+            conn.execute(
+                "DELETE FROM projection_jobs WHERE target_id=?",
+                (record_id,),
+            )
+            # Summary text is derived, but its source list can itself disclose a
+            # permanently deleted identifier. Remove affected versions so the
+            # next projection/summary refresh can recreate a privacy-clean view.
+            conn.execute(
+                "DELETE FROM summary_versions WHERE source_ids_json LIKE ?",
+                (f'%\"{record_id}\"%',),
+            )
             conn.execute("DELETE FROM recall_events WHERE record_id=?", (record_id,))
             conn.execute("DELETE FROM embeddings WHERE record_id=? AND source='memory'", (record_id,))
             conn.execute("DELETE FROM search_fts WHERE record_id=? AND source='memory'", (record_id,))
             deleted = conn.execute("DELETE FROM memories WHERE id=?", (record_id,)).rowcount
             if deleted != 1:
                 raise KeyError(record_id)
+            deleted_work_items = self._purge_work_items_for_raw_ids(conn, raw_ids)
             for raw_id in raw_ids:
+                conn.execute(
+                    "DELETE FROM subject_links WHERE object_type='raw_turn' AND object_id=?",
+                    (raw_id,),
+                )
                 conn.execute("DELETE FROM raw_turns WHERE id=?", (raw_id,))
             conn.execute(
                 "INSERT INTO audit_events(action,record_id,created_at) VALUES('purge',?,?)",
@@ -912,6 +1254,7 @@ class MemoryDatabase:
             "memories": 1,
             "candidates": len(candidate_ids),
             "raw_turns": len(raw_ids),
+            "work_items": deleted_work_items,
             "dream_runs": len(dream_run_ids),
         }
 
@@ -919,7 +1262,8 @@ class MemoryDatabase:
         record_id = str(uuid.uuid4())
         with self.transaction(immediate=True) as conn:
             conn.execute(
-                "INSERT INTO raw_turns VALUES(?,?,?,?,?,?,?)",
+                "INSERT INTO raw_turns(id,session_id,user_content,assistant_content,observed_at,ingested_at,secret_redacted) "
+                "VALUES(?,?,?,?,?,?,?)",
                 (record_id, session_id, user, assistant, utc_now(), None, int(redacted)),
             )
         return record_id
@@ -950,6 +1294,9 @@ class MemoryDatabase:
         observed_at: str | None = None,
         timezone_name: str = "system",
         dream_run_id: str | None = None,
+        admission_state: str = "admitted",
+        source_type: str = "dream_user",
+        admission_reason: str | None = None,
     ) -> CandidateRecord:
         if kind not in MEMORY_KINDS:
             kind = "fact"
@@ -970,16 +1317,26 @@ class MemoryDatabase:
                 conn.execute(
                     "UPDATE candidates SET status='pending',last_seen_at=?,last_activity_at=?, "
                     "model_confidence=max(model_confidence,?),expired_at=NULL,rejected_at=NULL, "
-                    "rem_status='unreviewed',rem_reason=NULL,rem_reviewed_at=NULL WHERE id=?",
-                    (now, now, confidence, candidate_id),
+                    "rem_status='unreviewed',rem_reason=NULL,rem_reviewed_at=NULL,"
+                    "admission_state=?,source_type=?,admission_reason=? WHERE id=?",
+                    (
+                        now,
+                        now,
+                        confidence,
+                        admission_state,
+                        source_type,
+                        admission_reason,
+                        candidate_id,
+                    ),
                 )
             else:
                 candidate_id = str(uuid.uuid4())
                 conn.execute(
                     """INSERT INTO candidates(
                         id,content,kind,status,model_confidence,sensitive,score,score_components,
-                        evidence_days,content_hash,first_seen_at,last_seen_at,last_activity_at
-                    ) VALUES(?,?,?,'pending',?,?,0,'{}',0,?,?,?,?)""",
+                        evidence_days,content_hash,first_seen_at,last_seen_at,last_activity_at,
+                        admission_state,source_type,admission_reason
+                    ) VALUES(?,?,?,'pending',?,?,0,'{}',0,?,?,?,?,?,?,?)""",
                     (
                         candidate_id,
                         content.strip(),
@@ -990,6 +1347,9 @@ class MemoryDatabase:
                         now,
                         now,
                         now,
+                        admission_state,
+                        source_type,
+                        admission_reason,
                     ),
                 )
                 self._add_event(
@@ -1022,7 +1382,7 @@ class MemoryDatabase:
                             candidate_id,
                             raw_turn_id,
                             excerpt[:1000],
-                            "conversation",
+                            "user",
                             evidence_time,
                         ),
                     )
@@ -1067,11 +1427,40 @@ class MemoryDatabase:
                 ).fetchone()
             )
 
-    def list_candidates(self, *, status: str = "pending", limit: int = 500) -> list[CandidateRecord]:
+    def active_memory_by_content(self, content: str) -> MemoryRecord | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM memories WHERE content_hash=? AND status='active'",
+                (content_hash(content),),
+            ).fetchone()
+        return self._memory_from_row(row) if row else None
+
+    def list_candidates(
+        self,
+        *,
+        status: str = "pending",
+        admission_state: str | None = None,
+        limit: int = 500,
+    ) -> list[CandidateRecord]:
+        sql = "SELECT * FROM candidates WHERE status=?"
+        args: list[Any] = [status]
+        if admission_state:
+            sql += " AND admission_state=?"
+            args.append(admission_state)
+        sql += " ORDER BY score DESC,last_seen_at DESC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._candidate_from_row(row) for row in rows]
+
+    def candidates_due_for_rem(self, limit: int = 30) -> list[CandidateRecord]:
         with self.connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM candidates WHERE status=? ORDER BY score DESC,last_seen_at DESC LIMIT ?",
-                (status, limit),
+                "SELECT * FROM candidates WHERE status='pending' "
+                "AND admission_state='admitted' "
+                "AND (rem_reviewed_at IS NULL OR rem_reviewed_at < last_activity_at) "
+                "ORDER BY coalesce(rem_reviewed_at,'') ASC,last_activity_at ASC LIMIT ?",
+                (limit,),
             ).fetchall()
         return [self._candidate_from_row(row) for row in rows]
 
@@ -1248,6 +1637,18 @@ class MemoryDatabase:
                 (canonical_id, duplicate_id),
             )
             conn.execute(
+                "UPDATE admission_decisions SET candidate_id=? WHERE candidate_id=?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE memory_review_items SET candidate_id=? WHERE candidate_id=?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
+                "UPDATE memory_review_items SET related_candidate_id=? WHERE related_candidate_id=?",
+                (canonical_id, duplicate_id),
+            )
+            conn.execute(
                 "UPDATE recall_events SET record_id=? WHERE record_id=? AND source='candidate'",
                 (canonical_id, duplicate_id),
             )
@@ -1361,7 +1762,7 @@ class MemoryDatabase:
                         float(candidate["model_confidence"]),
                         0.5,
                         int(candidate["sensitive"]),
-                        candidate["conflict_memory_id"],
+                        None,
                         content_hash(memory_content),
                         now,
                         now,
@@ -1380,75 +1781,8 @@ class MemoryDatabase:
                         "origin": origin,
                     },
                 )
-                if candidate["conflict_memory_id"]:
-                    conn.execute(
-                        "UPDATE memories SET status='superseded',updated_at=? WHERE id=?",
-                        (now, candidate["conflict_memory_id"]),
-                    )
-            linked_candidate = conn.execute(
-                "SELECT id FROM candidates WHERE promoted_memory_id=? AND id<>?",
-                (memory_id, candidate_id),
-            ).fetchone()
-            if linked_candidate:
-                canonical_id = linked_candidate["id"]
-                conn.execute(
-                    "UPDATE evidence SET candidate_id=?,memory_id=? WHERE candidate_id=?",
-                    (canonical_id, memory_id, candidate_id),
-                )
-                conn.execute(
-                    "UPDATE recall_events SET record_id=? "
-                    "WHERE source='candidate' AND record_id=?",
-                    (canonical_id, candidate_id),
-                )
-                conn.execute(
-                    "INSERT OR IGNORE INTO model_call_records(call_id,record_type,record_id) "
-                    "SELECT call_id,'candidate',? FROM model_call_records "
-                    "WHERE record_type='candidate' AND record_id=?",
-                    (canonical_id, candidate_id),
-                )
-                conn.execute(
-                    "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
-                    (candidate_id,),
-                )
-                conn.execute(
-                    "DELETE FROM embeddings WHERE source='candidate' AND record_id=?",
-                    (candidate_id,),
-                )
-                conn.execute(
-                    "DELETE FROM search_fts WHERE source='candidate' AND record_id=?",
-                    (candidate_id,),
-                )
-                conn.execute(
-                    "UPDATE candidates SET last_seen_at=max(last_seen_at,?),"
-                    "last_activity_at=max(last_activity_at,?),"
-                    "recall_count=(SELECT COUNT(*) FROM recall_events "
-                    "WHERE source='candidate' AND record_id=? AND injected=1),"
-                    "unique_query_count=(SELECT COUNT(DISTINCT query_hash) FROM recall_events "
-                    "WHERE source='candidate' AND record_id=? AND injected=1) WHERE id=?",
-                    (
-                        candidate["last_seen_at"],
-                        candidate["last_activity_at"],
-                        canonical_id,
-                        canonical_id,
-                        canonical_id,
-                    ),
-                )
-                self._add_event(
-                    conn,
-                    "candidate_merged",
-                    candidate_id=canonical_id,
-                    memory_id=memory_id,
-                    dream_run_id=dream_run_id,
-                    occurred_at=now,
-                    data={
-                        "duplicate_candidate_id": candidate_id,
-                        "duplicate_content": candidate["content"],
-                        "reason": "晋升目标已关联同一长期记忆",
-                    },
-                )
-                conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
-                row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
-                return self._memory_from_row(row)
+                # Conflict resolution is deliberately handled by the review service.
+                # Promoting a candidate must never silently supersede an active memory.
             conn.execute(
                 "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin=?,"
                 "promoted_memory_id=? WHERE id=?",
@@ -1481,6 +1815,27 @@ class MemoryDatabase:
                     "unique_query_count": int(candidate["unique_query_count"]),
                 },
             )
+
+            if existing:
+                self._add_event(
+                    conn,
+                    "candidate_absorbed",
+                    candidate_id=candidate_id,
+                    memory_id=memory_id,
+                    dream_run_id=dream_run_id,
+                    occurred_at=now,
+                    data={"reason": "identical_content", "origin": origin},
+                )
+            if candidate["subject_id"]:
+                conn.execute(
+                    "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+                    "assignment_status,method,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET updated_at=excluded.updated_at",
+                    (
+                        str(uuid.uuid4()), candidate["subject_id"], "memory", memory_id,
+                        1.0, "confirmed", "candidate_promotion", now, now,
+                    ),
+                )
             row = conn.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
         return self._memory_from_row(row)
 
@@ -1532,6 +1887,626 @@ class MemoryDatabase:
                     (since,),
                 ).fetchone()[0]
             )
+
+    def add_admission_decision(
+        self,
+        *,
+        disposition: str,
+        content: str,
+        reason: str,
+        confidence: float = 0.0,
+        evidence_quote: str | None = None,
+        raw_turn_id: str | None = None,
+        candidate_id: str | None = None,
+        dream_run_id: str | None = None,
+    ) -> str:
+        if disposition not in {"admit", "observe", "discard", "invalid"}:
+            raise ValueError(disposition)
+        decision_id = str(uuid.uuid4())
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                """INSERT INTO admission_decisions(
+                    id,disposition,content,evidence_quote,reason,confidence,
+                    raw_turn_id,candidate_id,dream_run_id,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    decision_id,
+                    disposition,
+                    content[:4000],
+                    (evidence_quote or "")[:1000] or None,
+                    reason[:1000],
+                    max(0.0, min(1.0, float(confidence))),
+                    raw_turn_id,
+                    candidate_id,
+                    dream_run_id,
+                    now,
+                ),
+            )
+            self._add_event(
+                conn,
+                "admission_reviewed",
+                candidate_id=candidate_id,
+                dream_run_id=dream_run_id,
+                occurred_at=now,
+                data={"disposition": disposition, "reason": reason[:1000]},
+            )
+        return decision_id
+
+    def list_admission_decisions(self, limit: int = 200) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM admission_decisions ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    @staticmethod
+    def make_review_fingerprint(
+        issue_type: str,
+        *,
+        proposed_content: str | None = None,
+        candidate_id: str | None = None,
+        related_candidate_id: str | None = None,
+        primary_memory_id: str | None = None,
+        related_memory_id: str | None = None,
+        basis_hash: str = "",
+    ) -> str:
+        payload = "\n".join(
+            [
+                issue_type,
+                content_hash(proposed_content or ""),
+                candidate_id or "",
+                related_candidate_id or "",
+                primary_memory_id or "",
+                related_memory_id or "",
+                basis_hash,
+            ]
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def create_review_item(
+        self,
+        *,
+        issue_type: str,
+        proposed_action: str,
+        reason: str,
+        proposed_content: str | None = None,
+        confidence: float = 0.0,
+        candidate_id: str | None = None,
+        related_candidate_id: str | None = None,
+        primary_memory_id: str | None = None,
+        related_memory_id: str | None = None,
+        source: str = "integration",
+        basis_hash: str = "",
+        dream_run_id: str | None = None,
+        audit_run_id: str | None = None,
+        subject_id: str | None = None,
+        queue: str | None = None,
+    ) -> ReviewItem:
+        fingerprint = self.make_review_fingerprint(
+            issue_type,
+            proposed_content=proposed_content,
+            candidate_id=candidate_id,
+            related_candidate_id=related_candidate_id,
+            primary_memory_id=primary_memory_id,
+            related_memory_id=related_memory_id,
+            basis_hash=basis_hash,
+        )
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            existing = conn.execute(
+                "SELECT * FROM memory_review_items WHERE fingerprint=?", (fingerprint,)
+            ).fetchone()
+            if existing:
+                return self._review_from_row(existing)
+            review_id = str(uuid.uuid4())
+            if queue is None:
+                queue = (
+                    "suggestion"
+                    if issue_type in {"duplicate", "legacy_admission", "project_assignment", "stale_work_item", "summary_refresh"}
+                    else "decision"
+                )
+            conn.execute(
+                """INSERT INTO memory_review_items(
+                    id,issue_type,status,proposed_action,proposed_content,reason,confidence,
+                    candidate_id,related_candidate_id,primary_memory_id,related_memory_id,
+                    source,basis_hash,fingerprint,dream_run_id,audit_run_id,created_at,updated_at,
+                    subject_id,queue
+                ) VALUES(?,?,'open',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    review_id,
+                    issue_type,
+                    proposed_action,
+                    proposed_content,
+                    reason[:2000],
+                    max(0.0, min(1.0, float(confidence))),
+                    candidate_id,
+                    related_candidate_id,
+                    primary_memory_id,
+                    related_memory_id,
+                    source,
+                    basis_hash,
+                    fingerprint,
+                    dream_run_id,
+                    audit_run_id,
+                    now,
+                    now,
+                    subject_id,
+                    queue,
+                ),
+            )
+            self._add_event(
+                conn,
+                "integration_review_created",
+                candidate_id=candidate_id,
+                memory_id=primary_memory_id or related_memory_id,
+                dream_run_id=dream_run_id,
+                occurred_at=now,
+                data={
+                    "review_id": review_id,
+                    "issue_type": issue_type,
+                    "proposed_action": proposed_action,
+                    "reason": reason[:1000],
+                },
+            )
+            row = conn.execute(
+                "SELECT * FROM memory_review_items WHERE id=?", (review_id,)
+            ).fetchone()
+        return self._review_from_row(row)
+
+    def get_review_item(self, review_id: str) -> ReviewItem | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_review_items WHERE id=?", (review_id,)
+            ).fetchone()
+        return self._review_from_row(row) if row else None
+
+    def list_review_items(
+        self,
+        *,
+        status: str | None = "open",
+        issue_type: str | None = None,
+        queue: str | None = None,
+        subject_id: str | None = None,
+        limit: int = 500,
+    ) -> list[ReviewItem]:
+        sql = "SELECT * FROM memory_review_items WHERE 1=1"
+        args: list[Any] = []
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        if issue_type:
+            sql += " AND issue_type=?"
+            args.append(issue_type)
+        if queue:
+            sql += " AND queue=?"
+            args.append(queue)
+        if subject_id:
+            sql += " AND subject_id=?"
+            args.append(subject_id)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._review_from_row(row) for row in rows]
+
+    def count_open_reviews(self) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_review_items WHERE status='open'"
+                ).fetchone()[0]
+            )
+
+    def has_open_review(
+        self, *, candidate_id: str | None = None, memory_id: str | None = None
+    ) -> bool:
+        clauses = ["status='open'"]
+        args: list[Any] = []
+        if candidate_id:
+            clauses.append("(candidate_id=? OR related_candidate_id=?)")
+            args.extend([candidate_id, candidate_id])
+        if memory_id:
+            clauses.append("(primary_memory_id=? OR related_memory_id=?)")
+            args.extend([memory_id, memory_id])
+        if len(clauses) == 1:
+            return False
+        with self.connect() as conn:
+            return bool(
+                conn.execute(
+                    "SELECT 1 FROM memory_review_items WHERE " + " AND ".join(clauses) + " LIMIT 1",
+                    args,
+                ).fetchone()
+            )
+
+    def close_review_item(self, review_id: str, *, resolution: str, dismissed: bool = False) -> None:
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_review_items WHERE id=? AND status='open'", (review_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError(review_id)
+            conn.execute(
+                "UPDATE memory_review_items SET status=?,resolution=?,resolved_at=?,updated_at=? "
+                "WHERE id=?",
+                ("dismissed" if dismissed else "resolved", resolution[:1000], now, now, review_id),
+            )
+            self._add_event(
+                conn,
+                "integration_review_resolved",
+                candidate_id=row["candidate_id"],
+                memory_id=row["primary_memory_id"] or row["related_memory_id"],
+                occurred_at=now,
+                data={"review_id": review_id, "resolution": resolution[:1000]},
+            )
+
+    def obsolete_open_reviews(
+        self, *, candidate_id: str | None = None, memory_id: str | None = None
+    ) -> int:
+        clauses = ["status='open'"]
+        args: list[Any] = []
+        if candidate_id:
+            clauses.append("(candidate_id=? OR related_candidate_id=?)")
+            args.extend([candidate_id, candidate_id])
+        if memory_id:
+            clauses.append("(primary_memory_id=? OR related_memory_id=?)")
+            args.extend([memory_id, memory_id])
+        if len(clauses) == 1:
+            return 0
+        with self.transaction(immediate=True) as conn:
+            return conn.execute(
+                "UPDATE memory_review_items SET status='obsolete',updated_at=? WHERE "
+                + " AND ".join(clauses),
+                [utc_now(), *args],
+            ).rowcount
+
+    def create_audit_run(self, scope: str) -> AuditRun:
+        if scope not in {"incremental", "full", "legacy"}:
+            raise ValueError(scope)
+        run_id = str(uuid.uuid4())
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            conn.execute(
+                "INSERT INTO memory_audit_runs(id,scope,status,started_at) VALUES(?,?,?,?)",
+                (run_id, scope, "running", now),
+            )
+            row = conn.execute("SELECT * FROM memory_audit_runs WHERE id=?", (run_id,)).fetchone()
+        return self._audit_run_from_row(row)
+
+    def finish_audit_run(
+        self,
+        run_id: str,
+        *,
+        checked_count: int,
+        issue_count: int,
+        error: str | None = None,
+    ) -> AuditRun:
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            changed = conn.execute(
+                "UPDATE memory_audit_runs SET status=?,checked_count=?,issue_count=?,"
+                "finished_at=?,error=? WHERE id=?",
+                (
+                    "failed" if error else "completed",
+                    checked_count,
+                    issue_count,
+                    now,
+                    error[:2000] if error else None,
+                    run_id,
+                ),
+            ).rowcount
+            if not changed:
+                raise KeyError(run_id)
+            row = conn.execute("SELECT * FROM memory_audit_runs WHERE id=?", (run_id,)).fetchone()
+        return self._audit_run_from_row(row)
+
+    def latest_audit_run(self, scope: str = "full") -> AuditRun | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM memory_audit_runs WHERE scope=? ORDER BY started_at DESC LIMIT 1",
+                (scope,),
+            ).fetchone()
+        return self._audit_run_from_row(row) if row else None
+
+    def merge_memories(self, canonical_id: str, duplicate_id: str) -> MemoryRecord:
+        if canonical_id == duplicate_id:
+            memory = self.get_memory(canonical_id)
+            if not memory:
+                raise KeyError(canonical_id)
+            return memory
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            canonical = conn.execute("SELECT * FROM memories WHERE id=?", (canonical_id,)).fetchone()
+            duplicate = conn.execute("SELECT * FROM memories WHERE id=?", (duplicate_id,)).fetchone()
+            if not canonical or not duplicate:
+                raise KeyError(canonical_id if not canonical else duplicate_id)
+            if canonical["status"] != "active" or duplicate["status"] != "active":
+                raise ValueError("Only active memories can be merged")
+            conn.execute("UPDATE evidence SET memory_id=? WHERE memory_id=?", (canonical_id, duplicate_id))
+            conn.execute(
+                "UPDATE candidates SET promoted_memory_id=? WHERE promoted_memory_id=?",
+                (canonical_id, duplicate_id),
+            )
+            for link in conn.execute(
+                "SELECT * FROM subject_links WHERE object_type='memory' AND object_id=?",
+                (duplicate_id,),
+            ).fetchall():
+                conn.execute(
+                    "INSERT INTO subject_links(id,subject_id,object_type,object_id,confidence,"
+                    "assignment_status,method,created_at,updated_at) VALUES(?,?, 'memory',?,?,?,?,?,?) "
+                    "ON CONFLICT(subject_id,object_type,object_id) DO UPDATE SET "
+                    "confidence=max(confidence,excluded.confidence),updated_at=excluded.updated_at",
+                    (str(uuid.uuid4()), link["subject_id"], canonical_id, link["confidence"],
+                     link["assignment_status"], "memory_merge", link["created_at"], now),
+                )
+            conn.execute(
+                "DELETE FROM subject_links WHERE object_type='memory' AND object_id=?", (duplicate_id,)
+            )
+            for summary in conn.execute(
+                "SELECT id,source_ids_json FROM summary_versions WHERE source_ids_json LIKE ?",
+                (f'%\"{duplicate_id}\"%',),
+            ).fetchall():
+                source_ids = [
+                    canonical_id if str(item) == duplicate_id else str(item)
+                    for item in json.loads(summary["source_ids_json"])
+                ]
+                conn.execute(
+                    "UPDATE summary_versions SET source_ids_json=? WHERE id=?",
+                    (json.dumps(list(dict.fromkeys(source_ids))), summary["id"]),
+                )
+            conn.execute(
+                "UPDATE memories SET status='superseded',temporal_status='historical',"
+                "valid_to=coalesce(valid_to,?),temporal_reason='Merged into canonical memory',"
+                "updated_at=? WHERE id=?",
+                (now, now, duplicate_id),
+            )
+            self._add_event(
+                conn,
+                "memory_merged",
+                memory_id=canonical_id,
+                occurred_at=now,
+                data={"absorbed_memory_id": duplicate_id},
+            )
+            self._add_event(
+                conn,
+                "memory_superseded",
+                memory_id=duplicate_id,
+                occurred_at=now,
+                data={"canonical_memory_id": canonical_id, "reason": "merge"},
+            )
+            row = conn.execute("SELECT * FROM memories WHERE id=?", (canonical_id,)).fetchone()
+        return self._memory_from_row(row)
+
+    def update_memory_temporal(
+        self,
+        record_id: str,
+        *,
+        valid_from: str | None = None,
+        valid_to: str | None = None,
+        temporal_status: str = "current",
+        temporal_reason: str | None = None,
+    ) -> MemoryRecord:
+        if temporal_status not in {"current", "historical", "disputed"}:
+            raise ValueError("Unsupported temporal status")
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            old = conn.execute("SELECT * FROM memories WHERE id=?", (record_id,)).fetchone()
+            if not old:
+                raise KeyError(record_id)
+            conn.execute(
+                "INSERT INTO memory_revisions(memory_id,content,kind,changed_at) VALUES(?,?,?,?)",
+                (record_id, old["content"], old["kind"], now),
+            )
+            conn.execute(
+                "UPDATE memories SET valid_from=?,valid_to=?,temporal_status=?,temporal_reason=?,updated_at=? WHERE id=?",
+                (valid_from, valid_to, temporal_status, temporal_reason, now, record_id),
+            )
+            self._add_event(
+                conn,
+                "memory_temporal_updated",
+                memory_id=record_id,
+                occurred_at=now,
+                data={
+                    "valid_from": valid_from,
+                    "valid_to": valid_to,
+                    "temporal_status": temporal_status,
+                    "temporal_reason": temporal_reason,
+                },
+            )
+            row = conn.execute("SELECT * FROM memories WHERE id=?", (record_id,)).fetchone()
+        return self._memory_from_row(row)
+
+    def supersede_memory(self, new_memory_id: str, old_memory_id: str) -> MemoryRecord:
+        if new_memory_id == old_memory_id:
+            raise ValueError("A memory cannot supersede itself")
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            new = conn.execute("SELECT * FROM memories WHERE id=?", (new_memory_id,)).fetchone()
+            old = conn.execute("SELECT * FROM memories WHERE id=?", (old_memory_id,)).fetchone()
+            if not new or not old:
+                raise KeyError(new_memory_id if not new else old_memory_id)
+            conn.execute(
+                "UPDATE memories SET supersedes_id=?,updated_at=? WHERE id=?",
+                (old_memory_id, now, new_memory_id),
+            )
+            conn.execute(
+                "UPDATE memories SET status='superseded',temporal_status='historical',"
+                "valid_to=coalesce(valid_to,?),temporal_reason='Superseded by newer memory',"
+                "updated_at=? WHERE id=?",
+                (now, now, old_memory_id),
+            )
+            self._add_event(
+                conn,
+                "memory_superseded",
+                memory_id=old_memory_id,
+                occurred_at=now,
+                data={"replacement_memory_id": new_memory_id},
+            )
+            row = conn.execute("SELECT * FROM memories WHERE id=?", (new_memory_id,)).fetchone()
+        return self._memory_from_row(row)
+
+    def apply_dream_consolidation(
+        self,
+        *,
+        creates: list[dict[str, Any]],
+        reviews: list[dict[str, Any]],
+        dream_run_id: str,
+    ) -> dict[str, Any]:
+        """Validate and apply a complete Deep batch in one transaction."""
+        candidate_ids = [str(item.get("candidate_id", "")) for item in [*creates, *reviews]]
+        if not candidate_ids or any(not item for item in candidate_ids):
+            if candidate_ids:
+                raise ValueError("Deep batch contains an empty candidate ID")
+            return {"promoted": [], "reviews": []}
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise ValueError("Deep batch contains duplicate candidate IDs")
+        now = utc_now()
+        promoted: list[str] = []
+        created_reviews: list[str] = []
+        with self.transaction(immediate=True) as conn:
+            candidates = {
+                row["id"]: row
+                for row in conn.execute(
+                    f"SELECT * FROM candidates WHERE id IN ({','.join('?' for _ in candidate_ids)})",
+                    candidate_ids,
+                ).fetchall()
+            }
+            if set(candidates) != set(candidate_ids) or any(
+                row["status"] != "pending" or row["admission_state"] != "admitted"
+                for row in candidates.values()
+            ):
+                raise ValueError("Deep batch references an unavailable candidate")
+            for item in reviews:
+                target_value = item.get("target_memory_id")
+                target_id = str(target_value).strip() if target_value else ""
+                if target_id and not conn.execute(
+                    "SELECT 1 FROM memories WHERE id=? AND status='active'", (target_id,)
+                ).fetchone():
+                    raise ValueError(f"Deep batch references unknown memory ID: {target_id}")
+
+            for item in creates:
+                candidate_id = str(item["candidate_id"])
+                candidate = candidates[candidate_id]
+                memory_content = str(item.get("content", "")).strip()
+                if not memory_content:
+                    raise ValueError("Deep create action has empty content")
+                existing = conn.execute(
+                    "SELECT * FROM memories WHERE content_hash=? AND status='active'",
+                    (content_hash(memory_content),),
+                ).fetchone()
+                if existing:
+                    memory_id = existing["id"]
+                else:
+                    memory_id = str(uuid.uuid4())
+                    conn.execute(
+                        """INSERT INTO memories(
+                            id,content,kind,status,origin,confidence,importance,sensitive,
+                            supersedes_id,content_hash,created_at,updated_at
+                        ) VALUES(?,?,?,'active','dream',?,?,?,NULL,?,?,?)""",
+                        (
+                            memory_id,
+                            memory_content,
+                            candidate["kind"],
+                            float(candidate["model_confidence"]),
+                            0.5,
+                            int(candidate["sensitive"]),
+                            content_hash(memory_content),
+                            now,
+                            now,
+                        ),
+                    )
+                    self._add_event(
+                        conn,
+                        "memory_created",
+                        candidate_id=candidate_id,
+                        memory_id=memory_id,
+                        dream_run_id=dream_run_id,
+                        occurred_at=now,
+                        data={"content": memory_content, "kind": candidate["kind"], "origin": "dream"},
+                    )
+                conn.execute(
+                    "UPDATE candidates SET status='promoted',promoted_at=?,promotion_origin='dream',"
+                    "promoted_memory_id=? WHERE id=?",
+                    (now, memory_id, candidate_id),
+                )
+                conn.execute(
+                    "UPDATE evidence SET memory_id=? WHERE candidate_id=?", (memory_id, candidate_id)
+                )
+                self._add_event(
+                    conn,
+                    "candidate_promoted",
+                    candidate_id=candidate_id,
+                    memory_id=memory_id,
+                    dream_run_id=dream_run_id,
+                    occurred_at=now,
+                    data={
+                        "origin": "dream",
+                        "promotion_lane": "different_dates",
+                        "candidate_content": candidate["content"],
+                        "memory_content": memory_content,
+                    },
+                )
+                promoted.append(memory_id)
+
+            for item in reviews:
+                candidate_id = str(item["candidate_id"])
+                target_value = item.get("target_memory_id")
+                target_id = str(target_value).strip() if target_value else None
+                proposed_content = str(item.get("content", "")).strip() or candidates[candidate_id]["content"]
+                issue_type = str(item.get("issue_type", item.get("action", "defer")))
+                basis_hash = str(item.get("basis_hash", ""))
+                fingerprint = self.make_review_fingerprint(
+                    issue_type,
+                    proposed_content=proposed_content,
+                    candidate_id=candidate_id,
+                    related_memory_id=target_id,
+                    basis_hash=basis_hash,
+                )
+                existing_review = conn.execute(
+                    "SELECT id FROM memory_review_items WHERE fingerprint=?", (fingerprint,)
+                ).fetchone()
+                if existing_review:
+                    created_reviews.append(existing_review["id"])
+                    continue
+                review_id = str(uuid.uuid4())
+                conn.execute(
+                    """INSERT INTO memory_review_items(
+                        id,issue_type,status,proposed_action,proposed_content,reason,confidence,
+                        candidate_id,related_memory_id,source,basis_hash,fingerprint,dream_run_id,
+                        created_at,updated_at
+                    ) VALUES(?,?,'open',?,?,?,?,?,?,'dream',?,?,?,?,?)""",
+                    (
+                        review_id,
+                        issue_type,
+                        str(item.get("action", "defer")),
+                        proposed_content,
+                        str(item.get("reason", "Deep integration requires review"))[:2000],
+                        max(0.0, min(1.0, float(item.get("confidence", 0.0)))),
+                        candidate_id,
+                        target_id,
+                        basis_hash,
+                        fingerprint,
+                        dream_run_id,
+                        now,
+                        now,
+                    ),
+                )
+                self._add_event(
+                    conn,
+                    "integration_review_created",
+                    candidate_id=candidate_id,
+                    memory_id=target_id,
+                    dream_run_id=dream_run_id,
+                    occurred_at=now,
+                    data={
+                        "review_id": review_id,
+                        "issue_type": issue_type,
+                        "proposed_action": str(item.get("action", "defer")),
+                    },
+                )
+                created_reviews.append(review_id)
+        return {"promoted": promoted, "reviews": created_reviews}
 
     def purge_candidate(
         self,
@@ -1603,8 +2578,20 @@ class MemoryDatabase:
                 "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
                 (candidate_id,),
             )
+            conn.execute(
+                "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
+            )
+            conn.execute(
+                "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?",
+                (candidate_id,),
+            )
             conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
             if privacy and raw_ids:
+                deleted_work_items = self._purge_work_items_for_raw_ids(conn, raw_ids)
+                conn.executemany(
+                    "DELETE FROM subject_links WHERE object_type='raw_turn' AND object_id=?",
+                    [(item,) for item in raw_ids],
+                )
                 conn.executemany("DELETE FROM raw_turns WHERE id=?", [(item,) for item in raw_ids])
                 for affected_id in affected_candidate_ids:
                     evidence_days = self._count_evidence_days(
@@ -1621,8 +2608,44 @@ class MemoryDatabase:
         return {
             "candidates": 1,
             "raw_turns": len(raw_ids) if privacy else 0,
+            "work_items": deleted_work_items if privacy and raw_ids else 0,
             "dream_runs": len(dream_run_ids),
         }
+
+    @staticmethod
+    def _purge_work_items_for_raw_ids(conn: sqlite3.Connection, raw_ids: list[str]) -> int:
+        if not raw_ids:
+            return 0
+        placeholders = ",".join("?" for _ in raw_ids)
+        work_item_ids = [
+            str(row[0])
+            for row in conn.execute(
+                f"SELECT id FROM work_items WHERE raw_turn_id IN ({placeholders})", raw_ids
+            )
+        ]
+        for item_id in work_item_ids:
+            conn.execute(
+                "DELETE FROM subject_links WHERE object_type='work_item' AND object_id=?",
+                (item_id,),
+            )
+            conn.execute(
+                "DELETE FROM recall_events WHERE source='work_item' AND record_id=?", (item_id,)
+            )
+            conn.execute(
+                "DELETE FROM embeddings WHERE source='work_item' AND record_id=?", (item_id,)
+            )
+            conn.execute(
+                "DELETE FROM search_fts WHERE source='work_item' AND record_id=?", (item_id,)
+            )
+            conn.execute("DELETE FROM projection_jobs WHERE target_id=?", (item_id,))
+            conn.execute(
+                "DELETE FROM summary_versions WHERE source_ids_json LIKE ?",
+                (f'%\"{item_id}\"%',),
+            )
+        if work_item_ids:
+            item_placeholders = ",".join("?" for _ in work_item_ids)
+            conn.execute(f"DELETE FROM work_items WHERE id IN ({item_placeholders})", work_item_ids)
+        return len(work_item_ids)
 
     def retention_cleanup(
         self,
@@ -1677,6 +2700,9 @@ class MemoryDatabase:
             ]
             for candidate_id in purge_ids:
                 conn.execute(
+                    "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
+                )
+                conn.execute(
                     "DELETE FROM recall_events WHERE record_id=? AND source='candidate'",
                     (candidate_id,),
                 )
@@ -1701,10 +2727,14 @@ class MemoryDatabase:
                 )
             calls = conn.execute("DELETE FROM model_calls WHERE created_at < ?", (model_cutoff,)).rowcount
             traces = conn.execute("DELETE FROM recall_events WHERE created_at < ?", (model_cutoff,)).rowcount
+            admission_logs = conn.execute(
+                "DELETE FROM admission_decisions WHERE created_at < ?", (model_cutoff,)
+            ).rowcount
         return {
             "raw_turns": raw,
             "model_calls": calls,
             "recall_events": traces,
+            "admission_decisions": admission_logs,
             "expired_candidates": expired,
             "purged_candidates": len(purge_ids),
         }
@@ -1761,6 +2791,10 @@ class MemoryDatabase:
             importance=float(row["importance"]),
             sensitive=bool(row["sensitive"]),
             valid_until=row["valid_until"],
+            valid_from=row["valid_from"],
+            valid_to=row["valid_to"],
+            temporal_status=row["temporal_status"] or "current",
+            temporal_reason=row["temporal_reason"],
             supersedes_id=row["supersedes_id"],
             content_hash=row["content_hash"],
             created_at=row["created_at"],
@@ -1795,4 +2829,44 @@ class MemoryDatabase:
             score_components=json.loads(row["score_components"] or "{}"),
             conflict_memory_id=row["conflict_memory_id"],
             conflict_reason=row["conflict_reason"],
+            admission_state=row["admission_state"] or "admitted",
+            source_type=row["source_type"] or "dream_user",
+            admission_reason=row["admission_reason"],
+        )
+
+    def _review_from_row(self, row: sqlite3.Row) -> ReviewItem:
+        return ReviewItem(
+            id=row["id"],
+            issue_type=row["issue_type"],
+            status=row["status"],
+            proposed_action=row["proposed_action"],
+            proposed_content=row["proposed_content"],
+            reason=row["reason"],
+            confidence=float(row["confidence"]),
+            candidate_id=row["candidate_id"],
+            related_candidate_id=row["related_candidate_id"],
+            primary_memory_id=row["primary_memory_id"],
+            related_memory_id=row["related_memory_id"],
+            source=row["source"],
+            basis_hash=row["basis_hash"],
+            fingerprint=row["fingerprint"],
+            dream_run_id=row["dream_run_id"],
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            resolved_at=row["resolved_at"],
+            resolution=row["resolution"],
+            subject_id=row["subject_id"],
+            queue=row["queue"] or "decision",
+        )
+
+    def _audit_run_from_row(self, row: sqlite3.Row) -> AuditRun:
+        return AuditRun(
+            id=row["id"],
+            scope=row["scope"],
+            status=row["status"],
+            checked_count=int(row["checked_count"]),
+            issue_count=int(row["issue_count"]),
+            started_at=row["started_at"],
+            finished_at=row["finished_at"],
+            error=row["error"],
         )

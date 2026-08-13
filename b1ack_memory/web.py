@@ -88,9 +88,99 @@ def create_router(
     def memories(status: str = "active", limit: int = 500) -> list[dict[str, Any]]:
         return memory.list_memories(status=status, limit=min(max(limit, 1), 5000))
 
+    @router.get("/search")
+    def search(query: str, limit: int = 20, project_id: str | None = None) -> list[dict[str, Any]]:
+        return [
+            item.to_dict()
+            for item in memory.search(
+                query, limit=min(max(limit, 1), 20), injected=False, project_id=project_id
+            )
+        ]
+
+    @router.get("/projects")
+    def projects(status: str | None = None) -> list[dict[str, Any]]:
+        return memory.list_projects(status=status or None)
+
+    @router.get("/projects/{project_id}")
+    def project(project_id: str) -> dict[str, Any]:
+        return memory.get_project(project_id)
+
+    @router.get("/projects/{project_id}/context-preview")
+    def project_context(project_id: str, query: str = "", session_id: str = "") -> dict[str, Any]:
+        return memory.context_preview(query, project_id=project_id, session_id=session_id)
+
+    @router.get("/projects/{project_id}/export")
+    def export_project(project_id: str) -> dict[str, Any]:
+        return memory.export_project(project_id)
+
+    @router.get("/subjects")
+    def subjects(subject_type: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        return memory.list_subjects(subject_type=subject_type or None, status=status or None)
+
+    @router.get("/subjects/{subject_id}")
+    def subject(subject_id: str) -> dict[str, Any]:
+        return memory.workspace.get_subject(subject_id)
+
+    @router.get("/work-items")
+    def work_items(
+        status: str | None = None,
+        subject_id: str | None = None,
+        item_type: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        return memory.list_work_items(
+            status=status or None,
+            subject_id=subject_id or None,
+            item_type=item_type or None,
+            limit=min(max(limit, 1), 5000),
+        )
+
+    @router.get("/summaries/{scope}/{subject_id}")
+    def summaries(scope: str, subject_id: str) -> list[dict[str, Any]]:
+        return memory.summary_versions(scope, None if subject_id == "global" else subject_id)
+
+    @router.get("/context/preview")
+    def context_preview(
+        query: str,
+        project_id: str | None = None,
+        session_id: str = "",
+        workspace: str | None = None,
+    ) -> dict[str, Any]:
+        return memory.context_preview(
+            query, project_id=project_id or None, session_id=session_id, workspace=workspace or None
+        )
+
+    @router.get("/maintenance/storage")
+    def storage_health() -> dict[str, Any]:
+        return memory.workspace.storage_health()
+
     @router.get("/candidates")
-    def candidates(status: str = "pending", limit: int = 500) -> list[dict[str, Any]]:
-        return memory.list_candidates(status=status, limit=min(max(limit, 1), 5000))
+    def candidates(
+        status: str = "pending",
+        admission_state: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        return memory.list_candidates(
+            status=status,
+            admission_state=admission_state,
+            limit=min(max(limit, 1), 5000),
+        )
+
+    @router.get("/reviews")
+    def reviews(
+        status: str | None = "open",
+        issue_type: str | None = None,
+        queue: str | None = None,
+        subject_id: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        return memory.list_reviews(
+            status=status or None,
+            issue_type=issue_type or None,
+            queue=queue or None,
+            subject_id=subject_id or None,
+            limit=min(max(limit, 1), 5000),
+        )
 
     @router.get("/dream-runs")
     def dream_runs(limit: int = 100) -> list[dict[str, Any]]:
@@ -140,17 +230,119 @@ def create_router(
     def run_dream(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         return memory.run_dream(dry_run=bool(body.get("dry_run", False)))
 
+    @router.post("/projects", dependencies=mutate())
+    def create_project(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.create_project(body)
+
+    @router.patch("/projects/{project_id}", dependencies=mutate())
+    def update_project(project_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.update_project(project_id, body)
+
+    @router.post("/projects/{project_id}/archive", dependencies=mutate())
+    def archive_project(project_id: str) -> dict[str, Any]:
+        return memory.archive_project(project_id)
+
+    @router.post("/projects/{project_id}/session", dependencies=mutate())
+    def set_session_project(project_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.set_session_project(str(body.get("session_id", "")), project_id)
+
+    @router.post("/subjects", dependencies=mutate())
+    def create_subject(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.create_subject(body)
+
+    @router.post("/subjects/{subject_id}/merge", dependencies=mutate())
+    def merge_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.merge_subjects(subject_id, str(body.get("source_id", "")))
+
+    @router.patch("/subjects/{subject_id}", dependencies=mutate())
+    def update_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.update_subject(subject_id, body)
+
+    @router.post("/subjects/{subject_id}/split", dependencies=mutate())
+    def split_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.split_subject(subject_id, body)
+
+    @router.post("/subjects/{subject_id}/links", dependencies=mutate())
+    def link_subject(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.link_subject(subject_id, body)
+
+    @router.delete("/subjects/{subject_id}/links/{object_type}/{object_id}", dependencies=mutate())
+    def unlink_subject(subject_id: str, object_type: str, object_id: str) -> dict[str, Any]:
+        return memory.unlink_subject(subject_id, object_type, object_id)
+
+    @router.post("/subjects/{subject_id}/relations", dependencies=mutate())
+    def add_subject_relation(subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.add_subject_relation(subject_id, body)
+
+    @router.patch("/work-items/{item_id}", dependencies=mutate())
+    def update_work_item(item_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.update_work_item(item_id, body)
+
+    @router.post("/work-items/{item_id}/{action}", dependencies=mutate())
+    def work_item_action(item_id: str, action: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        if action not in {"confirm", "resolve", "archive", "restore", "promote"}:
+            raise HTTPException(status_code=404, detail="Unsupported work item action")
+        return memory.work_item_action(item_id, action, body)
+
+    @router.post("/summaries/{scope}/{subject_id}/regenerate", dependencies=mutate())
+    def regenerate_summary(scope: str, subject_id: str) -> dict[str, Any]:
+        return memory.regenerate_summary(scope, None if subject_id == "global" else subject_id)
+
+    @router.patch("/summaries/{scope}/{subject_id}", dependencies=mutate())
+    def override_summary(scope: str, subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.override_summary(
+            scope, None if subject_id == "global" else subject_id, str(body.get("content", ""))
+        )
+
+    @router.post("/summaries/{scope}/{subject_id}/rollback", dependencies=mutate())
+    def rollback_summary(scope: str, subject_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.rollback_summary(
+            scope, None if subject_id == "global" else subject_id, str(body.get("version_id", ""))
+        )
+
+    @router.post("/summaries/{scope}/{subject_id}/resume", dependencies=mutate())
+    def resume_summary(scope: str, subject_id: str) -> dict[str, Any]:
+        return memory.resume_summary(scope, None if subject_id == "global" else subject_id)
+
+    @router.post("/reviews/scan", dependencies=mutate())
+    def scan_reviews(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
+        return memory.run_memory_audit(scope=str(body.get("scope", "full")))
+
+    @router.post("/reviews/{review_id}/resolve", dependencies=mutate())
+    def resolve_review(review_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.resolve_review(
+            review_id,
+            action=str(body.get("action", "")),
+            content=body.get("content"),
+            canonical_id=body.get("canonical_id"),
+            kind=body.get("kind"),
+        )
+
+    @router.post("/reviews/{review_id}/dismiss", dependencies=mutate())
+    def dismiss_review(review_id: str) -> dict[str, Any]:
+        return memory.dismiss_review(review_id)
+
     @router.post("/memories", dependencies=mutate())
     def add_memory(body: dict[str, Any] = Body(...)) -> dict[str, Any]:
         return memory.remember(
             str(body.get("content", "")),
             kind=str(body.get("kind", "fact")),
             allow_sensitive=bool(body.get("allow_sensitive", False)),
+            project_id=str(body.get("project_id", "") or "") or None,
         )
 
     @router.patch("/memories/{record_id}", dependencies=mutate())
     def edit_memory(record_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        return memory.update_memory(record_id, str(body["content"]), str(body.get("kind", "fact")))
+        return memory.update_memory(
+            record_id,
+            str(body["content"]),
+            str(body.get("kind", "fact")),
+            valid_from=body.get("valid_from"),
+            valid_to=body.get("valid_to"),
+            temporal_status=body.get("temporal_status"),
+            temporal_reason=body.get("temporal_reason"),
+            project_id=str(body.get("project_id", "") or "") or None,
+        )
 
     @router.post("/memories/{record_id}/trash", dependencies=mutate())
     def trash_memory(record_id: str) -> dict[str, bool]:
@@ -158,9 +350,8 @@ def create_router(
         return {"ok": True}
 
     @router.post("/memories/{record_id}/restore", dependencies=mutate())
-    def restore_memory(record_id: str) -> dict[str, bool]:
-        memory.restore_memory(record_id)
-        return {"ok": True}
+    def restore_memory(record_id: str) -> dict[str, Any]:
+        return memory.restore_memory(record_id)
 
     @router.delete("/memories/{record_id}", dependencies=mutate())
     def purge_memory(record_id: str) -> dict[str, Any]:
@@ -196,11 +387,23 @@ def create_router(
         memory.restore_backup(name)
         return {"ok": True}
 
+    @router.post("/backups/{name}/preview-restore", dependencies=mutate())
+    def preview_restore(name: str) -> dict[str, Any]:
+        return memory.preview_restore(name)
+
     @router.post("/maintenance", dependencies=mutate())
     def maintenance(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
         return memory.maintenance(
             vacuum=bool(body.get("vacuum", False)), cleanup=bool(body.get("cleanup", False))
         )
+
+    @router.post("/maintenance/validate", dependencies=mutate())
+    def validate_storage() -> dict[str, Any]:
+        return memory.workspace.storage_health()
+
+    @router.post("/maintenance/rebuild-projections", dependencies=mutate())
+    def rebuild_projections() -> dict[str, Any]:
+        return memory.workspace.rebuild_projections()
 
     @router.post("/rebuild", dependencies=mutate())
     def rebuild(body: dict[str, Any] = Body(default={})) -> dict[str, Any]:
