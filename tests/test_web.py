@@ -4,10 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from b1ack_memory.service import MemoryService
-from b1ack_memory.web import create_app
+from b1ack_memory.web import create_app, create_router
 
 
 class WebTests(unittest.TestCase):
@@ -51,6 +52,22 @@ class WebTests(unittest.TestCase):
             headers=self.headers,
         )
         self.assertEqual(invalid.status_code, 400)
+
+    def test_dashboard_router_serves_external_ui_assets(self) -> None:
+        app = FastAPI()
+        app.include_router(
+            create_router(self.service, auth_mode="dashboard"),
+            prefix="/api/plugins/b1ack-memory",
+        )
+        with TestClient(app) as client:
+            page = client.get("/api/plugins/b1ack-memory/ui/")
+            self.assertEqual(page.status_code, 200)
+            self.assertIn('src="app.js"', page.text)
+            self.assertEqual(client.get("/api/plugins/b1ack-memory/ui/app.js").status_code, 200)
+            self.assertEqual(client.get("/api/plugins/b1ack-memory/ui/style.css").status_code, 200)
+            bootstrap = client.get("/api/plugins/b1ack-memory/bootstrap")
+            self.assertEqual(bootstrap.status_code, 200)
+            self.assertEqual(bootstrap.json()["auth_mode"], "dashboard")
 
     def test_operational_errors_are_safe_and_readable(self) -> None:
         headers = self.headers
