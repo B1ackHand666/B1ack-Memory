@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.5.3] - 2026-08-13
+
+### 修复
+
+- 回退 v0.5.1/v0.5.2 的外部 iframe URL：它会绕过 Hermes SDK 自动附加的宿主会话，在 Hermes 0.19 部署中导致 `{"detail":"Unauthorized"}`。Dashboard 恢复为由父页面通过 SDK 获取资源后再加载的认证链路。
+- 首屏数据加载改为独立结算；项目、审核、存储等单个模块失败时，其余模块仍显示，概览保留具体失败模块与重试操作，不再让整个页面无限停在骨架屏。
+
 ## [0.5.2] - 2026-08-13
 
 ### 修复
@@ -245,7 +252,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.2...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.3
 [0.5.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.2
 [0.5.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.1
 [0.5.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.0

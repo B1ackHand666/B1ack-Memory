@@ -124,7 +124,7 @@ class DistributionTests(unittest.TestCase):
         self.assertIn("kind: exclusive", manifest)
         self.assertIn(f'version: "{b1ack_memory.__version__}"', manifest)
 
-    def test_dashboard_iframe_uses_authenticated_sdk_bridge_without_inline_scripts(self) -> None:
+    def test_dashboard_iframe_uses_authenticated_sdk_bridge(self) -> None:
         root = Path(__file__).resolve().parents[1]
         for script in (
             root / "dashboard" / "dist" / "index.js",
@@ -133,10 +133,8 @@ class DistributionTests(unittest.TestCase):
             source = script.read_text(encoding="utf-8")
             self.assertIn("SDK.fetchJSON", source)
             self.assertIn("SDK.authedFetch", source)
-            self.assertIn("dashboardRoutePrefix", source)
-            self.assertIn('src: dashboardRoutePrefix() + API + "/ui/"', source)
-            self.assertNotIn("srcDoc:", source)
-            self.assertNotIn('API + "/ui-bundle"', source)
+            self.assertIn('API + "/ui-bundle"', source)
+            self.assertIn("srcDoc: documentHtml", source)
             self.assertNotIn('src: dashboardBasePath', source)
 
     def test_dashboard_api_can_be_loaded_as_a_standalone_module(self) -> None:

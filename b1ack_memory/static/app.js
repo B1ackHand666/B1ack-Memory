@@ -78,8 +78,15 @@ function fail(error) { console.error(error); notice(error.message || String(erro
 async function loadAll() {
   try {
     const bootstrap = await api("/bootstrap"); statusData = bootstrap.status;
-    await Promise.all([loadOverview(), loadSettings(), loadLibrary(), loadProjects(), loadReviews(), loadDreams(), loadTraces(), loadCalls(), loadStorage(), loadIngestionIssues(), loadBackups()]);
-    clearLoadFailure();
+    const loaders = [
+      ["概览", loadOverview], ["设置", loadSettings], ["记忆库", loadLibrary], ["项目", loadProjects],
+      ["审核", loadReviews], ["Dream", loadDreams], ["召回轨迹", loadTraces], ["模型调用", loadCalls],
+      ["存储", loadStorage], ["隔离会话", loadIngestionIssues], ["备份", loadBackups],
+    ];
+    const results = await Promise.allSettled(loaders.map(([, loader]) => loader()));
+    const failures = results.flatMap((result, index) => result.status === "rejected" ? [`${loaders[index][0]}：${result.reason?.message || String(result.reason)}`] : []);
+    if (failures.length) showLoadFailure(new Error(`部分数据未加载：${failures.join("；")}`));
+    else clearLoadFailure();
   } catch (error) { fail(error); showLoadFailure(error); }
 }
 
