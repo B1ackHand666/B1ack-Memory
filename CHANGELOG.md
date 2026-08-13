@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.5.1] - 2026-08-13
+
+### 修复
+
+- Hermes Dashboard 不再通过 `iframe srcDoc` 注入内联 WebUI 脚本，改为加载宿主鉴权下的外部 `/ui/` 资源，避免 CSP 拦截脚本后页面永久停留在骨架屏。
+- 首次数据加载失败时，概览页会保留错误说明和“重试”操作，不再只显示短暂通知与无限骨架占位。
+
 ## [0.5.0] - 2026-08-13
 
 ### 新增
@@ -232,7 +239,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.0...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.1
 [0.5.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.0
 [0.4.0]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.4.0
 [0.3.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.3.1

@@ -1,5 +1,12 @@
 const base = location.pathname.replace(/\/ui\/?$/, "");
-const bridge = window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
+function dashboardBridge() {
+  try {
+    return window.parent !== window ? window.parent.__B1ACK_MEMORY_DASHBOARD_BRIDGE__ : null;
+  } catch (_) {
+    return null;
+  }
+}
+const bridge = dashboardBridge();
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 let settings = {};
@@ -23,9 +30,11 @@ const badge = (text, tone="") => `<span class="badge ${tone}">${esc(text)}</span
 const empty = (text) => `<div class="empty">${esc(text)}</div>`;
 
 async function api(path, options={}) {
-  const headers = {"Content-Type":"application/json", ...(options.headers || {})};
-  if (bridge) return bridge.request(path, {...options, headers});
-  const response = await fetch(base + path, {...options, headers});
+  const headers = {...(options.headers || {})};
+  if (options.body !== undefined && !headers["Content-Type"]) headers["Content-Type"] = "application/json";
+  const request = Object.keys(headers).length ? {...options, headers} : options;
+  if (bridge) return bridge.request(path, request);
+  const response = await fetch(base + path, request);
   if (!response.ok) {
     let detail = response.statusText;
     try { detail = (await response.json()).detail || detail; } catch {}
@@ -37,6 +46,19 @@ function notice(message, isError=false) {
   const node = $("#notice"); clearTimeout(noticeTimer); node.textContent = message; node.className = isError ? "error" : ""; node.style.display = "block";
   noticeTimer = setTimeout(() => node.style.display = "none", 4200);
 }
+function showLoadFailure(error) {
+  const message = error?.message || String(error);
+  let panel = $("#load-error");
+  if (!panel) {
+    panel = document.createElement("article");
+    panel.id = "load-error";
+    $("#overview").prepend(panel);
+  }
+  Object.assign(panel.style, {border: "1px solid #713c43", background: "#241419", borderRadius: "16px", padding: "15px 18px", marginBottom: "16px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px"});
+  panel.innerHTML = `<div><b>数据没有加载完成</b><p style="margin:5px 0 0;color:#e9b9be;line-height:1.45;word-break:break-word">${esc(message)}</p></div><button class="quiet small" type="button">重试</button>`;
+  panel.querySelector("button").addEventListener("click", () => loadAll());
+}
+function clearLoadFailure() { $("#load-error")?.remove(); }
 async function mutate(path, body={}, method="POST", reload=true) {
   const result = await api(path, {method, body:JSON.stringify(body)});
   if (reload) await loadAll();
@@ -57,7 +79,8 @@ async function loadAll() {
   try {
     const bootstrap = await api("/bootstrap"); statusData = bootstrap.status;
     await Promise.all([loadOverview(), loadSettings(), loadLibrary(), loadProjects(), loadReviews(), loadDreams(), loadTraces(), loadCalls(), loadStorage(), loadIngestionIssues(), loadBackups()]);
-  } catch (error) { fail(error); }
+    clearLoadFailure();
+  } catch (error) { fail(error); showLoadFailure(error); }
 }
 
 async function loadOverview() {
