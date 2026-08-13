@@ -285,6 +285,25 @@ class CoreTests(unittest.TestCase):
         self.service.restore_memory(record_id)
         self.assertEqual(self.service.list_memories()[0]["id"], record_id)
 
+    def test_trashing_memory_obsoletes_reviews_and_allows_privacy_purge(self) -> None:
+        record_id = self.service.remember("Review cleanup lifecycle test", kind="fact")["memory"]["id"]
+        review = self.service.db.create_review_item(
+            issue_type="conflict",
+            proposed_action="keep_both",
+            reason="Test review tied to a memory that is being discarded",
+            primary_memory_id=record_id,
+            source="test",
+        )
+
+        self.service.trash_memory(record_id)
+
+        self.assertEqual(self.service.db.get_review_item(review.id).status, "obsolete")
+        self.assertFalse(self.service.list_reviews(status="open"))
+        result = self.service.purge_memory(record_id)
+        self.assertEqual(result["removed"]["memories"], 1)
+        self.assertIsNone(self.service.db.get_memory(record_id))
+        self.assertIsNone(self.service.db.get_review_item(review.id))
+
     def test_sensitive_memory_requires_review(self) -> None:
         result = self.service.remember("我的银行卡需要单独管理", kind="fact")
         self.assertEqual(result["status"], "review_required")

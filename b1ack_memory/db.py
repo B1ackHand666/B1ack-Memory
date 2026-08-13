@@ -1244,6 +1244,17 @@ class MemoryDatabase:
             ).rowcount
             if not changed:
                 raise KeyError(record_id)
+            obsolete_reviews = 0
+            if status == "trashed":
+                # A review whose proposed action depends on a trashed memory is
+                # no longer actionable.  Do this in the same transaction as the
+                # lifecycle change so it cannot remain in the review queue.
+                obsolete_reviews = conn.execute(
+                    "UPDATE memory_review_items SET status='obsolete',"
+                    "resolution='memory_trashed',resolved_at=?,updated_at=? "
+                    "WHERE status='open' AND (primary_memory_id=? OR related_memory_id=?)",
+                    (now, now, record_id, record_id),
+                ).rowcount
             event_type = {
                 "active": "memory_restored",
                 "trashed": "memory_trashed",
@@ -1254,7 +1265,11 @@ class MemoryDatabase:
                 event_type,
                 memory_id=record_id,
                 occurred_at=now,
-                data={"previous_status": old["status"], "status": status},
+                data={
+                    "previous_status": old["status"],
+                    "status": status,
+                    "obsolete_reviews": obsolete_reviews,
+                },
             )
 
     def purge_memory(self, record_id: str) -> dict[str, int]:

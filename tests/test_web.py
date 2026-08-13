@@ -37,6 +37,12 @@ class WebTests(unittest.TestCase):
         self.assertIn("bridge.request", bundle.json()["js"])
         self.assertIn("Promise.allSettled", bundle.json()["js"])
         self.assertIn('classList.remove("skeleton")', bundle.json()["js"])
+        self.assertNotIn("confirm-text", bundle.json()["html"])
+        self.assertNotIn("confirmText=", bundle.json()["js"])
+        self.assertIn('value="cancel" class="quiet" formnovalidate', bundle.json()["html"])
+        self.assertIn("await mutate(`/memories/${b.dataset.trashMemory}/trash`);closeDrawer()", bundle.json()["js"])
+        self.assertIn("await mutate(`/memories/${b.dataset.purgeMemory}`,{},'DELETE');closeDrawer()", bundle.json()["js"])
+        self.assertIn('tab === "history" ? \'<option value="all">历史与回收站</option>\'', bundle.json()["js"])
         self.assertIn("部分数据未加载", bundle.json()["js"])
         self.assertEqual(self.client.post(
             "/api/memories", json={"content": "测试"}, headers={"Authorization": ""}
