@@ -4,6 +4,13 @@
 
 ## [未发布]
 
+## [0.5.4] - 2026-08-13
+
+### 修复
+
+- Dashboard 保持 Hermes SDK 的认证请求桥接，但不再将完整 WebUI 脚本内联拼入 `iframe srcDoc`；改为从 Dashboard 插件静态资源加载，修复部分 Hermes 运行环境中页面只显示骨架屏、脚本未执行的问题。
+- 将 Dashboard 运行所需的 WebUI 脚本随两份插件 Dashboard 资源一起打包，并覆盖反向代理子路径。
+
 ## [0.5.3] - 2026-08-13
 
 ### 修复
@@ -252,7 +259,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.3...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.4...HEAD
+[0.5.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.4
 [0.5.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.3
 [0.5.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.2
 [0.5.1]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.1

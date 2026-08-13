@@ -26,17 +26,19 @@
     },
   };
 
-  function escapeInlineScript(source) {
-    return String(source).replace(/<\/script/gi, "<\\/script");
+  function dashboardBasePath() {
+    const configured = window.__HERMES_BASE_PATH__;
+    if (typeof configured === "string") return configured.replace(/\/$/, "");
+    return window.location.pathname.replace(/\/b1ack-memory\/?$/, "").replace(/\/$/, "");
   }
 
   function embeddedDocument(bundle) {
+    const appUrl = dashboardBasePath() + "/dashboard-plugins/b1ack-memory/dist/app.js";
     return String(bundle.html)
       .replace(/<link[^>]+href=["']style\.css["'][^>]*>/i, "<style>" + bundle.css + "</style>")
       .replace(
         /<script[^>]+src=["']app\.js["'][^>]*><\/script>/i,
-        "<script>window.__B1ACK_MEMORY_EMBEDDED__=true;</script>" +
-          "<script>" + escapeInlineScript(bundle.js) + "</script>",
+        '<script src="' + appUrl + '"><\/script>',
       );
   }
 
@@ -72,6 +74,7 @@
       style: {
         border: 0,
         width: "100%",
+        height: "calc(100vh - 7rem)",
         minHeight: "calc(100vh - 7rem)",
         background: "#0b0e14",
       },
