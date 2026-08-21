@@ -1881,6 +1881,9 @@ class MemoryDatabase:
             }
             if not active_signal_ids and not active_daily_ids:
                 raise ValueError("REM reflection requires active recent evidence")
+            source_sensitive = self._recent_sources_sensitive_in_tx(
+                conn, active_signal_ids, active_daily_ids
+            )
             reflection_id = str(uuid.uuid4())
             now = utc_now()
             conn.execute(
@@ -1890,7 +1893,8 @@ class MemoryDatabase:
                 ") VALUES(?,?,?,'active',?,?,?,?,?,?,?)",
                 (
                     reflection_id, text, reflection_type, max(0.0, min(1.0, float(confidence))),
-                    int(sensitive), json.dumps(sorted(active_signal_ids)), json.dumps(sorted(active_daily_ids)),
+                    int(bool(sensitive) or source_sensitive),
+                    json.dumps(sorted(active_signal_ids)), json.dumps(sorted(active_daily_ids)),
                     dream_run_id, now, now,
                 ),
             )
@@ -1903,19 +1907,80 @@ class MemoryDatabase:
         result["daily_memory_ids"] = json.loads(result.pop("daily_memory_ids_json") or "[]")
         return result
 
-    def active_recent_for_rem(self, *, daily_days: int = 30, limit: int = 300) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(daily_days)))).date().isoformat()
+    @staticmethod
+    def _recent_sources_sensitive_in_tx(
+        conn: sqlite3.Connection, signal_ids: Any, daily_memory_ids: Any
+    ) -> bool:
+        signal_values = list(dict.fromkeys(str(value) for value in signal_ids if str(value)))
+        daily_values = list(dict.fromkeys(str(value) for value in daily_memory_ids if str(value)))
+        if signal_values:
+            placeholders = ",".join("?" for _ in signal_values)
+            rows = conn.execute(
+                f"SELECT id,sensitive FROM recent_signals WHERE id IN ({placeholders})",
+                signal_values,
+            ).fetchall()
+            if len(rows) != len(signal_values) or any(bool(row["sensitive"]) for row in rows):
+                return True
+        for daily_id in daily_values:
+            rows = conn.execute(
+                "SELECT re.signal_id,rs.sensitive FROM recent_evidence re "
+                "LEFT JOIN recent_signals rs ON rs.id=re.signal_id "
+                "WHERE re.daily_memory_id=?",
+                (daily_id,),
+            ).fetchall()
+            if not rows or any(
+                row["signal_id"] is None or row["sensitive"] is None or bool(row["sensitive"])
+                for row in rows
+            ):
+                return True
+        return False
+
+    def recent_source_sensitivity(
+        self, *, signal_ids: list[str], daily_memory_ids: list[str]
+    ) -> dict[str, dict[str, bool]]:
+        signals = [str(value) for value in dict.fromkeys(signal_ids) if str(value)]
+        daily = [str(value) for value in dict.fromkeys(daily_memory_ids) if str(value)]
+        with self.connect() as conn:
+            signal_map: dict[str, bool] = {}
+            if signals:
+                placeholders = ",".join("?" for _ in signals)
+                signal_map = {
+                    str(row["id"]): bool(row["sensitive"])
+                    for row in conn.execute(
+                        f"SELECT id,sensitive FROM recent_signals WHERE id IN ({placeholders})",
+                        signals,
+                    )
+                }
+            daily_map = {
+                daily_id: self._recent_sources_sensitive_in_tx(conn, [], [daily_id])
+                for daily_id in daily
+            }
+        return {
+            "signals": {value: signal_map.get(value, True) for value in signals},
+            "daily_memories": {value: daily_map.get(value, True) for value in daily},
+        }
+
+    def active_recent_for_rem(
+        self, *, daily_days: int = 30, timezone_name: str = "system", limit: int = 300
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        cutoff = (
+            datetime.now(resolve_timezone(timezone_name)) - timedelta(days=max(1, int(daily_days)))
+        ).date().isoformat()
         return (
             self.list_recent_signals(status="active", limit=limit),
             self.list_daily_memories(status="active", since_date=cutoff, limit=limit),
         )
 
-    def expire_recent_layer(self, *, recent_days: int = 14, daily_days: int = 30) -> dict[str, int]:
+    def expire_recent_layer(
+        self, *, recent_days: int = 14, daily_days: int = 30, timezone_name: str = "system"
+    ) -> dict[str, int]:
         now = utc_now()
         recent_cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(recent_days)))).isoformat(
             timespec="seconds"
         )
-        daily_cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(daily_days)))).date().isoformat()
+        daily_cutoff = (
+            datetime.now(resolve_timezone(timezone_name)) - timedelta(days=max(1, int(daily_days)))
+        ).date().isoformat()
         with self.transaction(immediate=True) as conn:
             signals = conn.execute(
                 "UPDATE recent_signals SET status='expired',updated_at=? "
@@ -1968,10 +2033,10 @@ class MemoryDatabase:
 
     def remove_recent_record(self, record_type: str, record_id: str, *, permanent: bool = False) -> dict[str, int]:
         """Stop future Dream/recall immediately; preserve long-term conclusions for review."""
-        table, evidence_column, recent_evidence_column, source = {
-            "recent_signal": ("recent_signals", "recent_signal_id", "signal_id", "recent_signal"),
-            "daily_memory": ("daily_memories", "daily_memory_id", "daily_memory_id", "daily_memory"),
-        }.get(record_type, ("", "", "", ""))
+        table = {
+            "recent_signal": "recent_signals",
+            "daily_memory": "daily_memories",
+        }.get(record_type, "")
         if not table:
             raise ValueError("Unsupported recent record type")
         now = utc_now()
@@ -1979,32 +2044,100 @@ class MemoryDatabase:
             row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
             if not row:
                 raise KeyError(record_id)
-            reflection_column = (
-                "signal_ids_json" if record_type == "recent_signal" else "daily_memory_ids_json"
-            )
-            conn.execute(
-                f"UPDATE rem_reflections SET status='discarded',outcome='source_deleted',updated_at=? "
-                f"WHERE status='active' AND {reflection_column} LIKE ?",
-                (now, f'%"{record_id}"%'),
-            )
             if not permanent:
+                reflection_column = (
+                    "signal_ids_json" if record_type == "recent_signal" else "daily_memory_ids_json"
+                )
+                conn.execute(
+                    f"UPDATE rem_reflections SET status='discarded',outcome='source_deleted',updated_at=? "
+                    f"WHERE status='active' AND {reflection_column} LIKE ?",
+                    (now, f'%"{record_id}"%'),
+                )
                 conn.execute(f"UPDATE {table} SET status='trashed',updated_at=? WHERE id=?", (now, record_id))
-                return {"trashed": 1, "reviews": 0, "purged": 0}
-            # A permanent recent-layer deletion is a privacy operation.  The
-            # source turn and every model run explicitly linked to it must no
-            # longer retain the deleted conversation; normal trashing above
-            # intentionally does not take this irreversible path.
-            raw_ids = [
+                return {
+                    "trashed": 1, "reviews": 0, "purged": 0,
+                    "recent_signals": int(record_type == "recent_signal"),
+                    "daily_memories": int(record_type == "daily_memory"),
+                    "raw_turns": 0,
+                }
+
+            # Permanent deletion is deliberately a privacy-first cascade.  A
+            # selected signal and every daily view that directly cites it (and
+            # vice versa) are deleted together.  Raw turns are only deleted
+            # after every remaining reference has been checked.
+            recent_signal_ids: set[str] = {record_id} if record_type == "recent_signal" else set()
+            daily_memory_ids: set[str] = {record_id} if record_type == "daily_memory" else set()
+            raw_ids: set[str] = set()
+            changed = True
+            while changed:
+                changed = False
+                if recent_signal_ids:
+                    placeholders = ",".join("?" for _ in recent_signal_ids)
+                    linked_rows = conn.execute(
+                        "SELECT signal_id,daily_memory_id,raw_turn_id FROM recent_evidence "
+                        f"WHERE signal_id IN ({placeholders})",
+                        list(recent_signal_ids),
+                    ).fetchall()
+                else:
+                    linked_rows = conn.execute(
+                        "SELECT signal_id,daily_memory_id,raw_turn_id FROM recent_evidence "
+                        "WHERE daily_memory_id=?", (record_id,)
+                    ).fetchall()
+                for linked in linked_rows:
+                    if linked["signal_id"] and str(linked["signal_id"]) not in recent_signal_ids:
+                        recent_signal_ids.add(str(linked["signal_id"]))
+                        changed = True
+                    if linked["daily_memory_id"] and str(linked["daily_memory_id"]) not in daily_memory_ids:
+                        daily_memory_ids.add(str(linked["daily_memory_id"]))
+                        changed = True
+                    if linked["raw_turn_id"]:
+                        raw_ids.add(str(linked["raw_turn_id"]))
+
+                if daily_memory_ids:
+                    placeholders = ",".join("?" for _ in daily_memory_ids)
+                    linked_rows = conn.execute(
+                        "SELECT signal_id,daily_memory_id,raw_turn_id FROM recent_evidence "
+                        f"WHERE daily_memory_id IN ({placeholders})",
+                        list(daily_memory_ids),
+                    ).fetchall()
+                    for linked in linked_rows:
+                        if linked["signal_id"] and str(linked["signal_id"]) not in recent_signal_ids:
+                            recent_signal_ids.add(str(linked["signal_id"]))
+                            changed = True
+                        if linked["daily_memory_id"] and str(linked["daily_memory_id"]) not in daily_memory_ids:
+                            daily_memory_ids.add(str(linked["daily_memory_id"]))
+                            changed = True
+                        if linked["raw_turn_id"]:
+                            raw_ids.add(str(linked["raw_turn_id"]))
+
+            signal_values = sorted(recent_signal_ids)
+            daily_values = sorted(daily_memory_ids)
+            raw_values = sorted(raw_ids)
+            signal_placeholders = ",".join("?" for _ in signal_values) or "''"
+            daily_placeholders = ",".join("?" for _ in daily_values) or "''"
+            source_evidence_clause = (
+                f"recent_signal_id IN ({signal_placeholders}) OR "
+                f"daily_memory_id IN ({daily_placeholders})"
+            )
+            source_evidence_params = [*signal_values, *daily_values]
+
+            candidate_ids = [
                 str(item[0])
                 for item in conn.execute(
-                    f"SELECT DISTINCT raw_turn_id FROM recent_evidence "
-                    f"WHERE {recent_evidence_column}=? AND raw_turn_id IS NOT NULL",
-                    (record_id,),
+                    "SELECT DISTINCT candidate_id FROM evidence WHERE (" + source_evidence_clause + ") "
+                    "AND candidate_id IS NOT NULL",
+                    source_evidence_params,
                 )
             ]
-            record_refs = [(source, record_id), *[("raw_turn", raw_id) for raw_id in raw_ids]]
+            candidate_placeholders = ",".join("?" for _ in candidate_ids) or "''"
             dream_run_ids: set[str] = set()
             call_ids: set[str] = set()
+            record_refs = [
+                *(('recent_signal', value) for value in signal_values),
+                *(('daily_memory', value) for value in daily_values),
+                *(('candidate', value) for value in candidate_ids),
+            ]
+            deleted_model_call_records = 0
             for record_kind, referenced_id in record_refs:
                 for call in conn.execute(
                     "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
@@ -2015,53 +2148,311 @@ class MemoryDatabase:
                     call_ids.add(str(call["id"]))
                     if call["dream_run_id"]:
                         dream_run_ids.add(str(call["dream_run_id"]))
-            clauses = [f"COALESCE({evidence_column}=?,0)"]
-            params: list[Any] = [record_id]
-            if raw_ids:
-                placeholders = ",".join("?" for _ in raw_ids)
-                clauses.append(f"COALESCE(raw_turn_id IN ({placeholders}),0)")
-                params.extend(raw_ids)
+
+            # Preserve long-term memories, but make loss of their evidence
+            # visible before deleting the evidence rows themselves.
             linked = conn.execute(
-                "SELECT DISTINCT memory_id FROM evidence WHERE ("
-                + " OR ".join(clauses)
-                + ") AND memory_id IS NOT NULL",
-                params,
+                "SELECT DISTINCT memory_id FROM evidence WHERE (" + source_evidence_clause + ") "
+                "AND memory_id IS NOT NULL",
+                source_evidence_params,
             ).fetchall()
             reviews = 0
             for linked_row in linked:
                 memory_id = str(linked_row["memory_id"])
                 remaining = conn.execute(
-                    "SELECT count(*) FROM evidence WHERE memory_id=? AND NOT ("
-                    + " OR ".join(clauses)
-                    + ")",
-                    [memory_id, *params],
+                    "SELECT count(*) FROM evidence WHERE memory_id=? AND NOT (" + source_evidence_clause + ") "
+                    + (f"AND candidate_id NOT IN ({candidate_placeholders})" if candidate_ids else ""),
+                    [memory_id, *source_evidence_params, *candidate_ids],
                 ).fetchone()[0]
                 if int(remaining) <= 1:
                     self._create_evidence_impact_review_in_tx(
-                        conn, memory_id, source="recent_privacy_delete", basis_hash=f"{record_type}:{record_id}"
+                        conn, memory_id, source="recent_privacy_delete",
+                        basis_hash=f"{record_type}:{record_id}",
                     )
                     reviews += 1
-            conn.execute("DELETE FROM recall_events WHERE source=? AND record_id=?", (source, record_id))
-            conn.execute("DELETE FROM embeddings WHERE source=? AND record_id=?", (source, record_id))
-            conn.execute("DELETE FROM search_fts WHERE source=? AND record_id=?", (source, record_id))
-            conn.execute("DELETE FROM model_call_records WHERE record_type=? AND record_id=?", (source, record_id))
-            conn.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
-            for run_id in dream_run_ids:
-                conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
-            for record_kind, referenced_id in record_refs:
-                conn.execute(
+
+            # Delete evidence and derived indexes for every cascaded recent
+            # record.  This removes the association without touching the
+            # long-term memory row itself.
+            deleted_evidence = conn.execute(
+                "DELETE FROM evidence WHERE (" + source_evidence_clause + ")",
+                source_evidence_params,
+            ).rowcount
+            deleted_recent_signals = conn.execute(
+                f"DELETE FROM recent_signals WHERE id IN ({signal_placeholders})", signal_values
+            ).rowcount if signal_values else 0
+            deleted_daily_memories = conn.execute(
+                f"DELETE FROM daily_memories WHERE id IN ({daily_placeholders})", daily_values
+            ).rowcount if daily_values else 0
+            discarded_reflections = 0
+            reflection_clauses: list[str] = []
+            reflection_params: list[str] = []
+            for value in [*signal_values, *daily_values]:
+                reflection_clauses.extend(["signal_ids_json LIKE ?", "daily_memory_ids_json LIKE ?"])
+                reflection_params.extend([f'%"{value}"%', f'%"{value}"%'])
+            discarded_reflection_ids: list[str] = []
+            if reflection_clauses:
+                discarded_reflection_ids = [
+                    str(item[0]) for item in conn.execute(
+                        "SELECT id FROM rem_reflections WHERE status='active' AND ("
+                        + " OR ".join(reflection_clauses) + ")",
+                        reflection_params,
+                    )
+                ]
+                discarded_reflections = conn.execute(
+                    "UPDATE rem_reflections SET status='discarded',outcome='source_deleted',updated_at=? "
+                    "WHERE status='active' AND (" + " OR ".join(reflection_clauses) + ")",
+                    [now, *reflection_params],
+                ).rowcount
+
+            reflection_record_refs = [("rem_reflection", value) for value in discarded_reflection_ids]
+            for record_kind, referenced_id in reflection_record_refs:
+                for call in conn.execute(
+                    "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                    "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                    "WHERE mcr.record_type=? AND mcr.record_id=?",
+                    (record_kind, referenced_id),
+                ):
+                    call_ids.add(str(call["id"]))
+                    if call["dream_run_id"]:
+                        dream_run_ids.add(str(call["dream_run_id"]))
+                conn.execute("DELETE FROM recall_events WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                conn.execute("DELETE FROM embeddings WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                conn.execute("DELETE FROM search_fts WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                deleted_model_call_records += conn.execute(
                     "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
                     (record_kind, referenced_id),
+                ).rowcount
+
+            for record_kind, referenced_id in record_refs:
+                conn.execute(
+                    "DELETE FROM recall_events WHERE source=? AND record_id=?",
+                    (record_kind, referenced_id),
                 )
-            if raw_ids:
-                conn.executemany("DELETE FROM raw_turns WHERE id=?", [(raw_id,) for raw_id in raw_ids])
+                conn.execute(
+                    "DELETE FROM embeddings WHERE source=? AND record_id=?",
+                    (record_kind, referenced_id),
+                )
+                conn.execute(
+                    "DELETE FROM search_fts WHERE source=? AND record_id=?",
+                    (record_kind, referenced_id),
+                )
+                deleted_model_call_records += conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
+                    (record_kind, referenced_id),
+                ).rowcount
+                conn.execute("DELETE FROM projection_jobs WHERE target_id=?", (referenced_id,))
+                conn.execute(
+                    "DELETE FROM summary_versions WHERE source_ids_json LIKE ?",
+                    (f'%"{referenced_id}"%',),
+                )
+
+            deleted_candidates = 0
+            deleted_admission_decisions = 0
+            for candidate_id in candidate_ids:
+                deleted_admission_decisions += conn.execute(
+                    "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
+                ).rowcount
+                conn.execute(
+                    "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?",
+                    (candidate_id,),
+                )
+                conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+                deleted_candidates += 1
+
+            # If another recent record still references a raw turn, retain it;
+            # the remaining record is a valid reference and must not be broken.
+            deletable_raw_ids: list[str] = []
+            for raw_id in raw_values:
+                if conn.execute(
+                    "SELECT 1 FROM recent_evidence WHERE raw_turn_id=? LIMIT 1", (raw_id,)
+                ).fetchone():
+                    continue
+                raw_candidates = [
+                    str(item[0]) for item in conn.execute(
+                        "SELECT DISTINCT candidate_id FROM evidence WHERE raw_turn_id=? "
+                        "AND candidate_id IS NOT NULL", (raw_id,)
+                    )
+                ]
+                if raw_candidates:
+                    for candidate_id in raw_candidates:
+                        linked_candidate_memories = conn.execute(
+                            "SELECT DISTINCT memory_id FROM evidence WHERE candidate_id=? AND memory_id IS NOT NULL",
+                            (candidate_id,),
+                        ).fetchall()
+                        for linked_memory in linked_candidate_memories:
+                            memory_id = str(linked_memory["memory_id"])
+                            remaining = conn.execute(
+                                "SELECT count(*) FROM evidence WHERE memory_id=? AND candidate_id<>? "
+                                "AND (raw_turn_id IS NULL OR raw_turn_id<>?)",
+                                (memory_id, candidate_id, raw_id),
+                            ).fetchone()[0]
+                            if int(remaining) <= 1:
+                                self._create_evidence_impact_review_in_tx(
+                                    conn, memory_id, source="recent_privacy_delete",
+                                    basis_hash=f"{record_type}:{record_id}",
+                                )
+                                reviews += 1
+                        for call in conn.execute(
+                            "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                            "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                            "WHERE mcr.record_type='candidate' AND mcr.record_id=?",
+                            (candidate_id,),
+                        ):
+                            call_ids.add(str(call["id"]))
+                            if call["dream_run_id"]:
+                                dream_run_ids.add(str(call["dream_run_id"]))
+                        conn.execute("DELETE FROM recall_events WHERE source='candidate' AND record_id=?", (candidate_id,))
+                        conn.execute("DELETE FROM embeddings WHERE source='candidate' AND record_id=?", (candidate_id,))
+                        conn.execute("DELETE FROM search_fts WHERE source='candidate' AND record_id=?", (candidate_id,))
+                        deleted_model_call_records += conn.execute(
+                            "DELETE FROM model_call_records WHERE record_type='candidate' AND record_id=?",
+                            (candidate_id,),
+                        ).rowcount
+                        deleted_admission_decisions += conn.execute(
+                            "DELETE FROM admission_decisions WHERE candidate_id=?", (candidate_id,)
+                        ).rowcount
+                        conn.execute(
+                            "DELETE FROM subject_links WHERE object_type='candidate' AND object_id=?",
+                            (candidate_id,),
+                        )
+                        conn.execute("DELETE FROM candidates WHERE id=?", (candidate_id,))
+                        deleted_candidates += 1
+                raw_memory_ids = conn.execute(
+                    "SELECT DISTINCT memory_id FROM evidence WHERE raw_turn_id=? AND memory_id IS NOT NULL",
+                    (raw_id,),
+                ).fetchall()
+                for raw_memory in raw_memory_ids:
+                    memory_id = str(raw_memory["memory_id"])
+                    remaining = conn.execute(
+                        "SELECT count(*) FROM evidence WHERE memory_id=? "
+                        "AND (raw_turn_id IS NULL OR raw_turn_id<>?)",
+                        (memory_id, raw_id),
+                    ).fetchone()[0]
+                    if int(remaining) <= 1:
+                        self._create_evidence_impact_review_in_tx(
+                            conn, memory_id, source="recent_privacy_delete",
+                            basis_hash=f"{record_type}:{record_id}",
+                        )
+                        reviews += 1
+                deleted_evidence += conn.execute(
+                    "DELETE FROM evidence WHERE raw_turn_id=?", (raw_id,)
+                ).rowcount
+                deletable_raw_ids.append(raw_id)
+
+            raw_record_refs = [("raw_turn", value) for value in deletable_raw_ids]
+            for record_kind, referenced_id in raw_record_refs:
+                for call in conn.execute(
+                    "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                    "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                    "WHERE mcr.record_type=? AND mcr.record_id=?",
+                    (record_kind, referenced_id),
+                ):
+                    call_ids.add(str(call["id"]))
+                    if call["dream_run_id"]:
+                        dream_run_ids.add(str(call["dream_run_id"]))
+                deleted_model_call_records += conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
+                    (record_kind, referenced_id),
+                ).rowcount
+                conn.execute("DELETE FROM recall_events WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                conn.execute("DELETE FROM embeddings WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                conn.execute("DELETE FROM search_fts WHERE source=? AND record_id=?", (record_kind, referenced_id))
+                conn.execute("DELETE FROM projection_jobs WHERE target_id=?", (referenced_id,))
+                conn.execute(
+                    "DELETE FROM summary_versions WHERE source_ids_json LIKE ?",
+                    (f'%"{referenced_id}"%',),
+                )
+
+            if deletable_raw_ids:
+                raw_placeholders = ",".join("?" for _ in deletable_raw_ids)
+                work_item_ids = [
+                    str(item[0]) for item in conn.execute(
+                        f"SELECT id FROM work_items WHERE raw_turn_id IN ({raw_placeholders})",
+                        deletable_raw_ids,
+                    )
+                ]
+                if work_item_ids:
+                    work_placeholders = ",".join("?" for _ in work_item_ids)
+                    deleted_model_call_records += int(conn.execute(
+                        "SELECT count(*) FROM model_call_records WHERE record_type='work_item' "
+                        f"AND record_id IN ({work_placeholders})",
+                        work_item_ids,
+                    ).fetchone()[0])
+                    for call in conn.execute(
+                        "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                        "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                        "WHERE mcr.record_type='work_item' "
+                        f"AND mcr.record_id IN ({work_placeholders})",
+                        work_item_ids,
+                    ):
+                        call_ids.add(str(call["id"]))
+                        if call["dream_run_id"]:
+                            dream_run_ids.add(str(call["dream_run_id"]))
+                admission_ids = [
+                    str(item[0]) for item in conn.execute(
+                        f"SELECT id FROM admission_decisions WHERE raw_turn_id IN ({raw_placeholders})",
+                        deletable_raw_ids,
+                    )
+                ]
+                if admission_ids:
+                    admission_placeholders = ",".join("?" for _ in admission_ids)
+                    for call in conn.execute(
+                        "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                        "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                        "WHERE mcr.record_type='admission_decision' "
+                        f"AND mcr.record_id IN ({admission_placeholders})",
+                        admission_ids,
+                    ):
+                        call_ids.add(str(call["id"]))
+                        if call["dream_run_id"]:
+                            dream_run_ids.add(str(call["dream_run_id"]))
+                    deleted_model_call_records += conn.execute(
+                        "DELETE FROM model_call_records WHERE record_type='admission_decision' "
+                        f"AND record_id IN ({admission_placeholders})",
+                        admission_ids,
+                    ).rowcount
+                deleted_admission_decisions += conn.execute(
+                    f"DELETE FROM admission_decisions WHERE raw_turn_id IN ({raw_placeholders})",
+                    deletable_raw_ids,
+                ).rowcount
+            deleted_work_items = self._purge_work_items_for_raw_ids(conn, deletable_raw_ids)
+            if deletable_raw_ids:
+                conn.executemany(
+                    "DELETE FROM subject_links WHERE object_type='raw_turn' AND object_id=?",
+                    [(value,) for value in deletable_raw_ids],
+                )
+            if deletable_raw_ids:
+                conn.executemany("DELETE FROM raw_turns WHERE id=?", [(value,) for value in deletable_raw_ids])
+
+            for run_id in dream_run_ids:
+                conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
             for call_id in call_ids:
                 conn.execute(
                     "DELETE FROM model_calls WHERE id=? AND NOT EXISTS "
                     "(SELECT 1 FROM model_call_records WHERE call_id=?)",
                     (call_id, call_id),
                 )
-        return {"trashed": 0, "reviews": reviews, "purged": 1}
+            conn.execute(
+                "INSERT INTO audit_events(action,record_id,created_at) VALUES(?,?,?)",
+                ("purge-recent", record_id, now),
+            )
+        return {
+            "trashed": 0,
+            "reviews": reviews,
+            "purged": 1,
+            "recent_signals": int(deleted_recent_signals),
+            "daily_memories": int(deleted_daily_memories),
+            "raw_turns": len(deletable_raw_ids),
+            "work_items": int(deleted_work_items),
+            "admission_decisions": int(deleted_admission_decisions),
+            "model_call_records": int(deleted_model_call_records),
+            "model_calls": int(len(call_ids)),
+            "dream_runs": int(len(dream_run_ids)),
+            "rem_reflections": int(discarded_reflections),
+            "candidates": int(deleted_candidates),
+            "evidence": int(deleted_evidence),
+        }
 
     def _create_deep_review_in_tx(
         self,
@@ -2097,7 +2488,8 @@ class MemoryDatabase:
         )
 
     def apply_deep_integrations(
-        self, integrations: list[dict[str, Any]], *, dream_run_id: str
+        self, integrations: list[dict[str, Any]], *, dream_run_id: str,
+        timezone_name: str = "system"
     ) -> dict[str, int]:
         """Validate and atomically apply a Deep batch.
 
@@ -2107,8 +2499,10 @@ class MemoryDatabase:
         """
         allowed = {"create", "update", "merge", "supersede", "expire", "defer", "review"}
         outcomes = {key: 0 for key in allowed}
+        outcomes["discarded"] = 0
         if not integrations:
             return outcomes
+        resolve_timezone(timezone_name)
         with self.transaction(immediate=True) as conn:
             event_run_id = (
                 dream_run_id
@@ -2158,6 +2552,35 @@ class MemoryDatabase:
                 daily_ids = json.loads(reflection["daily_memory_ids_json"] or "[]")
                 signal_placeholders = ",".join("?" for _ in signal_ids) or "''"
                 daily_placeholders = ",".join("?" for _ in daily_ids) or "''"
+                active_signal_ids = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT id FROM recent_signals "
+                        f"WHERE status='active' AND datetime(expires_at)>datetime(?) "
+                        f"AND id IN ({signal_placeholders})",
+                        [now, *signal_ids],
+                    )
+                }
+                active_daily_ids = {
+                    str(row[0]) for row in conn.execute(
+                        "SELECT id FROM daily_memories "
+                        f"WHERE status='active' AND datetime(expires_at)>datetime(?) "
+                        f"AND id IN ({daily_placeholders})",
+                        [now, *daily_ids],
+                    )
+                }
+                if active_signal_ids != {str(value) for value in signal_ids} or active_daily_ids != {
+                    str(value) for value in daily_ids
+                }:
+                    conn.execute(
+                        "UPDATE rem_reflections SET status='discarded',outcome='source_expired',"
+                        "handled_at=?,updated_at=? WHERE id=?",
+                        (now, now, reflection_id),
+                    )
+                    outcomes["discarded"] += 1
+                    continue
+                source_sensitive = self._recent_sources_sensitive_in_tx(
+                    conn, signal_ids, daily_ids
+                )
                 source_times = [
                     row[0] for row in conn.execute(
                         "SELECT observed_at FROM recent_evidence WHERE signal_id IN "
@@ -2167,13 +2590,16 @@ class MemoryDatabase:
                     )
                 ]
                 evidence_days = {
-                    str(value)[:10] for value in source_times if isinstance(value, str) and len(value) >= 10
+                    local_date(str(value), timezone_name)
+                    for value in source_times
+                    if isinstance(value, str) and len(value) >= 10
                 }
                 if action in {"create", "update", "merge", "supersede", "expire"} and len(evidence_days) < 2:
                     action = "defer"
                     reason = "Deep deferred: recent evidence has not yet appeared on two dates"
                 requires_review = (
-                    action == "review" or bool(reflection["sensitive"]) or confidence < 0.70
+                    action == "review" or source_sensitive or bool(reflection["sensitive"])
+                    or confidence < 0.70
                 )
                 if requires_review:
                     self._create_deep_review_in_tx(
@@ -3706,6 +4132,10 @@ class MemoryDatabase:
             )
             conn.execute(
                 "DELETE FROM search_fts WHERE source='work_item' AND record_id=?", (item_id,)
+            )
+            conn.execute(
+                "DELETE FROM model_call_records WHERE record_type='work_item' AND record_id=?",
+                (item_id,),
             )
             conn.execute("DELETE FROM projection_jobs WHERE target_id=?", (item_id,))
             conn.execute(

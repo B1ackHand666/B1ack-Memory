@@ -1952,6 +1952,7 @@ class MemoryService:
                 result["cleanup"]["recent_layer"] = self.db.expire_recent_layer(
                     recent_days=int(retention.get("recent_signal_days", 14)),
                     daily_days=int(retention.get("daily_memory_days", 30)),
+                    timezone_name=str(self.db.get_settings()["general"]["timezone"]),
                 )
             result["derived"] = self.rebuild_derived()
             return result
@@ -2045,6 +2046,7 @@ class MemoryService:
                                     self.db.expire_recent_layer(
                                         recent_days=int(retention.get("recent_signal_days", 14)),
                                         daily_days=int(retention.get("daily_memory_days", 30)),
+                                        timezone_name=timezone_name,
                                     )
                                     with self.db.transaction(immediate=True) as conn:
                                         conn.execute(

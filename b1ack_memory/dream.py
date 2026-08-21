@@ -158,6 +158,7 @@ class DreamEngine:
             expiry = self.db.expire_recent_layer(
                 recent_days=int(retention.get("recent_signal_days", 14)),
                 daily_days=int(retention.get("daily_memory_days", 30)),
+                timezone_name=timezone_name,
             )
             counts["expired"] += expiry["recent_signals"] + expiry["daily_memories"]
             turns = self.db.pending_raw_turns()
@@ -178,9 +179,10 @@ class DreamEngine:
             else:
                 light_summary = "No new turns; continuing pending Deep work"
             rem_summary = self._run_rem_v6(
-                run_id, retention, counts, enabled=bool(turns and (counts["recent"] or counts["daily"]))
+                run_id, retention, counts, timezone_name,
+                enabled=bool(turns and (counts["recent"] or counts["daily"]))
             )
-            deep_summary = self._run_deep_v6(run_id, counts)
+            deep_summary = self._run_deep_v6(run_id, counts, timezone_name)
             self.retrieval.rebuild_index()
             self._finish_run(
                 run_id, "completed", counts, light_summary, rem_summary, deep_summary
@@ -315,25 +317,34 @@ class DreamEngine:
         return f"signals {counts['recent']}, daily updates {counts['daily']}, merged {counts['merged']}, discarded {counts['discarded']}"
 
     def _run_rem_v6(
-        self, run_id: str, retention: dict[str, Any], counts: dict[str, int], *, enabled: bool
+        self, run_id: str, retention: dict[str, Any], counts: dict[str, int], timezone_name: str,
+        *, enabled: bool
     ) -> str:
         if not enabled:
             return "No changed recent input required REM"
         signals, daily = self.db.active_recent_for_rem(
-            daily_days=int(retention.get("daily_memory_days", 30)), limit=300
+            daily_days=int(retention.get("daily_memory_days", 30)),
+            timezone_name=timezone_name,
+            limit=300,
         )
         if not signals and not daily:
             return "No active recent material"
+        sensitivity = self.db.recent_source_sensitivity(
+            signal_ids=[str(item["id"]) for item in signals],
+            daily_memory_ids=[str(item["id"]) for item in daily],
+        )
         payload = {
             "recent_signals": [
                 {"id": item["id"], "content": item["content"], "kind": item["kind"],
                  "strength": item["strength"], "first_seen_at": item["first_seen_at"],
-                 "last_seen_at": item["last_seen_at"], "project_id": item.get("subject_id")}
+                 "last_seen_at": item["last_seen_at"], "project_id": item.get("subject_id"),
+                 "sensitive": sensitivity["signals"].get(str(item["id"]), False)}
                 for item in signals
             ],
             "daily_memories": [
                 {"id": item["id"], "date": item["memory_date"], "scope": item["scope_key"],
-                 "content": item["content"]}
+                 "content": item["content"],
+                 "sensitive": sensitivity["daily_memories"].get(str(item["id"]), True)}
                 for item in daily
             ],
         }
@@ -374,7 +385,7 @@ class DreamEngine:
             counts["reflections"] += 1
         return str(result.parsed.get("summary", "")).strip() or f"REM created {counts['reflections']} reflection(s)"
 
-    def _run_deep_v6(self, run_id: str, counts: dict[str, int]) -> str:
+    def _run_deep_v6(self, run_id: str, counts: dict[str, int], timezone_name: str) -> str:
         reflections = self.db.list_rem_reflections(status="active", limit=50)
         if not reflections:
             return "No supported REM reflection required Deep"
@@ -422,11 +433,14 @@ class DreamEngine:
                 "confidence": item.get("confidence", reflection["confidence"]),
                 "reason": str(item.get("reason", "")).strip(), "target_memory_id": target_id,
             })
-        applied = self.db.apply_deep_integrations(integrations, dream_run_id=run_id)
+        applied = self.db.apply_deep_integrations(
+            integrations, dream_run_id=run_id, timezone_name=timezone_name
+        )
         counts["promoted"] += applied["create"]
         counts["merged"] += applied["merge"]
         counts["updated_memories"] += applied["update"] + applied["merge"] + applied["supersede"] + applied["expire"]
         counts["reviews"] += applied["review"]
+        counts["discarded"] += applied.get("discarded", 0)
         return ", ".join(f"{key} {value}" for key, value in applied.items() if value) or "Deep deferred all reflections"
 
     def _run_light(
