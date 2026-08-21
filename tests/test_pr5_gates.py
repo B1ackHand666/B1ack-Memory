@@ -104,7 +104,7 @@ class GateRegressionTests(unittest.TestCase):
         backup = self.service.backup_dir / "newer.db"
         self.service.db.backup(backup)
         with contextlib.closing(sqlite3.connect(backup)) as conn:
-            conn.execute("UPDATE schema_meta SET version=8")
+            conn.execute("UPDATE schema_meta SET version=9")
             conn.commit()
         with self.assertRaisesRegex(ValueError, "newer"):
             self.service.preview_restore(backup.name)
@@ -119,7 +119,7 @@ class GateRegressionTests(unittest.TestCase):
 
 
 class ProvisionalSchemaTests(unittest.TestCase):
-    def test_provisional_v7_columns_are_repaired_without_version_bump(self) -> None:
+    def test_provisional_v7_columns_are_repaired_during_v8_upgrade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "memory.db"
             db = MemoryDatabase(path)
@@ -132,7 +132,7 @@ class ProvisionalSchemaTests(unittest.TestCase):
                 self.assertIn("last_ingest_error", {row[1] for row in conn.execute("PRAGMA table_info(raw_turns)")})
                 self.assertIn("proposal_json", {row[1] for row in conn.execute("PRAGMA table_info(memory_review_items)")})
                 self.assertIn("source_revision", {row[1] for row in conn.execute("PRAGMA table_info(summary_versions)")})
-                self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
+                self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 8)
 
 
 if __name__ == "__main__":

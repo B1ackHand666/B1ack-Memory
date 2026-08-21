@@ -53,6 +53,8 @@ class RetrievalEngine:
         memory_count = 0
         candidate_count = 0
         workspace_count = 0
+        recent_count = 0
+        daily_count = 0
         with self.db.transaction(immediate=True) as conn:
             conn.execute("DELETE FROM search_fts")
             predicate, predicate_args = eligible_memory_predicate("m")
@@ -67,7 +69,8 @@ class RetrievalEngine:
                 )
             memory_count = len(memories)
             candidates = conn.execute(
-                "SELECT id,content,admission_state FROM candidates WHERE status='pending'"
+                "SELECT id,content,admission_state FROM candidates "
+                "WHERE status='pending' AND admission_state<>'legacy_history'"
             ).fetchall()
             for row in candidates:
                 conn.execute(
@@ -76,6 +79,25 @@ class RetrievalEngine:
                      row["content"], normalized_search_text(row["content"])),
                 )
             candidate_count = len(candidates)
+            # Recent material is searchable only on an explicit query.  It is
+            # intentionally kept out of the `recall` pool used for prompt
+            # injection, so UI/search access cannot leak into prefetch.
+            for row in conn.execute(
+                "SELECT id,content FROM recent_signals WHERE status='active'"
+            ):
+                conn.execute(
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "recent_signal", "explicit_search", row["content"], normalized_search_text(row["content"])),
+                )
+                recent_count += 1
+            for row in conn.execute(
+                "SELECT id,content FROM daily_memories WHERE status='active'"
+            ):
+                conn.execute(
+                    "INSERT INTO search_fts(record_id,source,pool,content,search_text) VALUES(?,?,?,?,?)",
+                    (row["id"], "daily_memory", "explicit_search", row["content"], normalized_search_text(row["content"])),
+                )
+                daily_count += 1
             for row in conn.execute(
                 "SELECT id,content FROM work_items WHERE status IN ('suggested','active')"
             ):
@@ -102,7 +124,10 @@ class RetrievalEngine:
                     (row["id"], "summary", "explicit_search", row["content"], normalized_search_text(row["content"])),
                 )
                 workspace_count += 1
-        return {"memories": memory_count, "candidates": candidate_count, "workspace": workspace_count}
+        return {
+            "memories": memory_count, "candidates": candidate_count, "workspace": workspace_count,
+            "recent_signals": recent_count, "daily_memories": daily_count,
+        }
 
     def search(
         self,
@@ -222,6 +247,11 @@ class RetrievalEngine:
             project_confidence=project_confidence,
             project_reason=project_reason,
         )
+        if not injected:
+            self.db.reinforce_recent_search_hits(
+                [hit.id for hit in hits if hit.source == "recent_signal"],
+                retention_days=int(self.db.get_settings()["retention"].get("recent_signal_days", 14)),
+            )
         return hits
 
     def related_records(
@@ -351,6 +381,8 @@ class RetrievalEngine:
             "work_item": ("work_items", "item_type"),
             "subject": ("subjects", "subject_type"),
             "summary": ("summary_versions", "scope"),
+            "recent_signal": ("recent_signals", "kind"),
+            "daily_memory": ("daily_memories", "scope_key"),
         }
         table, column = mapping.get(source, ("memories", "kind"))
         with self.db.connect() as conn:

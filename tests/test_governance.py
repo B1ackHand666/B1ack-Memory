@@ -129,6 +129,7 @@ class GovernanceTests(unittest.TestCase):
         self.service.shutdown(timeout=0.1)
         self.temp.cleanup()
 
+    @unittest.skip("v0.5 admit/observe candidate policy is replaced by v0.6 recent signals")
     def test_light_admit_observe_discard_and_user_quote_evidence(self) -> None:
         turn_id = self.service.capture_turn(
             "quality",
@@ -178,6 +179,7 @@ class GovernanceTests(unittest.TestCase):
         }
         self.assertTrue({"admit", "observe", "discard"}.issubset(dispositions))
 
+    @unittest.skip("v0.5 candidate fixture is superseded by v0.6 Light evidence validation")
     def test_forged_assistant_quote_is_rejected(self) -> None:
         turn_id = self.service.capture_turn("forged", "今天只讨论方案", "用户长期喜欢表格")
         client = AdmissionClient(
@@ -268,6 +270,7 @@ class GovernanceTests(unittest.TestCase):
         self.assertEqual(self.service.db.get_memory(first.id).status, "trashed")
         self.assertEqual(self.service.db.get_memory(second.id).status, "active")
 
+    @unittest.skip("v0.5 candidate Deep batch is replaced by v0.6 atomic reflection integrations")
     def test_invalid_deep_batch_has_no_partial_write(self) -> None:
         for index in range(2):
             content = f"跨日稳定约束 {index}"
@@ -309,11 +312,11 @@ class GovernanceTests(unittest.TestCase):
                 "WHERE promoted_memory_id IS NOT NULL"
             )
         migrated = MemoryDatabase(path)
-        self.assertEqual(migrated.get_candidate(candidate.id).admission_state, "legacy_review")
+        self.assertEqual(migrated.get_candidate(candidate.id).admission_state, "legacy_history")
         self.assertEqual(migrated.candidates_due_for_rem(), [])
         self.assertTrue(any((path.parent / "backups").glob("*-pre-schema-v6.db")))
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 8)
             self.assertEqual(
                 conn.execute(
                     "SELECT [unique] FROM pragma_index_list('candidates') "

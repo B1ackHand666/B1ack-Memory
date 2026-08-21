@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .models import AuditRun, CandidateRecord, MEMORY_KINDS, MemoryRecord, ReviewItem
 from .security import secure_directory, secure_file
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 class _ClosingConnection(sqlite3.Connection):
@@ -94,7 +94,7 @@ class MemoryDatabase:
                 if not table:
                     return
                 version = int(source.execute("SELECT version FROM schema_meta").fetchone()[0])
-                if version not in {4, 5, 6}:
+                if version not in {4, 5, 6, 7}:
                     return
                 backup_dir = self.path.parent / "backups"
                 secure_directory(backup_dir)
@@ -235,6 +235,78 @@ class MemoryDatabase:
                     role TEXT NOT NULL,
                     observed_at TEXT NOT NULL
                 );
+
+                -- v0.6: these tables are the local, non-injectable recent layer.
+                -- They deliberately do not reference Hermes' native Markdown files.
+                CREATE TABLE IF NOT EXISTS recent_signals (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    kind TEXT NOT NULL DEFAULT 'fact',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    strength INTEGER NOT NULL DEFAULT 1,
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    content_hash TEXT NOT NULL,
+                    subject_id TEXT REFERENCES subjects(id) ON DELETE SET NULL,
+                    source_raw_turn_id TEXT REFERENCES raw_turns(id) ON DELETE SET NULL,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_recent_signals_active
+                    ON recent_signals(status, expires_at, last_seen_at DESC);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_recent_signals_live_hash
+                    ON recent_signals(content_hash) WHERE status='active';
+
+                CREATE TABLE IF NOT EXISTS daily_memories (
+                    id TEXT PRIMARY KEY,
+                    memory_date TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    subject_id TEXT REFERENCES subjects(id) ON DELETE SET NULL,
+                    content TEXT NOT NULL DEFAULT '',
+                    content_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    expires_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(memory_date, scope_key)
+                );
+                CREATE INDEX IF NOT EXISTS idx_daily_memories_active
+                    ON daily_memories(status, memory_date DESC, scope_key);
+
+                CREATE TABLE IF NOT EXISTS recent_evidence (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    signal_id TEXT REFERENCES recent_signals(id) ON DELETE CASCADE,
+                    daily_memory_id TEXT REFERENCES daily_memories(id) ON DELETE CASCADE,
+                    raw_turn_id TEXT REFERENCES raw_turns(id) ON DELETE SET NULL,
+                    recall_event_id INTEGER REFERENCES recall_events(id) ON DELETE SET NULL,
+                    excerpt TEXT NOT NULL DEFAULT '',
+                    role TEXT NOT NULL DEFAULT 'user',
+                    observed_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_recent_evidence_signal ON recent_evidence(signal_id);
+                CREATE INDEX IF NOT EXISTS idx_recent_evidence_daily ON recent_evidence(daily_memory_id);
+                CREATE INDEX IF NOT EXISTS idx_recent_evidence_raw ON recent_evidence(raw_turn_id);
+
+                CREATE TABLE IF NOT EXISTS rem_reflections (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    reflection_type TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 0.0,
+                    sensitive INTEGER NOT NULL DEFAULT 0,
+                    signal_ids_json TEXT NOT NULL DEFAULT '[]',
+                    daily_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                    dream_run_id TEXT REFERENCES dream_runs(id) ON DELETE SET NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    handled_at TEXT,
+                    outcome TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_rem_reflections_active
+                    ON rem_reflections(status, created_at DESC);
 
                 CREATE TABLE IF NOT EXISTS recall_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -582,6 +654,10 @@ class MemoryDatabase:
                     "source_revision": "TEXT NOT NULL DEFAULT ''",
                     "newest_source_updated_at": "TEXT",
                 },
+                "evidence": {
+                    "recent_signal_id": "TEXT REFERENCES recent_signals(id) ON DELETE SET NULL",
+                    "daily_memory_id": "TEXT REFERENCES daily_memories(id) ON DELETE SET NULL",
+                },
             }.items():
                 columns = {
                     row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
@@ -659,6 +735,10 @@ class MemoryDatabase:
                 "summary_count",
                 "projection_count",
                 "blocked_count",
+                "recent_count",
+                "daily_count",
+                "reflection_count",
+                "updated_memory_count",
             ):
                 if column not in dream_columns:
                     conn.execute(
@@ -735,6 +815,13 @@ class MemoryDatabase:
                     ") VALUES(?, 'all', '', ?, 'pending', ?, ?)",
                     (str(uuid.uuid5(uuid.NAMESPACE_URL, "b1ack:schema-v7:initial-projection")), revision, utc_now(), utc_now()),
                 )
+            if current < 8:
+                # v0.5 candidates remain available for audit, export and privacy
+                # deletion, but must never enter the v0.6 Dream pipeline again.
+                conn.execute(
+                    "UPDATE candidates SET admission_state='legacy_history' "
+                    "WHERE admission_state<>'legacy_history'"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_candidates_promoted_memory "
                 "ON candidates(promoted_memory_id) WHERE promoted_memory_id IS NOT NULL"
@@ -780,6 +867,8 @@ class MemoryDatabase:
                 "candidate_inactive_days": 14,
                 "candidate_expired_days": 30,
                 "rejected_candidate_days": 30,
+                "recent_signal_days": 14,
+                "daily_memory_days": 30,
             },
             "recall": {"limit": 5, "durable_limit": 6, "max_context_chars": 4000},
         }
@@ -1470,6 +1559,723 @@ class MemoryDatabase:
             if not changed:
                 raise KeyError(turn_id)
             return dict(conn.execute("SELECT * FROM raw_turns WHERE id=?", (turn_id,)).fetchone())
+
+    # ------------------------------------------------------------------
+    # v0.6 recent layer.  These records are intentionally separate from
+    # candidates and long-term memories: they are Dream input, never default
+    # prompt injection, and only Deep may turn their evidence into a memory.
+
+    @staticmethod
+    def _recent_row(row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if not row:
+            return None
+        result = dict(row)
+        result["sensitive"] = bool(result.get("sensitive"))
+        return result
+
+    def upsert_recent_signal(
+        self,
+        content: str,
+        *,
+        kind: str = "fact",
+        confidence: float = 0.0,
+        sensitive: bool = False,
+        raw_turn_id: str | None = None,
+        excerpt: str = "",
+        observed_at: str | None = None,
+        subject_id: str | None = None,
+        retention_days: int = 14,
+    ) -> tuple[dict[str, Any], bool]:
+        """Create or reinforce one active recent signal.
+
+        The boolean is true only when a new signal was created.  Exact
+        repetitions reinforce a single record instead of creating review
+        noise.  Semantic consolidation is performed by Light/REM before this
+        method is called.
+        """
+        text = content.strip()
+        if not text:
+            raise ValueError("Recent signal content cannot be empty")
+        if kind not in MEMORY_KINDS:
+            kind = "fact"
+        now = utc_now()
+        seen_at = observed_at or now
+        expires = (datetime.now(UTC) + timedelta(days=max(1, int(retention_days)))).isoformat(
+            timespec="seconds"
+        )
+        digest = content_hash(text)
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM recent_signals WHERE content_hash=? AND status='active'",
+                (digest,),
+            ).fetchone()
+            created = row is None
+            if row:
+                signal_id = str(row["id"])
+                conn.execute(
+                    "UPDATE recent_signals SET strength=strength+1,confidence=max(confidence,?),"
+                    "sensitive=max(sensitive,?),last_seen_at=?,expires_at=?,updated_at=?,"
+                    "subject_id=coalesce(?,subject_id),source_raw_turn_id=coalesce(?,source_raw_turn_id) "
+                    "WHERE id=?",
+                    (
+                        max(0.0, min(1.0, float(confidence))),
+                        int(sensitive),
+                        seen_at,
+                        expires,
+                        now,
+                        subject_id,
+                        raw_turn_id,
+                        signal_id,
+                    ),
+                )
+            else:
+                signal_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO recent_signals("
+                    "id,content,kind,status,confidence,strength,sensitive,content_hash,subject_id,"
+                    "source_raw_turn_id,first_seen_at,last_seen_at,expires_at,created_at,updated_at"
+                    ") VALUES(?,?,?,'active',?,1,?,?,?,?,?,?,?,?,?)",
+                    (
+                        signal_id,
+                        text,
+                        kind,
+                        max(0.0, min(1.0, float(confidence))),
+                        int(sensitive),
+                        digest,
+                        subject_id,
+                        raw_turn_id,
+                        seen_at,
+                        seen_at,
+                        expires,
+                        now,
+                        now,
+                    ),
+                )
+            if raw_turn_id and not conn.execute(
+                "SELECT 1 FROM recent_evidence WHERE signal_id=? AND raw_turn_id=?",
+                (signal_id, raw_turn_id),
+            ).fetchone():
+                conn.execute(
+                    "INSERT INTO recent_evidence(signal_id,raw_turn_id,excerpt,role,observed_at) "
+                    "VALUES(?,?,?,'user',?)",
+                    (signal_id, raw_turn_id, excerpt[:1000], seen_at),
+                )
+            if subject_id:
+                self._link_subject_in_tx(
+                    conn, subject_id, "recent_signal", signal_id,
+                    assignment_status="automatic", method="dream_light", now=now,
+                )
+            result = conn.execute("SELECT * FROM recent_signals WHERE id=?", (signal_id,)).fetchone()
+        return self._recent_row(result) or {}, created
+
+    def revise_recent_signal(
+        self,
+        signal_id: str,
+        content: str,
+        *,
+        kind: str | None = None,
+        confidence: float | None = None,
+        retention_days: int = 14,
+    ) -> dict[str, Any]:
+        text = content.strip()
+        if not text:
+            raise ValueError("Recent signal content cannot be empty")
+        now = utc_now()
+        expires = (datetime.now(UTC) + timedelta(days=max(1, int(retention_days)))).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction(immediate=True) as conn:
+            old = conn.execute("SELECT * FROM recent_signals WHERE id=?", (signal_id,)).fetchone()
+            if not old or old["status"] != "active":
+                raise KeyError(signal_id)
+            next_kind = kind if kind in MEMORY_KINDS else old["kind"]
+            next_confidence = old["confidence"] if confidence is None else max(
+                0.0, min(1.0, float(confidence))
+            )
+            conn.execute(
+                "UPDATE recent_signals SET content=?,kind=?,content_hash=?,confidence=?,strength=strength+1,"
+                "last_seen_at=?,expires_at=?,updated_at=? WHERE id=?",
+                (text, next_kind, content_hash(text), next_confidence, now, expires, now, signal_id),
+            )
+            row = conn.execute("SELECT * FROM recent_signals WHERE id=?", (signal_id,)).fetchone()
+        return self._recent_row(row) or {}
+
+    def merge_recent_signals(self, target_id: str, source_id: str, *, retention_days: int = 14) -> dict[str, Any]:
+        if target_id == source_id:
+            raise ValueError("A signal cannot merge into itself")
+        now = utc_now()
+        expires = (datetime.now(UTC) + timedelta(days=max(1, int(retention_days)))).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction(immediate=True) as conn:
+            target = conn.execute("SELECT * FROM recent_signals WHERE id=? AND status='active'", (target_id,)).fetchone()
+            source = conn.execute("SELECT * FROM recent_signals WHERE id=? AND status='active'", (source_id,)).fetchone()
+            if not target or not source:
+                raise KeyError(source_id if not source else target_id)
+            conn.execute(
+                "UPDATE recent_signals SET strength=strength+?,confidence=max(confidence,?),"
+                "sensitive=max(sensitive,?),last_seen_at=max(last_seen_at,?),expires_at=?,updated_at=? WHERE id=?",
+                (source["strength"], source["confidence"], source["sensitive"], source["last_seen_at"], expires, now, target_id),
+            )
+            conn.execute("UPDATE recent_evidence SET signal_id=? WHERE signal_id=?", (target_id, source_id))
+            conn.execute("UPDATE recent_signals SET status='merged',updated_at=? WHERE id=?", (now, source_id))
+            row = conn.execute("SELECT * FROM recent_signals WHERE id=?", (target_id,)).fetchone()
+        return self._recent_row(row) or {}
+
+    def add_daily_memory(
+        self,
+        content: str,
+        *,
+        observed_at: str | None = None,
+        timezone_name: str = "system",
+        subject_id: str | None = None,
+        raw_turn_id: str | None = None,
+        signal_id: str | None = None,
+        retention_days: int = 30,
+    ) -> dict[str, Any]:
+        """Append one compact, de-duplicated item to a day/global-or-project log."""
+        item = content.strip().lstrip("- ").strip()
+        if not item:
+            raise ValueError("Daily memory content cannot be empty")
+        now = utc_now()
+        recorded_at = observed_at or now
+        day = local_date(recorded_at, timezone_name)
+        scope = subject_id or "global"
+        expires = (datetime.now(UTC) + timedelta(days=max(1, int(retention_days)))).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(
+                "SELECT * FROM daily_memories WHERE memory_date=? AND scope_key=?",
+                (day, scope),
+            ).fetchone()
+            line = f"- {item}"
+            if row:
+                existing_lines = [value.strip() for value in str(row["content"]).splitlines() if value.strip()]
+                normalized = {content_hash(value.lstrip("- ").strip()) for value in existing_lines}
+                combined = str(row["content"])
+                if content_hash(item) not in normalized:
+                    combined = f"{combined.rstrip()}\n{line}".strip()
+                daily_id = str(row["id"])
+                conn.execute(
+                    "UPDATE daily_memories SET content=?,content_hash=?,status='active',expires_at=?,updated_at=? WHERE id=?",
+                    (combined, content_hash(combined), expires, now, daily_id),
+                )
+            else:
+                daily_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO daily_memories("
+                    "id,memory_date,scope_key,subject_id,content,content_hash,status,expires_at,created_at,updated_at"
+                    ") VALUES(?,?,?,?,?,?,'active',?,?,?)",
+                    (daily_id, day, scope, subject_id, line, content_hash(line), expires, now, now),
+                )
+            if raw_turn_id or signal_id:
+                existing = conn.execute(
+                    "SELECT 1 FROM recent_evidence WHERE daily_memory_id=? AND "
+                    "coalesce(raw_turn_id,'')=coalesce(?, '') AND coalesce(signal_id,'')=coalesce(?, '')",
+                    (daily_id, raw_turn_id, signal_id),
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO recent_evidence(signal_id,daily_memory_id,raw_turn_id,excerpt,role,observed_at) "
+                        "VALUES(?,?,?,?,'user',?)",
+                        (signal_id, daily_id, raw_turn_id, item[:1000], recorded_at),
+                    )
+            row = conn.execute("SELECT * FROM daily_memories WHERE id=?", (daily_id,)).fetchone()
+        return dict(row)
+
+    def list_recent_signals(
+        self, *, status: str | None = "active", subject_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM recent_signals WHERE 1=1"
+        args: list[Any] = []
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        if subject_id:
+            sql += " AND subject_id=?"
+            args.append(subject_id)
+        sql += " ORDER BY last_seen_at DESC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [self._recent_row(row) or {} for row in rows]
+
+    def list_daily_memories(
+        self,
+        *,
+        status: str | None = "active",
+        subject_id: str | None = None,
+        since_date: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM daily_memories WHERE 1=1"
+        args: list[Any] = []
+        if status:
+            sql += " AND status=?"
+            args.append(status)
+        if subject_id is not None:
+            sql += " AND subject_id=?"
+            args.append(subject_id)
+        if since_date:
+            sql += " AND memory_date>=?"
+            args.append(since_date)
+        sql += " ORDER BY memory_date DESC,scope_key ASC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_rem_reflections(
+        self, *, status: str | None = "active", limit: int = 200
+    ) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM rem_reflections"
+        args: list[Any] = []
+        if status:
+            sql += " WHERE status=?"
+            args.append(status)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        args.append(limit)
+        with self.connect() as conn:
+            rows = conn.execute(sql, args).fetchall()
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = dict(row)
+            item["sensitive"] = bool(item["sensitive"])
+            item["signal_ids"] = json.loads(item.pop("signal_ids_json") or "[]")
+            item["daily_memory_ids"] = json.loads(item.pop("daily_memory_ids_json") or "[]")
+            result.append(item)
+        return result
+
+    def create_rem_reflection(
+        self,
+        content: str,
+        *,
+        reflection_type: str,
+        confidence: float,
+        signal_ids: list[str],
+        daily_memory_ids: list[str],
+        sensitive: bool = False,
+        dream_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        text = content.strip()
+        if not text:
+            raise ValueError("REM reflection content cannot be empty")
+        allowed = {"theme", "evolution", "repetition", "conflict", "conclusion"}
+        if reflection_type not in allowed:
+            reflection_type = "theme"
+        with self.transaction(immediate=True) as conn:
+            signal_placeholders = ",".join("?" for _ in signal_ids) or "''"
+            daily_placeholders = ",".join("?" for _ in daily_memory_ids) or "''"
+            active_signal_ids = {
+                row[0] for row in conn.execute(
+                    f"SELECT id FROM recent_signals WHERE status='active' AND id IN ({signal_placeholders})",
+                    signal_ids,
+                )
+            }
+            active_daily_ids = {
+                row[0] for row in conn.execute(
+                    f"SELECT id FROM daily_memories WHERE status='active' AND id IN ({daily_placeholders})",
+                    daily_memory_ids,
+                )
+            }
+            if not active_signal_ids and not active_daily_ids:
+                raise ValueError("REM reflection requires active recent evidence")
+            reflection_id = str(uuid.uuid4())
+            now = utc_now()
+            conn.execute(
+                "INSERT INTO rem_reflections("
+                "id,content,reflection_type,status,confidence,sensitive,signal_ids_json,daily_memory_ids_json,"
+                "dream_run_id,created_at,updated_at"
+                ") VALUES(?,?,?,'active',?,?,?,?,?,?,?)",
+                (
+                    reflection_id, text, reflection_type, max(0.0, min(1.0, float(confidence))),
+                    int(sensitive), json.dumps(sorted(active_signal_ids)), json.dumps(sorted(active_daily_ids)),
+                    dream_run_id, now, now,
+                ),
+            )
+            row = conn.execute("SELECT * FROM rem_reflections WHERE id=?", (reflection_id,)).fetchone()
+        if not row:
+            return {}
+        result = dict(row)
+        result["sensitive"] = bool(result["sensitive"])
+        result["signal_ids"] = json.loads(result.pop("signal_ids_json") or "[]")
+        result["daily_memory_ids"] = json.loads(result.pop("daily_memory_ids_json") or "[]")
+        return result
+
+    def active_recent_for_rem(self, *, daily_days: int = 30, limit: int = 300) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(daily_days)))).date().isoformat()
+        return (
+            self.list_recent_signals(status="active", limit=limit),
+            self.list_daily_memories(status="active", since_date=cutoff, limit=limit),
+        )
+
+    def expire_recent_layer(self, *, recent_days: int = 14, daily_days: int = 30) -> dict[str, int]:
+        now = utc_now()
+        recent_cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(recent_days)))).isoformat(
+            timespec="seconds"
+        )
+        daily_cutoff = (datetime.now(UTC) - timedelta(days=max(1, int(daily_days)))).date().isoformat()
+        with self.transaction(immediate=True) as conn:
+            signals = conn.execute(
+                "UPDATE recent_signals SET status='expired',updated_at=? "
+                "WHERE status='active' AND (expires_at<=? OR last_seen_at<?)",
+                (now, now, recent_cutoff),
+            ).rowcount
+            daily = conn.execute(
+                "UPDATE daily_memories SET status='expired',updated_at=? "
+                "WHERE status='active' AND (expires_at<=? OR memory_date<?)",
+                (now, now, daily_cutoff),
+            ).rowcount
+        return {"recent_signals": signals, "daily_memories": daily}
+
+    def reinforce_recent_search_hits(self, signal_ids: list[str], *, retention_days: int = 14) -> int:
+        """Treat an explicit recall as weak recency reinforcement, never evidence."""
+        ids = list(dict.fromkeys(item for item in signal_ids if item))
+        if not ids:
+            return 0
+        now = utc_now()
+        expires = (datetime.now(UTC) + timedelta(days=max(1, int(retention_days)))).isoformat(
+            timespec="seconds"
+        )
+        with self.transaction(immediate=True) as conn:
+            return conn.executemany(
+                "UPDATE recent_signals SET strength=strength+1,last_seen_at=?,expires_at=?,updated_at=? "
+                "WHERE id=? AND status='active'",
+                [(now, expires, now, signal_id) for signal_id in ids],
+            ).rowcount
+
+    def _create_evidence_impact_review_in_tx(
+        self, conn: sqlite3.Connection, memory_id: str, *, source: str, basis_hash: str
+    ) -> None:
+        fingerprint = self.make_review_fingerprint(
+            "evidence_affected", primary_memory_id=memory_id, basis_hash=basis_hash
+        )
+        if conn.execute("SELECT 1 FROM memory_review_items WHERE fingerprint=?", (fingerprint,)).fetchone():
+            return
+        now = utc_now()
+        conn.execute(
+            "INSERT INTO memory_review_items("
+            "id,issue_type,status,proposed_action,reason,confidence,primary_memory_id,source,"
+            "basis_hash,fingerprint,created_at,updated_at,queue,proposal_json"
+            ") VALUES(?,?,'open',?,?,?, ?,?,?,?,?,?,'decision','{}')",
+            (
+                str(uuid.uuid4()), "evidence_affected", "retain_or_edit",
+                "Permanent deletion removed the only or a key recent-layer evidence source; long-term memory was preserved.",
+                1.0, memory_id, source, basis_hash, fingerprint, now, now,
+            ),
+        )
+
+    def remove_recent_record(self, record_type: str, record_id: str, *, permanent: bool = False) -> dict[str, int]:
+        """Stop future Dream/recall immediately; preserve long-term conclusions for review."""
+        table, evidence_column, recent_evidence_column, source = {
+            "recent_signal": ("recent_signals", "recent_signal_id", "signal_id", "recent_signal"),
+            "daily_memory": ("daily_memories", "daily_memory_id", "daily_memory_id", "daily_memory"),
+        }.get(record_type, ("", "", "", ""))
+        if not table:
+            raise ValueError("Unsupported recent record type")
+        now = utc_now()
+        with self.transaction(immediate=True) as conn:
+            row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (record_id,)).fetchone()
+            if not row:
+                raise KeyError(record_id)
+            reflection_column = (
+                "signal_ids_json" if record_type == "recent_signal" else "daily_memory_ids_json"
+            )
+            conn.execute(
+                f"UPDATE rem_reflections SET status='discarded',outcome='source_deleted',updated_at=? "
+                f"WHERE status='active' AND {reflection_column} LIKE ?",
+                (now, f'%"{record_id}"%'),
+            )
+            if not permanent:
+                conn.execute(f"UPDATE {table} SET status='trashed',updated_at=? WHERE id=?", (now, record_id))
+                return {"trashed": 1, "reviews": 0, "purged": 0}
+            # A permanent recent-layer deletion is a privacy operation.  The
+            # source turn and every model run explicitly linked to it must no
+            # longer retain the deleted conversation; normal trashing above
+            # intentionally does not take this irreversible path.
+            raw_ids = [
+                str(item[0])
+                for item in conn.execute(
+                    f"SELECT DISTINCT raw_turn_id FROM recent_evidence "
+                    f"WHERE {recent_evidence_column}=? AND raw_turn_id IS NOT NULL",
+                    (record_id,),
+                )
+            ]
+            record_refs = [(source, record_id), *[("raw_turn", raw_id) for raw_id in raw_ids]]
+            dream_run_ids: set[str] = set()
+            call_ids: set[str] = set()
+            for record_kind, referenced_id in record_refs:
+                for call in conn.execute(
+                    "SELECT mc.id,mc.dream_run_id FROM model_calls mc "
+                    "JOIN model_call_records mcr ON mcr.call_id=mc.id "
+                    "WHERE mcr.record_type=? AND mcr.record_id=?",
+                    (record_kind, referenced_id),
+                ):
+                    call_ids.add(str(call["id"]))
+                    if call["dream_run_id"]:
+                        dream_run_ids.add(str(call["dream_run_id"]))
+            clauses = [f"COALESCE({evidence_column}=?,0)"]
+            params: list[Any] = [record_id]
+            if raw_ids:
+                placeholders = ",".join("?" for _ in raw_ids)
+                clauses.append(f"COALESCE(raw_turn_id IN ({placeholders}),0)")
+                params.extend(raw_ids)
+            linked = conn.execute(
+                "SELECT DISTINCT memory_id FROM evidence WHERE ("
+                + " OR ".join(clauses)
+                + ") AND memory_id IS NOT NULL",
+                params,
+            ).fetchall()
+            reviews = 0
+            for linked_row in linked:
+                memory_id = str(linked_row["memory_id"])
+                remaining = conn.execute(
+                    "SELECT count(*) FROM evidence WHERE memory_id=? AND NOT ("
+                    + " OR ".join(clauses)
+                    + ")",
+                    [memory_id, *params],
+                ).fetchone()[0]
+                if int(remaining) <= 1:
+                    self._create_evidence_impact_review_in_tx(
+                        conn, memory_id, source="recent_privacy_delete", basis_hash=f"{record_type}:{record_id}"
+                    )
+                    reviews += 1
+            conn.execute("DELETE FROM recall_events WHERE source=? AND record_id=?", (source, record_id))
+            conn.execute("DELETE FROM embeddings WHERE source=? AND record_id=?", (source, record_id))
+            conn.execute("DELETE FROM search_fts WHERE source=? AND record_id=?", (source, record_id))
+            conn.execute("DELETE FROM model_call_records WHERE record_type=? AND record_id=?", (source, record_id))
+            conn.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
+            for run_id in dream_run_ids:
+                conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))
+            for record_kind, referenced_id in record_refs:
+                conn.execute(
+                    "DELETE FROM model_call_records WHERE record_type=? AND record_id=?",
+                    (record_kind, referenced_id),
+                )
+            if raw_ids:
+                conn.executemany("DELETE FROM raw_turns WHERE id=?", [(raw_id,) for raw_id in raw_ids])
+            for call_id in call_ids:
+                conn.execute(
+                    "DELETE FROM model_calls WHERE id=? AND NOT EXISTS "
+                    "(SELECT 1 FROM model_call_records WHERE call_id=?)",
+                    (call_id, call_id),
+                )
+        return {"trashed": 0, "reviews": reviews, "purged": 1}
+
+    def _create_deep_review_in_tx(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        reflection_id: str,
+        action: str,
+        content: str,
+        reason: str,
+        confidence: float,
+        target_memory_id: str | None,
+        dream_run_id: str | None,
+    ) -> None:
+        basis_hash = content_hash(f"{reflection_id}\n{content}\n{target_memory_id or ''}")
+        fingerprint = self.make_review_fingerprint(
+            "deep_review", proposed_content=content, primary_memory_id=target_memory_id,
+            basis_hash=basis_hash,
+        )
+        if conn.execute("SELECT 1 FROM memory_review_items WHERE fingerprint=?", (fingerprint,)).fetchone():
+            return
+        now = utc_now()
+        conn.execute(
+            "INSERT INTO memory_review_items("
+            "id,issue_type,status,proposed_action,proposed_content,reason,confidence,primary_memory_id,"
+            "source,basis_hash,fingerprint,dream_run_id,created_at,updated_at,queue,proposal_json"
+            ") VALUES(?,?,'open',?,?,?,?,?,?,?,?,?,?,?,'decision',?)",
+            (
+                str(uuid.uuid4()), "deep_review", action, content, reason[:2000],
+                max(0.0, min(1.0, confidence)), target_memory_id, "deep", basis_hash,
+                fingerprint, dream_run_id, now, now,
+                json.dumps({"reflection_id": reflection_id, "action": action}, ensure_ascii=False),
+            ),
+        )
+
+    def apply_deep_integrations(
+        self, integrations: list[dict[str, Any]], *, dream_run_id: str
+    ) -> dict[str, int]:
+        """Validate and atomically apply a Deep batch.
+
+        Normal duplicates converge into the existing memory.  Sensitive,
+        conflict, or low-confidence items stay in the review queue; no Deep
+        branch can silently delete a long-term conclusion.
+        """
+        allowed = {"create", "update", "merge", "supersede", "expire", "defer", "review"}
+        outcomes = {key: 0 for key in allowed}
+        if not integrations:
+            return outcomes
+        with self.transaction(immediate=True) as conn:
+            event_run_id = (
+                dream_run_id
+                if conn.execute("SELECT 1 FROM dream_runs WHERE id=?", (dream_run_id,)).fetchone()
+                else None
+            )
+            reflection_ids = [str(item.get("reflection_id", "")) for item in integrations]
+            if len(set(reflection_ids)) != len(reflection_ids) or not all(reflection_ids):
+                raise ValueError("Deep must contain each reflection at most once")
+            placeholders = ",".join("?" for _ in reflection_ids)
+            reflections = {
+                str(row["id"]): row for row in conn.execute(
+                    f"SELECT * FROM rem_reflections WHERE id IN ({placeholders}) AND status='active'",
+                    reflection_ids,
+                )
+            }
+            if set(reflections) != set(reflection_ids):
+                raise ValueError("Deep referenced an unavailable reflection")
+            now = utc_now()
+            for item in integrations:
+                reflection_id = str(item["reflection_id"])
+                reflection = reflections[reflection_id]
+                action = str(item.get("action", "defer")).strip().lower()
+                if action not in allowed:
+                    raise ValueError(f"Unsupported Deep action: {action}")
+                raw_target_id = item.get("target_memory_id")
+                target_id = str(raw_target_id).strip() if raw_target_id else None
+                target = None
+                if target_id:
+                    target = conn.execute(
+                        "SELECT * FROM memories WHERE id=? AND status='active'", (target_id,)
+                    ).fetchone()
+                    if not target:
+                        raise ValueError(f"Deep referenced an unavailable memory: {target_id}")
+                if action in {"update", "merge", "supersede", "expire"} and not target:
+                    raise ValueError(f"Deep action {action} requires a target memory")
+                content = str(item.get("content", "")).strip() or str(reflection["content"])
+                kind = str(item.get("kind", "fact")).strip()
+                if kind not in MEMORY_KINDS:
+                    kind = "fact"
+                try:
+                    confidence = max(0.0, min(1.0, float(item.get("confidence", reflection["confidence"]))))
+                except (TypeError, ValueError):
+                    confidence = float(reflection["confidence"])
+                reason = str(item.get("reason", "")).strip() or "Deep integration decision"
+                signal_ids = json.loads(reflection["signal_ids_json"] or "[]")
+                daily_ids = json.loads(reflection["daily_memory_ids_json"] or "[]")
+                signal_placeholders = ",".join("?" for _ in signal_ids) or "''"
+                daily_placeholders = ",".join("?" for _ in daily_ids) or "''"
+                source_times = [
+                    row[0] for row in conn.execute(
+                        "SELECT observed_at FROM recent_evidence WHERE signal_id IN "
+                        f"({signal_placeholders}) OR daily_memory_id IN "
+                        f"({daily_placeholders})",
+                        [*signal_ids, *daily_ids],
+                    )
+                ]
+                evidence_days = {
+                    str(value)[:10] for value in source_times if isinstance(value, str) and len(value) >= 10
+                }
+                if action in {"create", "update", "merge", "supersede", "expire"} and len(evidence_days) < 2:
+                    action = "defer"
+                    reason = "Deep deferred: recent evidence has not yet appeared on two dates"
+                requires_review = (
+                    action == "review" or bool(reflection["sensitive"]) or confidence < 0.70
+                )
+                if requires_review:
+                    self._create_deep_review_in_tx(
+                        conn, reflection_id=reflection_id, action=action, content=content,
+                        reason=reason, confidence=confidence, target_memory_id=target_id,
+                        dream_run_id=event_run_id,
+                    )
+                    conn.execute(
+                        "UPDATE rem_reflections SET status='review',outcome=?,handled_at=?,updated_at=? WHERE id=?",
+                        (action, now, now, reflection_id),
+                    )
+                    outcomes["review"] += 1
+                    continue
+                memory_id: str | None = None
+                if action == "create":
+                    duplicate = conn.execute(
+                        "SELECT * FROM memories WHERE content_hash=? AND status='active'",
+                        (content_hash(content),),
+                    ).fetchone()
+                    if duplicate:
+                        memory_id = str(duplicate["id"])
+                        action = "merge"
+                    else:
+                        memory_id = str(uuid.uuid4())
+                        conn.execute(
+                            "INSERT INTO memories("
+                            "id,content,kind,status,origin,confidence,importance,sensitive,content_hash,created_at,updated_at"
+                            ") VALUES(?,?,?,'active','dream-deep',?,?,0,?,?,?)",
+                            (memory_id, content, kind, confidence, 0.5, content_hash(content), now, now),
+                        )
+                        self._add_event(
+                            conn, "memory_created", memory_id=memory_id, dream_run_id=event_run_id,
+                            occurred_at=now, data={"content": content, "kind": kind, "origin": "dream-deep"},
+                        )
+                elif action in {"update", "merge"}:
+                    assert target is not None
+                    memory_id = str(target["id"])
+                    if action == "update" or content_hash(content) != target["content_hash"]:
+                        conn.execute(
+                            "INSERT INTO memory_revisions(memory_id,content,kind,changed_at) VALUES(?,?,?,?)",
+                            (memory_id, target["content"], target["kind"], now),
+                        )
+                        conn.execute(
+                            "UPDATE memories SET content=?,kind=?,content_hash=?,updated_at=? WHERE id=?",
+                            (content, kind, content_hash(content), now, memory_id),
+                        )
+                        self._add_event(
+                            conn, "memory_updated", memory_id=memory_id, dream_run_id=event_run_id,
+                            occurred_at=now, data={"content": content, "reason": reason, "action": action},
+                        )
+                elif action == "supersede":
+                    assert target is not None
+                    memory_id = str(uuid.uuid4())
+                    conn.execute(
+                        "INSERT INTO memories("
+                        "id,content,kind,status,origin,confidence,importance,sensitive,supersedes_id,content_hash,created_at,updated_at"
+                        ") VALUES(?,?,?,'active','dream-deep',?,?,0,?,?,?,?)",
+                        (memory_id, content, kind, confidence, 0.5, target["id"], content_hash(content), now, now),
+                    )
+                    conn.execute(
+                        "UPDATE memories SET status='superseded',temporal_status='historical',valid_to=coalesce(valid_to,?),updated_at=? WHERE id=?",
+                        (now, now, target["id"]),
+                    )
+                    self._add_event(
+                        conn, "memory_superseded", memory_id=str(target["id"]), dream_run_id=event_run_id,
+                        occurred_at=now, data={"replacement_memory_id": memory_id, "reason": reason},
+                    )
+                elif action == "expire":
+                    assert target is not None
+                    memory_id = str(target["id"])
+                    conn.execute(
+                        "UPDATE memories SET temporal_status='historical',valid_until=?,valid_to=coalesce(valid_to,?),updated_at=? WHERE id=?",
+                        (now, now, now, memory_id),
+                    )
+                    self._add_event(
+                        conn, "memory_expired", memory_id=memory_id, dream_run_id=event_run_id,
+                        occurred_at=now, data={"reason": reason},
+                    )
+                elif action == "defer":
+                    conn.execute(
+                        "UPDATE rem_reflections SET status='deferred',outcome='defer',handled_at=?,updated_at=? WHERE id=?",
+                        (now, now, reflection_id),
+                    )
+                    outcomes["defer"] += 1
+                    continue
+                if memory_id:
+                    for signal_id in signal_ids:
+                        conn.execute(
+                            "INSERT INTO evidence(memory_id,recent_signal_id,excerpt,role,observed_at) VALUES(?,?,?,'recent',?)",
+                            (memory_id, signal_id, str(reflection["content"])[:1000], now),
+                        )
+                    for daily_id in daily_ids:
+                        conn.execute(
+                            "INSERT INTO evidence(memory_id,daily_memory_id,excerpt,role,observed_at) VALUES(?,?,?,'daily',?)",
+                            (memory_id, daily_id, str(reflection["content"])[:1000], now),
+                        )
+                conn.execute(
+                    "UPDATE rem_reflections SET status='handled',outcome=?,handled_at=?,updated_at=? WHERE id=?",
+                    (action, now, now, reflection_id),
+                )
+                outcomes[action] += 1
+        return outcomes
 
     def upsert_candidate(
         self,
@@ -2799,6 +3605,22 @@ class MemoryDatabase:
         with self.transaction(immediate=True) as conn:
             if not conn.execute("SELECT 1 FROM candidates WHERE id=?", (candidate_id,)).fetchone():
                 raise KeyError(candidate_id)
+            if privacy:
+                linked_memories = conn.execute(
+                    "SELECT DISTINCT memory_id FROM evidence WHERE candidate_id=? AND memory_id IS NOT NULL",
+                    (candidate_id,),
+                ).fetchall()
+                for linked_memory in linked_memories:
+                    memory_id = str(linked_memory["memory_id"])
+                    remaining = int(conn.execute(
+                        "SELECT count(*) FROM evidence WHERE memory_id=? AND candidate_id<>?",
+                        (memory_id, candidate_id),
+                    ).fetchone()[0])
+                    if remaining <= 1:
+                        self._create_evidence_impact_review_in_tx(
+                            conn, memory_id, source="candidate_privacy_delete",
+                            basis_hash=f"candidate:{candidate_id}",
+                        )
             if privacy:
                 for run_id in dream_run_ids:
                     conn.execute("DELETE FROM dream_runs WHERE id=?", (run_id,))

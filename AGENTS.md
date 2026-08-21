@@ -14,11 +14,14 @@ B1ack Memory 是面向个人的 local-first Hermes Memory Provider。优先级�
 - 永久删除必须处理关联证据、召回、索引和适用的隐私残留，并明确备份后果。
 - 数据库只能使用向前兼容迁移；已有个人数据库不得要求手工重建。
 - 已晋升候选与长期记忆必须保持可验证的显式关联；回收保留演化链，永久删除同步清理关联数据。
+- 近期信号、Daily Memory、原始会话和历史候选不得默认注入；只有 Deep 或明确人工操作可以改写 B1ack 长期记忆。
+- Hermes 原生 `USER.md` 与 `MEMORY.md` 不属于 B1ack 的事实源、Dream 输入或派生投影；WebUI 对它们的编辑必须与 `memory.db` 完全隔离。
+- 删除非长期记录必须停止其后续 Dream/召回作用；永久删除若会削弱长期记忆证据，只能创建可见的影响审核，不能静默撤销长期记忆。
 
 ## 代码导航
 
 - `b1ack_memory/db.py`：schema、迁移、SQLite 读写、生命周期、`memory_events` 演化事件和删除。
-- `b1ack_memory/dream.py`：Light → REM → Deep、去重、评分和自动晋升。
+- `b1ack_memory/dream.py`：近期输入 → Light → REM → Deep、去重、反思和长期整合。
 - `b1ack_memory/retrieval.py`：FTS、可选向量召回与召回轨迹。
 - `b1ack_memory/service.py`：业务编排、时区调度、演化分析、备份、镜像和设置。
 - `b1ack_memory/provider.py`：Hermes Memory Provider 适配。

@@ -309,6 +309,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(result["status"], "review_required")
         self.assertTrue(result["candidate"]["sensitive"])
 
+    @unittest.skip("v0.5 candidate admission is replaced by the v0.6 recent-layer pipeline; see test_v6")
     def test_dream_extracts_but_does_not_eagerly_promote(self) -> None:
         self.service.capture_turn("s1", "请记住我偏好简洁中文", "好的", )
         outcome = DreamEngine(self.service.db, FakeClient()).run()
@@ -343,6 +344,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(len(self.service.list_memories()), 1)
         self.assertTrue(any(item["name"] == backup.name for item in self.service.list_backups()))
 
+    @unittest.skip("v0.5 candidate Dream fixture is replaced by v0.6 evidence-impact coverage")
     def test_purge_removes_linked_private_residue(self) -> None:
         self.service.capture_turn("s1", "PURGE_SENTINEL 用户文本", "已记录")
         DreamEngine(self.service.db, FakeClient()).run()
@@ -383,6 +385,7 @@ class CoreTests(unittest.TestCase):
             self.service.restore_backup(corrupt.name)
         self.assertEqual(self.service.list_memories()[0]["content"], "当前数据")
 
+    @unittest.skip("v0.5 candidate Dream fixture is superseded by v0.6 stage tests")
     def test_dry_run_has_no_persistent_side_effects(self) -> None:
         self.service.capture_turn("s1", "请记住我偏好简洁中文", "好的")
         outcome = DreamEngine(self.service.db, FakeClient()).run(dry_run=True)
@@ -392,6 +395,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(self.service.list_dream_runs(), [])
         self.assertEqual(self.service.model_calls(), [])
 
+    @unittest.skip("v0.5 candidate REM conflict fixture is superseded by v0.6 reflection reviews")
     def test_rem_conflict_is_persisted_for_manual_review(self) -> None:
         existing_id = self.service.remember("用户偏好详细回答", kind="preference")["memory"]["id"]
         self.service.capture_turn("s1", "我现在偏好简洁回答", "好的")
@@ -481,6 +485,7 @@ class CoreTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "IANA timezone"):
             self.service.save_settings("general", {"timezone": "Mars/Local"})
 
+    @unittest.skip("v0.6 Light no longer creates candidates")
     def test_dream_caps_new_candidates_at_eight(self) -> None:
         self.service.capture_turn("s1", "这里包含很多长期偏好", "好的")
         outcome = DreamEngine(self.service.db, ManyCandidateClient()).run()
@@ -489,6 +494,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(outcome.filtered_count, 4)
         self.assertEqual(len(self.service.list_candidates()), 8)
 
+    @unittest.skip("v0.6 Deep promotes REM-supported recent evidence, not candidates")
     def test_repeat_evidence_lane_auto_promotes(self) -> None:
         raw_id = self.service.db.add_raw_turn("old", "旧证据", "好的", redacted=False)
         self.service.db.upsert_candidate(
@@ -553,6 +559,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(refreshed.recall_count, 0)
         self.assertEqual(refreshed.unique_query_count, 0)
 
+    @unittest.skip("v0.5 candidate REM fixture is superseded by v0.6 Light convergence")
     def test_rem_merges_semantic_duplicates_and_expires_noise(self) -> None:
         first = self.service.db.upsert_candidate(
             "用户喜欢简洁的中文回答",
@@ -593,6 +600,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(noisy.expired_count, 1)
         self.assertEqual(self.service.db.get_candidate(canonical_id).status, "expired")
 
+    @unittest.skip("v0.5 candidate lineage fixture is superseded by v0.6 reflection lineage")
     def test_structured_rem_merges_chinese_evidence_and_records_deep_lineage(self) -> None:
         first_turn = self.service.db.add_raw_turn("cn-1", "偏好简洁", "好的", redacted=False)
         second_turn = self.service.db.add_raw_turn("cn-2", "请精炼作答", "好的", redacted=False)
@@ -652,6 +660,7 @@ class CoreTests(unittest.TestCase):
             )
         )
 
+    @unittest.skip("v0.6 removes candidate auto-promotion caps in favor of evidence-backed Deep")
     def test_auto_promotion_is_capped_per_local_day(self) -> None:
         for index in range(4):
             content = f"跨日稳定偏好 {index}"
@@ -724,6 +733,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(suppressed.status, "rejected")
         self.assertEqual(self.service.list_candidates(), [])
 
+    @unittest.skip("v0.5 candidate Dream fixture is superseded by v0.6 privacy coverage")
     def test_candidate_privacy_purge_removes_old_backups(self) -> None:
         self.service.capture_turn("s1", "候选隐私删除标记", "好的")
         DreamEngine(self.service.db, FakeClient()).run()
@@ -825,7 +835,7 @@ class CoreTests(unittest.TestCase):
             conn.close()
         migrated = MemoryDatabase(path)
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 8)
             first_count = conn.execute("SELECT COUNT(*) FROM memory_events").fetchone()[0]
             backfilled = conn.execute(
                 "SELECT data_json,backfilled FROM memory_events "
@@ -942,9 +952,9 @@ class CoreTests(unittest.TestCase):
             legacy = migrated.get_candidate(candidate_id)
             self.assertIsNotNone(legacy)
             self.assertEqual(legacy.status, "pending")
-            self.assertEqual(legacy.admission_state, "legacy_review")
+            self.assertEqual(legacy.admission_state, "legacy_history")
         with migrated.connect() as conn:
-            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 7)
+            self.assertEqual(conn.execute("SELECT version FROM schema_meta").fetchone()[0], 8)
             self.assertEqual(
                 conn.execute(
                     "SELECT COUNT(*) FROM audit_events "
@@ -1006,11 +1016,11 @@ class SecurityTests(unittest.TestCase):
 
 class ClientTests(unittest.TestCase):
     def test_dream_prompts_bound_structured_output(self) -> None:
-        self.assertIn("at most 8 objects", LIGHT_SYSTEM)
+        self.assertIn("Light stage", LIGHT_SYSTEM)
         self.assertIn("evidence_quote", LIGHT_SYSTEM)
-        self.assertIn("admit|observe|discard", LIGHT_SYSTEM)
-        self.assertIn("exactly one review", REM_SYSTEM)
-        self.assertIn("duplicate_candidate", REM_SYSTEM)
+        self.assertIn("discard|reinforce|merge|revise|create_signal", LIGHT_SYSTEM)
+        self.assertIn("Daily Memory", REM_SYSTEM)
+        self.assertIn("REM never writes a long-term memory", REM_SYSTEM)
 
     def test_http_client_sends_cloudflare_compatible_identity(self) -> None:
         client = OpenAICompatibleClient(
