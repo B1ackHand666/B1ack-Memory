@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .db import (
-    MemoryDatabase, content_hash, eligible_memory_predicate, local_date, resolve_timezone, utc_now,
+    SCHEMA_VERSION, MemoryDatabase, content_hash, eligible_memory_predicate, local_date, resolve_timezone, utc_now,
 )
 from .dream import DreamEngine
 from .governance import MemoryGovernance
@@ -433,7 +433,10 @@ class MemoryService:
                 self.db,
                 self.llm_client(),
                 self._integration_query_vector,
-                observe_handler=None if dry_run else self._store_observation,
+                # v0.6 Light does not turn every observation into a project
+                # work item.  Confirmed project work remains a manual/project
+                # workspace concern, not an implicit Dream side effect.
+                observe_handler=None,
             ).run(dry_run=dry_run)
             result = outcome.to_dict()
             if not dry_run:
@@ -452,8 +455,6 @@ class MemoryService:
                         "UPDATE dream_runs SET summary_count=?,projection_count=?,blocked_count=? WHERE id=?",
                         (result["summary_count"], result["projection_count"], result["blocked_count"], outcome.run_id),
                     )
-                if outcome.status == "completed" and self._governance().audit_due():
-                    result["weekly_audit"] = self._governance().run_audit(scope="full")
             return result
 
     def _store_observation(self, observation: dict[str, Any]) -> dict[str, Any] | None:
@@ -629,7 +630,10 @@ class MemoryService:
                     "SELECT COUNT(*) FROM memories WHERE status='trashed'"
                 ).fetchone()[0],
                 "pending_candidates": conn.execute(
-                    "SELECT COUNT(*) FROM candidates WHERE status='pending'"
+                    "SELECT COUNT(*) FROM candidates WHERE status='pending' AND admission_state<>'legacy_history'"
+                ).fetchone()[0],
+                "legacy_candidates": conn.execute(
+                    "SELECT COUNT(*) FROM candidates WHERE admission_state='legacy_history'"
                 ).fetchone()[0],
                 "expired_candidates": conn.execute(
                     "SELECT COUNT(*) FROM candidates WHERE status='expired'"
@@ -655,6 +659,15 @@ class MemoryService:
                 "suggested_work_items": conn.execute(
                     "SELECT COUNT(*) FROM work_items WHERE status='suggested'"
                 ).fetchone()[0],
+                "active_recent_signals": conn.execute(
+                    "SELECT COUNT(*) FROM recent_signals WHERE status='active'"
+                ).fetchone()[0],
+                "active_daily_memories": conn.execute(
+                    "SELECT COUNT(*) FROM daily_memories WHERE status='active'"
+                ).fetchone()[0],
+                "active_rem_reflections": conn.execute(
+                    "SELECT COUNT(*) FROM rem_reflections WHERE status='active'"
+                ).fetchone()[0],
             }
             last_dream = conn.execute(
                 "SELECT id,status,started_at,finished_at,error FROM dream_runs ORDER BY started_at DESC LIMIT 1"
@@ -676,6 +689,7 @@ class MemoryService:
                 **settings["embedding"],
             },
             "dream": settings["dream"],
+            "retention": settings["retention"],
             "general": settings["general"],
             "last_dream": dict(last_dream) if last_dream else None,
             "secret_permissions_safe": self.secrets.permissions_safe(),
@@ -690,6 +704,113 @@ class MemoryService:
                 "SELECT * FROM dream_runs ORDER BY started_at DESC LIMIT ?", (limit,)
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def list_recent_signals(
+        self, *, status: str | None = "active", project_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        if project_id is not None:
+            self._validate_project_id(project_id)
+        items = self.db.list_recent_signals(status=status, subject_id=project_id, limit=limit)
+        with self.db.connect() as conn:
+            for item in items:
+                rows = conn.execute(
+                    "SELECT raw_turn_id,excerpt,role,observed_at FROM recent_evidence "
+                    "WHERE signal_id=? ORDER BY observed_at DESC LIMIT 20", (item["id"],)
+                ).fetchall()
+                item["evidence"] = [dict(row) for row in rows]
+        return items
+
+    def list_daily_memories(
+        self, *, status: str | None = "active", project_id: str | None = None,
+        since_date: str | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        if project_id is not None:
+            self._validate_project_id(project_id)
+        items = self.db.list_daily_memories(
+            status=status, subject_id=project_id, since_date=since_date, limit=limit
+        )
+        with self.db.connect() as conn:
+            for item in items:
+                rows = conn.execute(
+                    "SELECT signal_id,raw_turn_id,excerpt,role,observed_at FROM recent_evidence "
+                    "WHERE daily_memory_id=? ORDER BY observed_at DESC LIMIT 20", (item["id"],)
+                ).fetchall()
+                item["evidence"] = [dict(row) for row in rows]
+        return items
+
+    def list_rem_reflections(self, *, status: str | None = "active", limit: int = 200) -> list[dict[str, Any]]:
+        return self.db.list_rem_reflections(status=status, limit=limit)
+
+    def delete_recent_record(
+        self, record_type: str, record_id: str, *, permanent: bool = False
+    ) -> dict[str, Any]:
+        with self._maintenance_lock:
+            removed = self.db.remove_recent_record(record_type, record_id, permanent=permanent)
+            derived = self.rebuild_derived()
+            result: dict[str, Any] = {"record_type": record_type, "record_id": record_id, "removed": removed}
+            if permanent:
+                result["maintenance"] = self.db.maintain(vacuum=True)
+                result["clean_backup"] = self._replace_backups_after_privacy_purge().name
+            result["fts"] = derived.get("fts", {})
+            return result
+
+    @staticmethod
+    def _native_memory_name(target: str) -> tuple[str, int]:
+        names = {"user": ("USER.md", 1375), "memory": ("MEMORY.md", 2200)}
+        try:
+            return names[target]
+        except KeyError as error:
+            raise ValueError("target must be 'user' or 'memory'") from error
+
+    def _native_memory_path(self, target: str) -> tuple[Path, int]:
+        filename, limit = self._native_memory_name(target)
+        hermes_home = os.environ.get("HERMES_HOME", "").strip()
+        if not hermes_home:
+            raise ValueError("HERMES_HOME is not configured for this process")
+        root = Path(hermes_home).expanduser().resolve()
+        memory_dir = (root / "memories").resolve()
+        path = (memory_dir / filename).resolve()
+        # target and filename come from the fixed map above; this check also
+        # protects against future changes accidentally allowing traversal.
+        if path.parent != memory_dir or path.name != filename:
+            raise ValueError("Invalid Hermes native memory path")
+        return path, limit
+
+    @staticmethod
+    def _native_memory_payload(target: str, path: Path, limit: int) -> dict[str, Any]:
+        if path.exists() and not path.is_file():
+            raise ValueError("Hermes native memory target is not a regular file")
+        content = path.read_text(encoding="utf-8") if path.is_file() else ""
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        modified_at = (
+            datetime.fromtimestamp(path.stat().st_mtime, UTC).isoformat(timespec="seconds")
+            if path.is_file() else None
+        )
+        return {
+            "target": target, "content": content, "exists": path.is_file(), "modified_at": modified_at,
+            "content_hash": digest, "limit": limit, "characters": len(content), "remaining": limit - len(content),
+            "independent": True,
+        }
+
+    def get_hermes_native_memory(self, target: str) -> dict[str, Any]:
+        path, limit = self._native_memory_path(target)
+        return self._native_memory_payload(target, path, limit)
+
+    def save_hermes_native_memory(
+        self, target: str, content: str, *, expected_hash: str
+    ) -> dict[str, Any]:
+        if not isinstance(content, str) or not isinstance(expected_hash, str):
+            raise ValueError("content and expected_hash are required strings")
+        path, limit = self._native_memory_path(target)
+        if len(content) > limit:
+            raise ValueError(f"{path.name} exceeds Hermes' {limit}-character capacity")
+        with self._maintenance_lock:
+            current = self._native_memory_payload(target, path, limit)
+            if not hmac.compare_digest(current["content_hash"], expected_hash):
+                raise ValueError("Hermes native memory changed externally; reload and resolve the conflict")
+            self._atomic_text(path, content)
+            # This routine deliberately does not open or mutate `memory.db`.
+            return self._native_memory_payload(target, path, limit)
 
     def list_memories(self, *, status: str = "active", limit: int = 500) -> list[dict[str, Any]]:
         items = [item.to_dict() for item in self.db.list_memories(status=status, limit=limit)]
@@ -758,6 +879,7 @@ class MemoryService:
         if admission_state and admission_state not in {
             "admitted",
             "legacy_review",
+            "legacy_history",
             "review_required",
         }:
             raise ValueError("Unsupported admission state")
@@ -1145,7 +1267,7 @@ class MemoryService:
             candidate = self.db.get_candidate(candidate_id)
             if not candidate:
                 raise KeyError(candidate_id)
-            if candidate.status == "promoted":
+            if candidate.status == "promoted" and candidate.admission_state != "legacy_history":
                 raise ValueError("Promoted candidates must be managed through their long-term memory")
             timezone_name = str(self.db.get_settings()["general"]["timezone"])
             removed = self.db.purge_candidate(
@@ -1668,7 +1790,7 @@ class MemoryService:
                         files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
                 manifest = {
                     "format": "b1ack-memory-backup-v1",
-                    "schema_version": 7,
+                    "schema_version": self.db.schema_version(),
                     "created_at": utc_now(),
                     "secrets_included": False,
                     "files": files,
@@ -1731,8 +1853,10 @@ class MemoryService:
                     for table in ("memories", "candidates", "raw_turns")
                 }
                 version = int(restored.execute("SELECT version FROM schema_meta").fetchone()[0])
-                if version > 7:
-                    raise ValueError(f"Backup schema v{version} is newer than supported schema v7")
+                if version > SCHEMA_VERSION:
+                    raise ValueError(
+                        f"Backup schema v{version} is newer than supported schema v{SCHEMA_VERSION}"
+                    )
         return {
             "ok": True,
             "name": source.name,
@@ -1764,8 +1888,10 @@ class MemoryService:
                 self._validate_database(restore_temp)
                 with contextlib.closing(sqlite3.connect(restore_temp)) as candidate:
                     version = int(candidate.execute("SELECT version FROM schema_meta").fetchone()[0])
-                if version > 7:
-                    raise ValueError(f"Backup schema v{version} is newer than supported schema v7")
+                if version > SCHEMA_VERSION:
+                    raise ValueError(
+                        f"Backup schema v{version} is newer than supported schema v{SCHEMA_VERSION}"
+                    )
                 # Migrate and validate the isolated copy before replacing the fact source.
                 MemoryDatabase(restore_temp)
                 self._validate_database(restore_temp)
@@ -1821,6 +1947,11 @@ class MemoryService:
                     int(retention["candidate_inactive_days"]),
                     int(retention["candidate_expired_days"]),
                     int(retention["rejected_candidate_days"]),
+                    timezone_name=str(self.db.get_settings()["general"]["timezone"]),
+                )
+                result["cleanup"]["recent_layer"] = self.db.expire_recent_layer(
+                    recent_days=int(retention.get("recent_signal_days", 14)),
+                    daily_days=int(retention.get("daily_memory_days", 30)),
                     timezone_name=str(self.db.get_settings()["general"]["timezone"]),
                 )
             result["derived"] = self.rebuild_derived()
@@ -1910,6 +2041,11 @@ class MemoryService:
                                         int(retention["candidate_inactive_days"]),
                                         int(retention["candidate_expired_days"]),
                                         int(retention["rejected_candidate_days"]),
+                                        timezone_name=timezone_name,
+                                    )
+                                    self.db.expire_recent_layer(
+                                        recent_days=int(retention.get("recent_signal_days", 14)),
+                                        daily_days=int(retention.get("daily_memory_days", 30)),
                                         timezone_name=timezone_name,
                                     )
                                     with self.db.transaction(immediate=True) as conn:
@@ -2035,6 +2171,8 @@ class MemoryService:
                 "candidate_inactive_days",
                 "candidate_expired_days",
                 "rejected_candidate_days",
+                "recent_signal_days",
+                "daily_memory_days",
             ):
                 if int(value[key]) < 1:
                     raise ValueError(f"{key} must be at least 1")

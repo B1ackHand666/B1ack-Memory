@@ -11,7 +11,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
-from .db import MemoryDatabase, content_hash, eligible_memory_predicate, utc_now
+from .db import SCHEMA_VERSION, MemoryDatabase, content_hash, eligible_memory_predicate, utc_now
 from .llm import LlmError, OpenAICompatibleClient
 from .security import permission_report, secure_directory, secure_file
 
@@ -945,7 +945,7 @@ class WorkspaceManager:
                 self._atomic_text(path, content)
                 manifest_files[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
             manifest = {
-                "schema_version": 7,
+                "schema_version": SCHEMA_VERSION,
                 "generated_at": utc_now(),
                 "source": "memory.db",
                 "files": manifest_files,

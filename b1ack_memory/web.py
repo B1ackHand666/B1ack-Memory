@@ -128,6 +128,32 @@ def create_router(
     def memories(status: str = "active", limit: int = 500) -> list[dict[str, Any]]:
         return memory.list_memories(status=status, limit=min(max(limit, 1), 5000))
 
+    @router.get("/recent-signals")
+    def recent_signals(
+        status: str | None = "active", project_id: str | None = None, limit: int = 500
+    ) -> list[dict[str, Any]]:
+        return memory.list_recent_signals(
+            status=status or None, project_id=project_id or None, limit=min(max(limit, 1), 5000)
+        )
+
+    @router.get("/daily-memories")
+    def daily_memories(
+        status: str | None = "active", project_id: str | None = None,
+        since_date: str | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        return memory.list_daily_memories(
+            status=status or None, project_id=project_id or None, since_date=since_date or None,
+            limit=min(max(limit, 1), 5000),
+        )
+
+    @router.get("/rem-reflections")
+    def rem_reflections(status: str | None = "active", limit: int = 200) -> list[dict[str, Any]]:
+        return memory.list_rem_reflections(status=status or None, limit=min(max(limit, 1), 2000))
+
+    @router.get("/hermes-native-memory/{target}")
+    def hermes_native_memory(target: str) -> dict[str, Any]:
+        return memory.get_hermes_native_memory(target)
+
     @router.get("/search")
     def search(query: str, limit: int = 20, project_id: str | None = None) -> list[dict[str, Any]]:
         return [
@@ -406,6 +432,20 @@ def create_router(
     @router.delete("/memories/{record_id}", dependencies=mutate())
     def purge_memory(record_id: str) -> dict[str, Any]:
         return memory.purge_memory(record_id)
+
+    @router.delete("/recent-signals/{record_id}", dependencies=mutate())
+    def delete_recent_signal(record_id: str, permanent: bool = False) -> dict[str, Any]:
+        return memory.delete_recent_record("recent_signal", record_id, permanent=permanent)
+
+    @router.delete("/daily-memories/{record_id}", dependencies=mutate())
+    def delete_daily_memory(record_id: str, permanent: bool = False) -> dict[str, Any]:
+        return memory.delete_recent_record("daily_memory", record_id, permanent=permanent)
+
+    @router.put("/hermes-native-memory/{target}", dependencies=mutate())
+    def save_hermes_native_memory(target: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
+        return memory.save_hermes_native_memory(
+            target, body.get("content"), expected_hash=body.get("expected_hash")
+        )
 
     @router.post("/candidates/{candidate_id}/promote", dependencies=mutate())
     def promote(candidate_id: str, body: dict[str, Any] = Body(default={})) -> dict[str, Any]:

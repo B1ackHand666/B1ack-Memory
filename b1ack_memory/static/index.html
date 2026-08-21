@@ -32,7 +32,7 @@
       <div id="metrics" class="metrics skeleton"></div>
       <div class="grid two">
         <article class="panel"><div class="panel-head"><div><span>HEALTH</span><h2>运行状态</h2></div><button class="quiet small" data-go="system" data-tab="storage">维护</button></div><div id="health" class="health-list skeleton"></div></article>
-        <article class="panel"><div class="panel-head"><div><span>CONTINUITY</span><h2>记忆连续性</h2></div></div><div class="pipeline"><b>对话</b><i>→</i><b>准入</b><i>→</i><b>项目工作记忆</b><i>→</i><b>长期整合</b></div><p class="muted">候选与提案不会默认注入；只有当前有效的长期记忆，以及可靠识别项目后的已确认工作项会进入上下文。</p></article>
+        <article class="panel"><div class="panel-head"><div><span>CONTINUITY</span><h2>记忆连续性</h2></div></div><div class="pipeline"><b>近期输入</b><i>→</i><b>Light</b><i>→</i><b>REM</b><i>→</i><b>Deep</b><i>→</i><b>长期记忆</b></div><p class="muted">近期信号、Daily Memory、原始会话和历史候选不会默认注入；只有有效长期记忆，以及可靠项目的已确认工作项会进入上下文。</p></article>
       </div>
       <article class="panel"><div class="panel-head"><div><span>RECENT</span><h2>最近活动</h2></div><button class="quiet small" data-go="system" data-tab="dream">查看 Dream</button></div><div id="recent-activity" class="compact-list skeleton"></div></article>
     </section>
@@ -40,9 +40,9 @@
     <section id="library" class="workspace">
       <div class="subnav" role="tablist">
         <button class="active" data-library-tab="memories">长期记忆</button>
-        <button data-library-tab="work">工作记忆</button>
-        <button data-library-tab="subjects">主题与实体</button>
-        <button data-library-tab="history">历史版本</button>
+        <button data-library-tab="recent">近期信号</button>
+        <button data-library-tab="daily">Daily Memory</button>
+        <button data-library-tab="history">v0.5 历史</button>
       </div>
       <div class="toolbar">
         <div class="searchbox"><span>⌕</span><input id="library-search" placeholder="搜索内容、项目、来源或 ID"></div>
@@ -79,6 +79,7 @@
         <button data-system-tab="traces">召回轨迹</button>
         <button data-system-tab="models">模型</button>
         <button data-system-tab="storage">存储与备份</button>
+        <button data-system-tab="hermes">Hermes 内置记忆</button>
         <button data-system-tab="advanced">高级设置</button>
       </div>
 
@@ -99,12 +100,20 @@
         <details class="panel details"><summary>隔离的会话条目</summary><p class="muted">连续三次提取失败的条目会停止自动消耗模型调用；核对错误后可单条重新处理。</p><div id="ingestion-issues" class="dense-list"></div></details>
         <div class="section-head"><div><span>BACKUPS</span><h2>备份</h2></div><p>恢复前会先校验并展示差异。</p></div><div id="backup-list" class="dense-list"></div>
       </div>
+      <div id="system-hermes" class="system-pane">
+        <article class="panel"><div class="panel-head"><div><span>HERMES NATIVE FILES</span><h2>Hermes 内置记忆</h2></div></div><p class="muted">仅编辑当前 <code>HERMES_HOME/memories</code> 的原生文件。它们不会写入 B1ack 数据库，也不参与 Dream、检索或跨 profile 同步；Hermes 会在下一会话启动时读取新内容。</p></article>
+        <div id="hermes-memory-status" class="health-list"></div>
+        <div class="grid two settings-grid">
+          <article class="panel"><div class="panel-head"><div><span>USER.md</span><h2>用户设定</h2></div><span id="hermes-user-counter" class="muted"></span></div><textarea id="hermes-user-content" rows="12" aria-label="Hermes USER.md"></textarea><div class="row"><button id="save-hermes-user">保存 USER.md</button></div></article>
+          <article class="panel"><div class="panel-head"><div><span>MEMORY.md</span><h2>会话记忆</h2></div><span id="hermes-memory-counter" class="muted"></span></div><textarea id="hermes-memory-content" rows="12" aria-label="Hermes MEMORY.md"></textarea><div class="row"><button id="save-hermes-memory">保存 MEMORY.md</button></div></article>
+        </div>
+      </div>
       <div id="system-advanced" class="system-pane">
         <div class="grid two settings-grid">
           <form id="general-form" class="panel"><div class="panel-head"><div><span>GENERAL</span><h2>时区</h2></div></div><label>记忆时区<input name="timezone" list="timezone-options" placeholder="system 或 IANA 时区"></label><datalist id="timezone-options"><option value="system"><option value="Asia/Shanghai"><option value="Asia/Tokyo"><option value="Europe/London"><option value="America/New_York"></datalist><small id="detected-timezone"></small><button type="submit">保存</button></form>
           <form id="recall-form" class="panel"><div class="panel-head"><div><span>RECALL</span><h2>上下文预算</h2></div></div><label>普通搜索条数<input name="limit" type="number" min="1" max="20"></label><label>项目包长期记忆上限<input name="durable_limit" type="number" min="1" max="20"></label><label>最大字符<input name="max_context_chars" type="number" min="500"></label><small>候选、proposal、历史事实和待确认归属永不默认注入。</small><button type="submit">保存</button></form>
-          <form id="dream-form" class="panel"><div class="panel-head"><div><span>SCHEDULE</span><h2>Dream 调度</h2></div></div><label class="check"><input name="enabled" type="checkbox">启用每日 Dream</label><label>每日时间<input name="daily_at" type="time"></label><div class="form-pair"><label>Light 批字符<input name="batch_chars" type="number" min="1000"></label><label>最大批数<input name="max_light_batches" type="number" min="1"></label></div><div class="form-pair"><label>新候选上限<input name="max_new_candidates" type="number" min="1"></label><label>自动晋升上限<input name="max_auto_promotions" type="number" min="0"></label></div><button type="submit">保存</button></form>
-          <form id="retention-form" class="panel"><div class="panel-head"><div><span>RETENTION</span><h2>保留策略</h2></div></div><div class="form-pair"><label>原始会话（天）<input name="raw_turn_days" type="number" min="1"></label><label>模型日志（天）<input name="model_call_days" type="number" min="1"></label></div><label>候选无活动过期（天）<input name="candidate_inactive_days" type="number" min="1"></label><div class="form-pair"><label>过期候选保留（天）<input name="candidate_expired_days" type="number" min="1"></label><label>拒绝候选保留（天）<input name="rejected_candidate_days" type="number" min="1"></label></div><label>保留备份数量<input name="backup_count" type="number" min="1"></label><button type="submit">保存</button></form>
+          <form id="dream-form" class="panel"><div class="panel-head"><div><span>SCHEDULE</span><h2>Dream 调度</h2></div></div><label class="check"><input name="enabled" type="checkbox">启用每日 Dream</label><label>每日时间<input name="daily_at" type="time"></label><div class="form-pair"><label>Light 批字符<input name="batch_chars" type="number" min="1000"></label><label>最大批数<input name="max_light_batches" type="number" min="1"></label></div><small>Light 只处理新增内容；REM/Deep 有足够材料才产出，不会为每日运行制造记忆。</small><button type="submit">保存</button></form>
+          <form id="retention-form" class="panel"><div class="panel-head"><div><span>RETENTION</span><h2>近期层保留</h2></div></div><div class="form-pair"><label>近期信号（天）<input name="recent_signal_days" type="number" min="1"></label><label>Daily Memory（天）<input name="daily_memory_days" type="number" min="1"></label></div><div class="form-pair"><label>原始会话（天）<input name="raw_turn_days" type="number" min="1"></label><label>模型日志（天）<input name="model_call_days" type="number" min="1"></label></div><label>保留备份数量<input name="backup_count" type="number" min="1"></label><small>v0.5 候选仅保留为可浏览、导出和隐私删除的历史，不再参与 Dream 或默认召回。</small><button type="submit">保存</button></form>
         </div>
       </div>
     </section>
@@ -116,7 +125,7 @@
   <dialog id="form-dialog"><form method="dialog" id="dynamic-form"><button class="dialog-close" value="cancel" formnovalidate aria-label="关闭">×</button><span class="eyebrow" id="form-eyebrow">EDIT</span><h2 id="form-title">编辑</h2><div id="form-fields"></div><div class="row end"><button value="cancel" class="quiet" formnovalidate>取消</button><button value="save" id="form-save">保存</button></div></form></dialog>
   <dialog id="confirm-dialog"><form method="dialog"><div class="danger-symbol">!</div><h2 id="confirm-title">确认操作</h2><p id="confirm-message" class="muted"></p><div class="row end"><button value="cancel" class="quiet">取消</button><button value="confirm" class="danger" id="confirm-submit">确认</button></div></form></dialog>
   <dialog id="preview-dialog"><form method="dialog"><button class="dialog-close" value="cancel">×</button><span class="eyebrow">IMPACT PREVIEW</span><h2 id="preview-title">操作预览</h2><div id="preview-content"></div><div class="row end"><button value="cancel" class="quiet">取消</button><button value="confirm" id="preview-confirm">继续</button></div></form></dialog>
-  <div id="dream-overlay" class="dream-overlay" hidden><div><span class="eyebrow">DREAMING</span><h2>正在整理记忆</h2><p>Light → subject → REM → Deep → Summary → Projection</p></div></div>
+  <div id="dream-overlay" class="dream-overlay" hidden><div><span class="eyebrow">DREAMING</span><h2>正在整理记忆</h2><p>近期输入 → Light → REM → Deep → 长期记忆</p></div></div>
   <script src="app.js"></script>
 </body>
 </html>

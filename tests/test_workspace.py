@@ -48,9 +48,9 @@ class WorkspaceTests(unittest.TestCase):
         self.service.shutdown(timeout=0.1)
         self.temp.cleanup()
 
-    def test_schema_v7_and_rebuildable_projection(self) -> None:
+    def test_schema_v8_and_rebuildable_projection(self) -> None:
         project = self.service.create_project({"name": "记忆治理", "aliases": ["治理项目"]})
-        self.assertEqual(self.service.db.schema_version(), 7)
+        self.assertEqual(self.service.db.schema_version(), 8)
         self.assertTrue((self.root / "vault" / "profile.md").is_file())
         self.assertTrue((self.root / "vault" / "projects" / "记忆治理.md").is_file() is False)
         project_page = self.root / "vault" / "projects" / f"{project['slug']}.md"
@@ -238,11 +238,11 @@ class WorkspaceTests(unittest.TestCase):
             self.assertIn("memory.db", archive.namelist())
             self.assertIn("manifest.json", archive.namelist())
             manifest = json.loads(archive.read("manifest.json"))
-            self.assertEqual(manifest["schema_version"], 7)
+            self.assertEqual(manifest["schema_version"], 8)
             self.assertNotIn("secrets.json", archive.namelist())
         preview = self.service.preview_restore(backup.name)
         self.assertEqual(preview["database_integrity"], "ok")
-        self.assertEqual(preview["schema_version"], 7)
+        self.assertEqual(preview["schema_version"], 8)
 
     def test_v6_upgrade_creates_pre_v7_backup(self) -> None:
         path = self.root / "upgrade-v6.db"
@@ -250,7 +250,7 @@ class WorkspaceTests(unittest.TestCase):
         with old.transaction(immediate=True) as conn:
             conn.execute("UPDATE schema_meta SET version=6")
         migrated = MemoryDatabase(path)
-        self.assertEqual(migrated.schema_version(), 7)
+        self.assertEqual(migrated.schema_version(), 8)
         self.assertTrue(any((path.parent / "backups").glob("*-pre-schema-v7.db")))
 
 
@@ -279,4 +279,4 @@ class WorkspaceWebTests(unittest.TestCase):
             f"/api/backups/{backup}/preview-restore", headers=self.headers
         )
         self.assertEqual(preview.status_code, 200)
-        self.assertEqual(preview.json()["schema_version"], 7)
+        self.assertEqual(preview.json()["schema_version"], 8)

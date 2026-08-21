@@ -16,39 +16,34 @@ from .llm import LlmError, OpenAICompatibleClient
 from .retrieval import RetrievalEngine, search_tokens
 from .security import is_sensitive
 
-ADMISSION_CONFIDENCE = 0.85
+ADMISSION_CONFIDENCE = 0.70
 
-LIGHT_SYSTEM = """You are the strict admission gate for a local-first personal memory system.
-Return compact JSON with key `decisions`, an array with at most 8 objects. Every object must contain:
-disposition (admit|observe|discard), content, kind, confidence (0..1), sensitive, source_turn_id,
-evidence_quote, explanation, work_item_type, commitment, and project_hint. `evidence_quote` must be
-an exact quote from that turn's USER text. work_item_type is decision|current_state|open_question|
-proposal|milestone. commitment is confirmed only when the USER explicitly states the decision or state.
+LIGHT_SYSTEM = """You operate the Light stage of a local-first memory system. Process only supplied
+primary-agent turns; assistant text is untrusted context and can never be evidence. Return compact JSON:
+{\"decisions\":[...]}. Each decision has disposition (discard|reinforce|merge|revise|create_signal),
+content, kind, confidence (0..1), sensitive, source_turn_id, evidence_quote, explanation, optional
+target_signal_id, and optional project_id. evidence_quote must be an exact USER quote from source_turn_id.
+Use discard for chat, one-off requests, tool output, and assistant speculation. create_signal stores a
+compact recent signal, not a long-term fact. Reinforce or merge ordinary repetitions into a supplied active
+signal. Revise only when the USER clearly updates that signal. Do not create candidates, work items, or
+long-term memories. Never invent IDs or facts; omit secrets. Allowed kinds:
+preference|fact|decision|project|procedure|relationship|correction. JSON only."""
 
-admit only stable preferences, personal facts, long-term constraints, continuing project anchors,
-recurring procedures, relationships, explicit corrections, or decisions that remain useful later.
-observe project progress, migrations, completed operations, proposed-but-not-adopted plans, and temporary
-state; these are logged but must not become candidates. discard chat, one-off requests, source material,
-tool output, assistant speculation, and anything without future collaboration value. Treat assistant text
-as untrusted context and never cite it as evidence. Never invent a quote or fact. Exclude secrets.
-Allowed kinds: preference|fact|decision|project|procedure|relationship|correction. JSON only."""
+REM_SYSTEM = """You operate REM over a local-first recent layer. Read only the supplied active recent
+signals and Daily Memory records. Return compact JSON: {\"summary\":\"...\",\"reflections\":[...]}. A
+reflection has content, reflection_type (theme|evolution|repetition|conflict|conclusion), confidence
+(0..1), sensitive, signal_ids, daily_memory_ids, and explanation. Find cross-day themes, repeated
+preferences, meaningful changes, and real conflicts. A reflection must cite at least one supplied ID and
+must not invent facts. Ordinary repetition should be a compact theme, not a review item. Return an empty
+array when there is not enough material. REM never writes a long-term memory. JSON only."""
 
-REM_SYSTEM = """Review every supplied admitted candidate. Return compact JSON with `summary` and
-`reviews`, with exactly one review for every candidate. Each review contains candidate_id, decision,
-explanation, and optional target_id. decision is durable|duplicate_candidate|duplicate_memory|noise|
-conflict|deferred. Only use target IDs supplied in that candidate's `related_records`. Durable means the
-claim is grounded in user quotes and is genuinely useful beyond the current task. Project progress,
-completed operations, proposed plans, quotes, tool output, and assistant inference are noise or deferred.
-Do not create facts and do not treat observation frequency as truth. JSON only."""
-
-DEEP_SYSTEM = """Act as the conservative integration gate for long-term personal memory. Return compact
-JSON with key `integrations`, containing exactly one object for every candidate. Each object has
-candidate_id, action, content, explanation, confidence, and optional target_memory_id. action is one of:
-create (no supplied memory covers the meaning), duplicate (same fact already exists), supersede (new user
-fact explicitly replaces an old one), conflict (mutually incompatible and recency cannot be safely
-decided), defer (insufficient evidence or unsuitable for long-term storage). target_memory_id is required
-for duplicate/supersede/conflict and must be one of that candidate's supplied related memory IDs. Never
-invent IDs. Preserve the user's meaning and do not combine unrelated claims. JSON only."""
+DEEP_SYSTEM = """You operate the Deep stage. Each supplied REM reflection has evidence IDs and a bounded
+list of related CURRENT long-term memories. Return compact JSON: {\"integrations\":[...]}. Give exactly one
+integration for every reflection: reflection_id, action (create|update|merge|supersede|expire|defer|review),
+content, kind, confidence, reason, and optional target_memory_id. Prefer update or merge of a related
+memory; create only if no related long-term memory covers it. target_memory_id is required for update,
+merge, supersede and expire and must be among that reflection's related IDs. Use review for sensitive,
+low-confidence or genuinely conflicting conclusions. Do not delete memories. JSON only."""
 
 
 @dataclass(slots=True)
@@ -70,6 +65,10 @@ class DreamOutcome:
     summary_count: int = 0
     projection_count: int = 0
     blocked_count: int = 0
+    recent_count: int = 0
+    daily_count: int = 0
+    reflection_count: int = 0
+    updated_memory_count: int = 0
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -91,6 +90,10 @@ class DreamOutcome:
             "summary_count": self.summary_count,
             "projection_count": self.projection_count,
             "blocked_count": self.blocked_count,
+            "recent_count": self.recent_count,
+            "daily_count": self.daily_count,
+            "reflection_count": self.reflection_count,
+            "updated_memory_count": self.updated_memory_count,
             "error": self.error,
         }
 
@@ -142,29 +145,45 @@ class DreamEngine:
             "summaries": 0,
             "projections": 0,
             "blocked": 0,
+            "recent": 0,
+            "daily": 0,
+            "reflections": 0,
+            "updated_memories": 0,
         }
         try:
+            all_settings = self.db.get_settings()
+            settings = all_settings["dream"]
+            retention = all_settings["retention"]
+            timezone_name = str(all_settings["general"]["timezone"])
+            expiry = self.db.expire_recent_layer(
+                recent_days=int(retention.get("recent_signal_days", 14)),
+                daily_days=int(retention.get("daily_memory_days", 30)),
+                timezone_name=timezone_name,
+            )
+            counts["expired"] += expiry["recent_signals"] + expiry["daily_memories"]
             turns = self.db.pending_raw_turns()
-            pending_any = self.db.list_candidates(limit=1)
-            if not turns and not pending_any:
-                self._finish_run(run_id, "completed", counts, "No new turns", "", "")
+            active_reflections = self.db.list_rem_reflections(status="active", limit=1)
+            if not turns and not active_reflections:
+                self._finish_run(run_id, "completed", counts, "No new recent input", "", "")
                 return self._outcome(run_id, "completed", counts)
             if not self.client.configured:
                 raise LlmError("LLM is not configured")
-
-            all_settings = self.db.get_settings()
-            settings = all_settings["dream"]
-            timezone_name = str(all_settings["general"]["timezone"])
-            try:
-                light_summary = self._run_light(
-                    run_id, turns, settings, timezone_name, counts
-                )
-            except Exception as error:
-                self.db.mark_turn_ingestion_failed([str(row["id"]) for row in turns], str(error))
-                raise
+            if turns:
+                try:
+                    light_summary = self._run_light_v6(
+                        run_id, turns, settings, retention, timezone_name, counts
+                    )
+                except Exception as error:
+                    self.db.mark_turn_ingestion_failed([str(row["id"]) for row in turns], str(error))
+                    raise
+            else:
+                light_summary = "No new turns; continuing pending Deep work"
+            rem_summary = self._run_rem_v6(
+                run_id, retention, counts, timezone_name,
+                enabled=bool(turns and (counts["recent"] or counts["daily"]))
+            )
+            deep_summary = self._run_deep_v6(run_id, counts, timezone_name)
             self.retrieval.rebuild_index()
-            rem_summary = self._run_rem(run_id, timezone_name, counts)
-            deep_summary = self._run_deep(run_id, settings, timezone_name, counts)
             self._finish_run(
                 run_id, "completed", counts, light_summary, rem_summary, deep_summary
             )
@@ -174,6 +193,255 @@ class DreamEngine:
             return self._outcome(run_id, "failed", counts, error=str(error))
         finally:
             self.db.release_lease("dream", owner)
+
+    def _run_light_v6(
+        self,
+        run_id: str,
+        turns: list[Any],
+        settings: dict[str, Any],
+        retention: dict[str, Any],
+        timezone_name: str,
+        counts: dict[str, int],
+    ) -> str:
+        known = {item["id"]: item for item in self.db.list_recent_signals(status="active", limit=100)}
+        prepared_turns = self._prepare_turn_chunks(turns, max_chars=int(settings["batch_chars"]))
+        batches = self._make_batches(
+            prepared_turns, max_chars=int(settings["batch_chars"]),
+            max_batches=int(settings["max_light_batches"]),
+        )
+        progress: dict[str, int] = {}
+        processed: set[str] = set()
+        for batch in batches:
+            turn_map = {str(row["id"]): row for row in batch}
+            payload = {
+                "turns": [
+                    {
+                        "id": row["id"], "observed_at": row["observed_at"],
+                        "user": row["user_content"],
+                        "assistant_context_untrusted": row["assistant_content"],
+                        "project_id": row["subject_id"],
+                    }
+                    for row in batch
+                ],
+                "active_signals": [
+                    {"id": item["id"], "content": item["content"], "kind": item["kind"],
+                     "strength": item["strength"], "project_id": item["subject_id"]}
+                    for item in known.values()
+                ],
+            }
+            result = self._call(
+                run_id, "light", LIGHT_SYSTEM, json.dumps(payload, ensure_ascii=False),
+                references=[("raw_turn", str(row["id"])) for row in batch],
+            )
+            decisions = result.parsed.get("decisions") if isinstance(result.parsed, dict) else None
+            if not isinstance(decisions, list):
+                raise LlmError("Light completion did not contain a decisions array")
+            for item in decisions[:20]:
+                if not isinstance(item, dict):
+                    counts["filtered"] += 1
+                    continue
+                disposition = str(item.get("disposition", "")).strip().lower()
+                source_id = str(item.get("source_turn_id", "")).strip()
+                source = turn_map.get(source_id)
+                content = str(item.get("content", "")).strip()
+                quote = str(item.get("evidence_quote", "")).strip()
+                target_id = str(item.get("target_signal_id", "")).strip()
+                reason = str(item.get("explanation", "")).strip() or "Light decision"
+                try:
+                    confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0))))
+                except (TypeError, ValueError):
+                    confidence = 0.0
+                quote_valid = bool(
+                    source and len(self._normalize_quote(quote)) >= 4
+                    and self._normalize_quote(quote) in self._normalize_quote(str(source["user_content"]))
+                )
+                if disposition not in {"discard", "reinforce", "merge", "revise", "create_signal"} or not source:
+                    counts["filtered"] += 1
+                    continue
+                if disposition != "discard" and (not content or not quote_valid):
+                    counts["filtered"] += 1
+                    continue
+                if disposition == "discard":
+                    self.db.add_admission_decision(
+                        disposition="discard", content=content or "(discarded turn)", evidence_quote=quote if quote_valid else None,
+                        reason=reason, confidence=confidence, raw_turn_id=source_id, dream_run_id=run_id,
+                    )
+                    counts["discarded"] += 1
+                    continue
+                subject_id = str(item.get("project_id", "")).strip() or source["subject_id"]
+                if subject_id:
+                    with self.db.connect() as conn:
+                        if not conn.execute("SELECT 1 FROM subjects WHERE id=? AND status='active'", (subject_id,)).fetchone():
+                            subject_id = None
+                kind = str(item.get("kind", "fact")).strip()
+                if disposition == "create_signal":
+                    signal, created = self.db.upsert_recent_signal(
+                        content, kind=kind, confidence=confidence,
+                        sensitive=bool(item.get("sensitive", False)) or is_sensitive(content),
+                        raw_turn_id=source_id, excerpt=quote, observed_at=source["observed_at"],
+                        subject_id=subject_id, retention_days=int(retention.get("recent_signal_days", 14)),
+                    )
+                    counts["recent"] += int(created)
+                elif target_id in known:
+                    target = known[target_id]
+                    if disposition == "reinforce":
+                        signal, _ = self.db.upsert_recent_signal(
+                            str(target["content"]), kind=str(target["kind"]), confidence=confidence,
+                            sensitive=bool(target["sensitive"]) or is_sensitive(content), raw_turn_id=source_id,
+                            excerpt=quote, observed_at=source["observed_at"], subject_id=subject_id,
+                            retention_days=int(retention.get("recent_signal_days", 14)),
+                        )
+                    else:
+                        signal = self.db.revise_recent_signal(
+                            target_id, content, kind=kind, confidence=confidence,
+                            retention_days=int(retention.get("recent_signal_days", 14)),
+                        )
+                    counts["merged"] += 1
+                else:
+                    counts["filtered"] += 1
+                    continue
+                known[str(signal["id"])] = signal
+                self.db.add_daily_memory(
+                    str(signal["content"]), observed_at=source["observed_at"], timezone_name=timezone_name,
+                    subject_id=signal.get("subject_id"), raw_turn_id=source_id, signal_id=str(signal["id"]),
+                    retention_days=int(retention.get("daily_memory_days", 30)),
+                )
+                counts["daily"] += 1
+                counts["admitted"] += 1
+            for row in batch:
+                turn_id = str(row["id"])
+                progress[turn_id] = max(progress.get(turn_id, 0), int(row.get("_ingest_end", 0)))
+                processed.add(turn_id)
+        self.db.advance_turn_ingestion(progress)
+        counts["input"] = len(processed)
+        return f"signals {counts['recent']}, daily updates {counts['daily']}, merged {counts['merged']}, discarded {counts['discarded']}"
+
+    def _run_rem_v6(
+        self, run_id: str, retention: dict[str, Any], counts: dict[str, int], timezone_name: str,
+        *, enabled: bool
+    ) -> str:
+        if not enabled:
+            return "No changed recent input required REM"
+        signals, daily = self.db.active_recent_for_rem(
+            daily_days=int(retention.get("daily_memory_days", 30)),
+            timezone_name=timezone_name,
+            limit=300,
+        )
+        if not signals and not daily:
+            return "No active recent material"
+        sensitivity = self.db.recent_source_sensitivity(
+            signal_ids=[str(item["id"]) for item in signals],
+            daily_memory_ids=[str(item["id"]) for item in daily],
+        )
+        payload = {
+            "recent_signals": [
+                {"id": item["id"], "content": item["content"], "kind": item["kind"],
+                 "strength": item["strength"], "first_seen_at": item["first_seen_at"],
+                 "last_seen_at": item["last_seen_at"], "project_id": item.get("subject_id"),
+                 "sensitive": sensitivity["signals"].get(str(item["id"]), False)}
+                for item in signals
+            ],
+            "daily_memories": [
+                {"id": item["id"], "date": item["memory_date"], "scope": item["scope_key"],
+                 "content": item["content"],
+                 "sensitive": sensitivity["daily_memories"].get(str(item["id"]), True)}
+                for item in daily
+            ],
+        }
+        result = self._call(
+            run_id, "rem", REM_SYSTEM, json.dumps(payload, ensure_ascii=False),
+            references=[*( ("recent_signal", str(item["id"])) for item in signals ),
+                        *( ("daily_memory", str(item["id"])) for item in daily )],
+        )
+        values = result.parsed.get("reflections") if isinstance(result.parsed, dict) else None
+        if not isinstance(values, list):
+            raise LlmError("REM completion did not contain a reflections array")
+        known_signals = {str(item["id"]) for item in signals}
+        known_daily = {str(item["id"]) for item in daily}
+        existing_hashes = {content_hash(item["content"]) for item in self.db.list_rem_reflections(status="active", limit=300)}
+        for item in values[:20]:
+            if not isinstance(item, dict):
+                counts["filtered"] += 1
+                continue
+            content = str(item.get("content", "")).strip()
+            signal_ids = [str(value) for value in item.get("signal_ids", []) if str(value) in known_signals]
+            daily_ids = [str(value) for value in item.get("daily_memory_ids", []) if str(value) in known_daily]
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.0))))
+            except (TypeError, ValueError):
+                confidence = 0.0
+            if not content or len(content) > 800 or confidence < 0.55 or (not signal_ids and not daily_ids):
+                counts["filtered"] += 1
+                continue
+            if content_hash(content) in existing_hashes:
+                counts["merged"] += 1
+                continue
+            self.db.create_rem_reflection(
+                content, reflection_type=str(item.get("reflection_type", "theme")).strip(),
+                confidence=confidence, signal_ids=signal_ids, daily_memory_ids=daily_ids,
+                sensitive=bool(item.get("sensitive", False)) or is_sensitive(content), dream_run_id=run_id,
+            )
+            existing_hashes.add(content_hash(content))
+            counts["reflections"] += 1
+        return str(result.parsed.get("summary", "")).strip() or f"REM created {counts['reflections']} reflection(s)"
+
+    def _run_deep_v6(self, run_id: str, counts: dict[str, int], timezone_name: str) -> str:
+        reflections = self.db.list_rem_reflections(status="active", limit=50)
+        if not reflections:
+            return "No supported REM reflection required Deep"
+        related: dict[str, list[Any]] = {}
+        references: list[tuple[str, str]] = [("rem_reflection", str(item["id"])) for item in reflections]
+        for reflection in reflections:
+            hits = self._related_records(str(reflection["content"]), include_candidates=False, limit=8)
+            related[str(reflection["id"])] = [hit for hit in hits if hit.source == "memory"]
+            references.extend(("memory", hit.id) for hit in related[str(reflection["id"])])
+        payload = {
+            "reflections": [
+                {
+                    "id": item["id"], "content": item["content"], "reflection_type": item["reflection_type"],
+                    "confidence": item["confidence"], "sensitive": item["sensitive"],
+                    "signal_ids": item["signal_ids"], "daily_memory_ids": item["daily_memory_ids"],
+                    "related_memories": [hit.to_dict() for hit in related[str(item["id"])]],
+                }
+                for item in reflections
+            ]
+        }
+        result = self._call(
+            run_id, "deep", DEEP_SYSTEM, json.dumps(payload, ensure_ascii=False),
+            references=list(dict.fromkeys(references)),
+        )
+        values = result.parsed.get("integrations") if isinstance(result.parsed, dict) else None
+        if not isinstance(values, list):
+            raise LlmError("Deep completion did not contain an integrations array")
+        expected = {str(item["id"]) for item in reflections}
+        parsed = {str(item.get("reflection_id", "")): item for item in values if isinstance(item, dict)}
+        if set(parsed) != expected:
+            raise LlmError("Deep must integrate every supplied REM reflection exactly once")
+        integrations: list[dict[str, Any]] = []
+        for reflection in reflections:
+            reflection_id = str(reflection["id"])
+            item = parsed[reflection_id]
+            action = str(item.get("action", "defer")).strip().lower()
+            target_id = str(item.get("target_memory_id", "")).strip() or None
+            permitted_targets = {hit.id for hit in related[reflection_id]}
+            if target_id and target_id not in permitted_targets:
+                raise LlmError(f"Deep referenced unrelated memory ID: {target_id}")
+            integrations.append({
+                "reflection_id": reflection_id, "action": action,
+                "content": str(item.get("content", "")).strip() or str(reflection["content"]),
+                "kind": str(item.get("kind", "fact")).strip(),
+                "confidence": item.get("confidence", reflection["confidence"]),
+                "reason": str(item.get("reason", "")).strip(), "target_memory_id": target_id,
+            })
+        applied = self.db.apply_deep_integrations(
+            integrations, dream_run_id=run_id, timezone_name=timezone_name
+        )
+        counts["promoted"] += applied["create"]
+        counts["merged"] += applied["merge"]
+        counts["updated_memories"] += applied["update"] + applied["merge"] + applied["supersede"] + applied["expire"]
+        counts["reviews"] += applied["review"]
+        counts["discarded"] += applied.get("discarded", 0)
+        return ", ".join(f"{key} {value}" for key, value in applied.items() if value) or "Deep deferred all reflections"
 
     def _run_light(
         self,
@@ -792,7 +1060,8 @@ class DreamEngine:
                 deep_summary=?,input_count=?,candidate_count=?,merged_count=?,filtered_count=?,
                 expired_count=?,promoted_count=?,admitted_count=?,observed_count=?,discarded_count=?,
                 review_count=?,work_item_count=?,assignment_count=?,summary_count=?,projection_count=?,
-                blocked_count=?,input_tokens=?,output_tokens=?,error=? WHERE id=?""",
+                blocked_count=?,recent_count=?,daily_count=?,reflection_count=?,updated_memory_count=?,
+                input_tokens=?,output_tokens=?,error=? WHERE id=?""",
                 (
                     status,
                     utc_now(),
@@ -814,6 +1083,10 @@ class DreamEngine:
                     counts["summaries"],
                     counts["projections"],
                     counts["blocked"],
+                    counts["recent"],
+                    counts["daily"],
+                    counts["reflections"],
+                    counts["updated_memories"],
                     usage[0],
                     usage[1],
                     error,
@@ -847,5 +1120,9 @@ class DreamEngine:
             summary_count=counts["summaries"],
             projection_count=counts["projections"],
             blocked_count=counts["blocked"],
+            recent_count=counts["recent"],
+            daily_count=counts["daily"],
+            reflection_count=counts["reflections"],
+            updated_memory_count=counts["updated_memories"],
             error=error,
         )

@@ -159,16 +159,11 @@ class B1ackMemoryProvider(MemoryProvider):
         content: str,
         metadata: dict[str, Any] | None = None,
     ) -> None:
-        del target
-        if action in {"add", "replace"} and content.strip():
-            try:
-                self.service.remember(
-                    content,
-                    origin="hermes-builtin",
-                    project_id=str((metadata or {}).get("project_id", "") or self.project_id or "") or None,
-                )
-            except ValueError:
-                pass
+        # Hermes native USER.md/MEMORY.md are deliberately independent in
+        # v0.6.  Hermes still calls this compatibility hook after a successful
+        # native write, but accepting it here must never create, update, or
+        # project a B1ack record.
+        del action, target, content, metadata
 
     def backup_paths(self) -> list[str]:
         paths = [str(self.service.db.path), str(self.service.root / "MEMORY.md"), str(self.service.root / "DREAMS.md")]

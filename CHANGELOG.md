@@ -2,10 +2,33 @@
 
 本文件记录 B1ack Memory 的重要变更。版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)，内容格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
-## [未发布]
+## [0.6.0] - 2026-08-21
+
+### 新增
+
+- 新增 schema v8 的近期层：`recent_signals`、`daily_memories`、`recent_evidence` 和 `rem_reflections`，并保留与长期记忆的显式证据关联。
+- 新增当前 `HERMES_HOME/memories/USER.md` 与 `MEMORY.md` 的安全 WebUI 编辑页：固定路径、字符容量提示（1,375 / 2,200）、外部修改冲突检测和原子写入。
+- 新增近期信号、Daily Memory、REM 反思和 Hermes 原生文件的 API，以及 v0.6 Dream、迁移、删除影响、原生文件隔离的回归测试。
+
+### 变更
+
+- Dream 改为“近期输入 → Light → REM → Deep → 长期记忆”：Light 只做丢弃、强化、合并、修订或新建近期信号；REM 只形成反思；Deep 才能原子创建或精炼长期记忆。
+- 普通重复和明确更新在近期层/长期层静默收敛；默认审核中心只展示敏感、低置信度、真实冲突和证据受影响事项。
+- 默认预取严格隔离近期信号、Daily Memory、原始会话、冻结候选和未确认项目状态；显式搜索近期信号仅提供弱强化。
+- 记忆库改为长期记忆、近期信号、Daily Memory 和冻结 v0.5 历史；项目工作台增加项目近期层和 REM 主题。
+- Hermes Provider 的 `on_memory_write` 保留兼容钩子但改为无操作；Hermes 自动原生记忆写入不再创建 B1ack 记忆。
+
+### 迁移与隐私
+
+- v7 → v8 前自动创建 `pre-schema-v8` 在线备份；旧候选转为 `legacy_history`，仅保留浏览、血缘、导出和隐私删除兼容性。
+- 删除近期信号或 Daily Memory 会立即阻止后续 Light、REM、Deep 和检索；永久删除会清理关联原始会话、模型调用、召回与索引，并在削弱长期记忆的唯一或关键证据时创建“证据受影响”审核而非静默删除长期记忆。
+- B1ack 的 `MEMORY.md` / `DREAMS.md` 仍是数据库镜像；Hermes 原生文件从此不导入、不投影、不覆盖、不跨 profile 同步。
 
 ### 修复
 
+- 修复敏感近期来源可被非敏感 REM 摘要绕过审核并自动晋升的问题；Deep 事务现在会重新计算 Signal、Daily Memory 及未知来源的敏感性。
+- 修复 Deep 在 UTC 边界误把同一本地日期当成两日证据的问题；证据日期遵守配置时区，只接受仍 active 且未过期的近期来源。
+- 修复近期层永久删除未完整清理关联视图和隐私派生数据的问题；级联清除近期证据、raw turn、work item、准入决定、摘要来源、投影任务、REM、模型调用、召回与索引，并保留长期记忆生成 evidence-impact 审核。
 - 长期记忆移入回收站时会在同一事务中使其关联的开放审核失效，回收站与待审核队列不再同时显示同一条记忆。
 - 永久删除改为一次点击确认，不再要求手输确认文本；仍保留不可撤销提示、删除前备份与隐私清理。
 - 新建项目等必填表单的“取消”与关闭按钮使用无验证提交，空白名称时可直接关闭；仅“保存”会校验必填项。
@@ -267,7 +290,8 @@
 - 自动生成 `MEMORY.md` 与 `DREAMS.md` 可读镜像。
 - 独立 CLI 与 Hermes 插件 CLI 命令。
 
-[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.4...HEAD
+[未发布]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/B1ackHand666/B1ack-Memory/compare/v0.5.4...v0.6.0
 [0.5.4]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.4
 [0.5.3]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.3
 [0.5.2]: https://github.com/B1ackHand666/B1ack-Memory/releases/tag/v0.5.2
